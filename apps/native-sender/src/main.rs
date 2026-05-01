@@ -9,6 +9,7 @@ use clap::Parser;
 use capture::CaptureTuning;
 use config::{AppConfig, CliArgs, TargetPlatform};
 use platform::CaptureBackend;
+use publisher::PublisherState;
 use reqwest::Client;
 use tokio::time::{interval, Duration};
 
@@ -24,6 +25,29 @@ async fn post_native_report(client: &Client, config: &AppConfig, report: &captur
         report.dropped_frames,
         report.avg_ingest_latency_ms,
         report.avg_payload_bytes,
+    )
+    .await
+}
+
+async fn post_publisher_event(
+    client: &Client,
+    config: &AppConfig,
+    state: PublisherState,
+    backend: &str,
+    message: Option<&str>,
+) -> Result<()> {
+    let capture_backend = format!("{:?}", config.capture_backend).to_ascii_lowercase();
+    let encoder_backend = format!("{:?}", config.encoder_backend).to_ascii_lowercase();
+    api::report_native_publisher_event(
+        client,
+        &config.api_base_url,
+        &config.room_name,
+        &config.identity,
+        state.as_str(),
+        backend,
+        &capture_backend,
+        &encoder_backend,
+        message,
     )
     .await
 }
@@ -75,10 +99,12 @@ async fn main() -> Result<()> {
         }
         println!("selected backend: {}", backend.name());
         println!("hint: {}", backend.diagnostics_hint());
+        let _ = post_publisher_event(&client, &config, PublisherState::Starting, backend.name(), None).await;
         let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
         if let Some(report) = report {
             post_native_report(&client, &config, &report).await?;
             println!("native session report: posted");
+            let _ = post_publisher_event(&client, &config, PublisherState::Running, backend.name(), None).await;
             if !config.dry_run {
                 println!(
                     "native session heartbeat started (every {}s). Press Ctrl+C to stop.",
@@ -95,6 +121,14 @@ async fn main() -> Result<()> {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => {
                             println!("shutdown signal received, stopping native sender heartbeat");
+                            let _ = post_publisher_event(
+                                &client,
+                                &config,
+                                PublisherState::Stopped,
+                                backend.name(),
+                                Some("shutdown signal received"),
+                            )
+                            .await;
                             break;
                         }
                         _ = ticker.tick() => {
@@ -102,6 +136,14 @@ async fn main() -> Result<()> {
                                 Ok(Some(live_report)) => {
                                     if let Err(err) = post_native_report(&client, &config, &live_report).await {
                                         eprintln!("native session heartbeat post failed: {}", err);
+                                        let _ = post_publisher_event(
+                                            &client,
+                                            &config,
+                                            PublisherState::Error,
+                                            backend.name(),
+                                            Some("native session heartbeat post failed"),
+                                        )
+                                        .await;
                                     }
                                 }
                                 Ok(None) => {
@@ -109,6 +151,14 @@ async fn main() -> Result<()> {
                                 }
                                 Err(err) => {
                                     eprintln!("native session heartbeat sampling failed: {}", err);
+                                    let _ = post_publisher_event(
+                                        &client,
+                                        &config,
+                                        PublisherState::Error,
+                                        backend.name(),
+                                        Some("native session heartbeat sampling failed"),
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -128,10 +178,12 @@ async fn main() -> Result<()> {
         }
         println!("selected backend: {}", backend.name());
         println!("hint: {}", backend.diagnostics_hint());
+        let _ = post_publisher_event(&client, &config, PublisherState::Starting, backend.name(), None).await;
         let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
         if let Some(report) = report {
             post_native_report(&client, &config, &report).await?;
             println!("native session report: posted");
+            let _ = post_publisher_event(&client, &config, PublisherState::Running, backend.name(), None).await;
             if !config.dry_run {
                 println!(
                     "native session heartbeat started (every {}s). Press Ctrl+C to stop.",
@@ -148,6 +200,14 @@ async fn main() -> Result<()> {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => {
                             println!("shutdown signal received, stopping native sender heartbeat");
+                            let _ = post_publisher_event(
+                                &client,
+                                &config,
+                                PublisherState::Stopped,
+                                backend.name(),
+                                Some("shutdown signal received"),
+                            )
+                            .await;
                             break;
                         }
                         _ = ticker.tick() => {
@@ -155,6 +215,14 @@ async fn main() -> Result<()> {
                                 Ok(Some(live_report)) => {
                                     if let Err(err) = post_native_report(&client, &config, &live_report).await {
                                         eprintln!("native session heartbeat post failed: {}", err);
+                                        let _ = post_publisher_event(
+                                            &client,
+                                            &config,
+                                            PublisherState::Error,
+                                            backend.name(),
+                                            Some("native session heartbeat post failed"),
+                                        )
+                                        .await;
                                     }
                                 }
                                 Ok(None) => {
@@ -162,6 +230,14 @@ async fn main() -> Result<()> {
                                 }
                                 Err(err) => {
                                     eprintln!("native session heartbeat sampling failed: {}", err);
+                                    let _ = post_publisher_event(
+                                        &client,
+                                        &config,
+                                        PublisherState::Error,
+                                        backend.name(),
+                                        Some("native session heartbeat sampling failed"),
+                                    )
+                                    .await;
                                 }
                             }
                         }

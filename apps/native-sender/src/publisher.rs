@@ -1,5 +1,24 @@
 use crate::api::TokenResponse;
 
+#[derive(Debug, Clone, Copy)]
+pub enum PublisherState {
+    Starting,
+    Running,
+    Stopped,
+    Error,
+}
+
+impl PublisherState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Error => "error",
+        }
+    }
+}
+
 pub async fn publish_bootstrap(platform_name: &str, token: &TokenResponse, dry_run: bool) {
     println!(
         "publisher config: platform={} livekit_url={} token_size={}",

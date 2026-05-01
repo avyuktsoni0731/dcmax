@@ -28,7 +28,18 @@ type NativeSessionRecord = {
   avgPayloadBytes: number;
   updatedAt: string;
 };
+type NativePublisherRecord = {
+  roomName: string;
+  identity: string;
+  state: "starting" | "running" | "stopped" | "error";
+  backend: string;
+  captureBackend: string;
+  encoderBackend: string;
+  message?: string;
+  updatedAt: string;
+};
 const nativeSessions = new Map<string, NativeSessionRecord>();
+const nativePublishers = new Map<string, NativePublisherRecord>();
 const allowedOrigins = (
   env.WEB_ORIGINS ??
   env.WEB_ORIGIN ??
@@ -90,6 +101,43 @@ app.get("/native/sessions/:roomName", (req, res) => {
     roomName,
     count: entries.length,
     sessions: entries
+  });
+});
+
+const nativePublisherEventSchema = z.object({
+  roomName: z.string().min(2).max(64).regex(/^[a-zA-Z0-9_-]+$/),
+  identity: z.string().min(2).max(64),
+  state: z.enum(["starting", "running", "stopped", "error"]),
+  backend: z.string().min(2).max(64),
+  captureBackend: z.string().min(2).max(64),
+  encoderBackend: z.string().min(2).max(64),
+  message: z.string().max(256).optional()
+});
+
+app.post("/native/publisher/events", (req, res) => {
+  const parsed = nativePublisherEventSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid native publisher event payload", details: parsed.error.flatten() });
+    return;
+  }
+
+  const payload = parsed.data;
+  const key = `${payload.roomName}:${payload.identity}`;
+  const record: NativePublisherRecord = {
+    ...payload,
+    updatedAt: new Date().toISOString()
+  };
+  nativePublishers.set(key, record);
+  res.json({ ok: true, key, record });
+});
+
+app.get("/native/publisher/:roomName", (req, res) => {
+  const roomName = req.params.roomName;
+  const entries = Array.from(nativePublishers.values()).filter((row) => row.roomName === roomName);
+  res.json({
+    roomName,
+    count: entries.length,
+    publishers: entries
   });
 });
 
