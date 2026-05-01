@@ -150,7 +150,8 @@ async fn main() -> Result<()> {
         };
         let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
         if let Some(report) = report {
-            post_native_report(&client, &config, &report).await?;
+            let last_report = report;
+            post_native_report(&client, &config, &last_report).await?;
             println!("native session report: posted");
             let _ = post_publisher_event(&client, &config, PublisherState::Running, backend.name(), None).await;
             if !config.dry_run {
@@ -159,12 +160,6 @@ async fn main() -> Result<()> {
                     config.heartbeat_seconds
                 );
                 let mut ticker = interval(Duration::from_secs(config.heartbeat_seconds));
-                let heartbeat_tuning = CaptureTuning {
-                    target_fps: config.target_fps,
-                    probe_seconds: 1,
-                    encoder_backend: config.encoder_backend,
-                    capture_backend: config.capture_backend,
-                };
                 loop {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => {
@@ -181,67 +176,50 @@ async fn main() -> Result<()> {
                             break;
                         }
                         _ = ticker.tick() => {
-                            match backend.bootstrap_capture_pipeline(false, heartbeat_tuning) {
-                                Ok(Some(live_report)) => {
-                                    if let Some(proc) = ffmpeg_publisher.as_mut() {
-                                        match proc.try_wait() {
-                                            Ok(Some(status)) => {
-                                                let mut msg = format!("ffmpeg WHIP publisher exited: {}", status);
-                                                if let Some(stderr) = proc.stderr.as_mut() {
-                                                    let mut buf = String::new();
-                                                    let _ = stderr.read_to_string(&mut buf);
-                                                    if !buf.trim().is_empty() {
-                                                        msg = format!("{} :: {}", msg, buf.trim());
-                                                        if buf.contains("Invalid answer: OK") {
-                                                            msg = format!(
-                                                                "{} :: hint: LiveKit signaling URL is not a WHIP ingest endpoint. Set LIVEKIT_WHIP_URL (and optionally LIVEKIT_WHIP_BEARER_TOKEN) for a valid ingest target.",
-                                                                msg
-                                                            );
-                                                        }
-                                                    }
+                            if let Some(proc) = ffmpeg_publisher.as_mut() {
+                                match proc.try_wait() {
+                                    Ok(Some(status)) => {
+                                        let mut msg = format!("ffmpeg WHIP publisher exited: {}", status);
+                                        if let Some(stderr) = proc.stderr.as_mut() {
+                                            let mut buf = String::new();
+                                            let _ = stderr.read_to_string(&mut buf);
+                                            if !buf.trim().is_empty() {
+                                                msg = format!("{} :: {}", msg, buf.trim());
+                                                if buf.contains("Invalid answer: OK") {
+                                                    msg = format!(
+                                                        "{} :: hint: LiveKit signaling URL is not a WHIP ingest endpoint. Set LIVEKIT_WHIP_URL (and optionally LIVEKIT_WHIP_BEARER_TOKEN) for a valid ingest target.",
+                                                        msg
+                                                    );
                                                 }
-                                                let _ = post_publisher_event(
-                                                    &client,
-                                                    &config,
-                                                    PublisherState::Error,
-                                                    backend.name(),
-                                                    Some("ffmpeg WHIP publisher exited"),
-                                                )
-                                                .await;
-                                                anyhow::bail!("{}", msg);
-                                            }
-                                            Ok(None) => {}
-                                            Err(err) => {
-                                                eprintln!("ffmpeg WHIP publisher status check failed: {}", err);
                                             }
                                         }
-                                    }
-                                    if let Err(err) = post_native_report(&client, &config, &live_report).await {
-                                        eprintln!("native session heartbeat post failed: {}", err);
                                         let _ = post_publisher_event(
                                             &client,
                                             &config,
                                             PublisherState::Error,
                                             backend.name(),
-                                            Some("native session heartbeat post failed"),
+                                            Some("ffmpeg WHIP publisher exited"),
                                         )
                                         .await;
+                                        anyhow::bail!("{}", msg);
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        eprintln!("ffmpeg WHIP publisher status check failed: {}", err);
                                     }
                                 }
-                                Ok(None) => {
-                                    // no-op
-                                }
-                                Err(err) => {
-                                    eprintln!("native session heartbeat sampling failed: {}", err);
-                                    let _ = post_publisher_event(
-                                        &client,
-                                        &config,
-                                        PublisherState::Error,
-                                        backend.name(),
-                                        Some("native session heartbeat sampling failed"),
-                                    )
-                                    .await;
-                                }
+                            }
+
+                            if let Err(err) = post_native_report(&client, &config, &last_report).await {
+                                eprintln!("native session heartbeat post failed: {}", err);
+                                let _ = post_publisher_event(
+                                    &client,
+                                    &config,
+                                    PublisherState::Error,
+                                    backend.name(),
+                                    Some("native session heartbeat post failed"),
+                                )
+                                .await;
                             }
                         }
                     }

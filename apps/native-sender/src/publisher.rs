@@ -179,6 +179,7 @@ pub fn start_ffmpeg_whip_publisher(
         EncoderBackend::Fast | EncoderBackend::FfmpegLibx264 => "yuv420p",
         EncoderBackend::FfmpegH264Nvenc => "nv12",
     };
+    let gop = target_fps.max(1);
     let mut command = Command::new("ffmpeg");
     command
         .arg("-hide_banner")
@@ -215,7 +216,13 @@ pub fn start_ffmpeg_whip_publisher(
             Vec::new()
         })
         .arg("-g")
-        .arg((target_fps * 2).to_string())
+        .arg(gop.to_string())
+        .arg("-keyint_min")
+        .arg(gop.to_string())
+        .arg("-sc_threshold")
+        .arg("0")
+        .arg("-bf")
+        .arg("0")
         .arg("-r")
         .arg(target_fps.to_string())
         .arg("-b:v")
@@ -224,6 +231,11 @@ pub fn start_ffmpeg_whip_publisher(
         .arg("16M")
         .arg("-bufsize")
         .arg("24M")
+        .args(if matches!(encoder_backend, EncoderBackend::Fast | EncoderBackend::FfmpegLibx264) {
+            vec!["-profile:v", "baseline", "-level:v", "3.1"]
+        } else {
+            Vec::new()
+        })
         .arg("-an")
         .arg("-f")
         .arg("whip")
