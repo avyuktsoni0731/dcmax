@@ -8,7 +8,8 @@ dotenv.config();
 
 const envSchema = z.object({
   PORT: z.coerce.number().default(4000),
-  WEB_ORIGIN: z.string().default("http://localhost:3000"),
+  WEB_ORIGIN: z.string().optional(),
+  WEB_ORIGINS: z.string().optional(),
   LIVEKIT_URL: z.string().default("ws://localhost:7880"),
   LIVEKIT_API_KEY: z.string().min(1),
   LIVEKIT_API_SECRET: z.string().min(1)
@@ -16,10 +17,24 @@ const envSchema = z.object({
 
 const env = envSchema.parse(process.env);
 const app = express();
+const allowedOrigins = (
+  env.WEB_ORIGINS ??
+  env.WEB_ORIGIN ??
+  "http://localhost:3000"
+)
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
 app.use(
   cors({
-    origin: env.WEB_ORIGIN
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error("Origin not allowed by CORS"));
+    }
   })
 );
 app.use(express.json());

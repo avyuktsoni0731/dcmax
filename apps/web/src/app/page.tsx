@@ -11,8 +11,14 @@ import {
   Track,
   VideoPresets
 } from "livekit-client";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { detectBrowser, detectOs, getSystemAudioSupportMessage } from "@/lib/capabilities";
+import { useEffect, useRef, useState } from "react";
+import {
+  BrowserName,
+  OsName,
+  detectBrowser,
+  detectOs,
+  getSystemAudioSupportMessage
+} from "@/lib/capabilities";
 import { QUALITY_PROFILES, QualityMode, resolveCodecPreference } from "@/lib/quality";
 
 type CallState = "idle" | "connecting" | "connected" | "reconnecting" | "ended";
@@ -20,6 +26,12 @@ type CallState = "idle" | "connecting" | "connected" | "reconnecting" | "ended";
 type TokenResponse = {
   token: string;
   url: string;
+};
+
+type UaInfo = {
+  browser: BrowserName;
+  os: OsName;
+  message: string;
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:4000";
@@ -48,30 +60,41 @@ export default function HomePage() {
   const [localIsSpeaking, setLocalIsSpeaking] = useState(false);
   const [connectionPill, setConnectionPill] = useState<"good" | "fair" | "poor">("good");
   const [errorText, setErrorText] = useState("");
+  const [uaInfo, setUaInfo] = useState<UaInfo>({
+    browser: "other",
+    os: "other",
+    message: "Checking browser capabilities..."
+  });
 
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
 
-  const uaInfo = useMemo(() => {
-    if (typeof window === "undefined") {
-      return {
-        browser: "other",
-        os: "other",
-        message: "Capability guidance unavailable on server render."
-      };
-    }
+  useEffect(() => {
     const browser = detectBrowser(window.navigator.userAgent);
     const os = detectOs(window.navigator.userAgent);
-    return {
+    setUaInfo({
       browser,
       os,
       message: getSystemAudioSupportMessage(browser, os)
-    };
+    });
   }, []);
 
   useEffect(() => {
     let mounted = true;
-    navigator.mediaDevices
+    const mediaDevices = window.navigator?.mediaDevices;
+    if (!mediaDevices || typeof mediaDevices.enumerateDevices !== "function") {
+      setAudioInputs([]);
+      const currentOrigin = window.location.origin;
+      const secureHint = window.isSecureContext
+        ? ""
+        : ` Current origin is ${currentOrigin}; use HTTPS (or localhost) to enable media APIs.`;
+      setErrorText(`This browser/context does not expose media devices.${secureHint}`);
+      return () => {
+        mounted = false;
+      };
+    }
+
+    mediaDevices
       .enumerateDevices()
       .then((devices) => {
         if (!mounted) return;
@@ -81,6 +104,7 @@ export default function HomePage() {
       })
       .catch(() => {
         setAudioInputs([]);
+        setErrorText("Unable to read media devices. Check site permissions for microphone access.");
       });
 
     return () => {
@@ -135,6 +159,15 @@ export default function HomePage() {
     setErrorText("");
     setCallState("connecting");
     try {
+      if (!window.navigator?.mediaDevices) {
+        const secureHint = window.isSecureContext
+          ? ""
+          : ` Current origin is ${window.location.origin}; use HTTPS (or localhost).`;
+        throw new Error(
+          `Media APIs are unavailable in this browser/context. Try Chrome/Edge with HTTPS.${secureHint}`
+        );
+      }
+
       const identity = username.trim().replace(/\s+/g, "_");
       if (!identity) throw new Error("Please enter a username");
       const sanitizedRoom = roomName.trim().replace(/\s+/g, "_");
@@ -235,6 +268,11 @@ export default function HomePage() {
 
   async function toggleScreenShare() {
     if (!room) return;
+    if (!window.navigator?.mediaDevices?.getDisplayMedia) {
+      setErrorText("Screen sharing is not available in this browser.");
+      return;
+    }
+
     const quality = QUALITY_PROFILES[qualityMode];
     try {
       if (isSharingScreen) {
