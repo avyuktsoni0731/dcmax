@@ -55,6 +55,7 @@ cargo run -- --dry-run
 - Encoder-ready frame contract (`CapturedFrame`) with capture timestamp and ingest-latency metrics
 - Encoder-input adapter stage (`EncoderInputFrame`) with conversion metrics and end-to-end ingest timing
 - Windows capture now attempts `ffmpeg` DXGI source (`ddagrab`) first, then falls back to `scrap`
+- Native sender now posts session quality reports to API (`POST /native/sessions`)
 
 ## FFmpeg Requirement (Windows Real Capture Path)
 
