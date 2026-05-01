@@ -6,7 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::CaptureBackend;
-use crate::capture::{CaptureTuning, CapturedFrame};
+use crate::capture::{
+    adapt_to_encoder_input_bgra, CaptureTuning, CapturedFrame, ConverterAcc, PixelFormat,
+};
 use crate::platform::windows_dxgi::probe_primary_adapter;
 
 pub struct WindowsCaptureBackend;
@@ -26,6 +28,10 @@ struct DesktopCaptureProbeStats {
     pipeline_consumed_frames: u64,
     pipeline_consumed_bytes: usize,
     pipeline_avg_ingest_latency_ms: f64,
+    encoder_converted_frames: u64,
+    encoder_dropped_frames: u64,
+    encoder_avg_conversion_latency_ms: f64,
+    encoder_avg_end_to_end_latency_ms: f64,
 }
 
 fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCaptureProbeStats> {
@@ -45,18 +51,40 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
         let mut consumed_frames: u64 = 0;
         let mut consumed_bytes: usize = 0;
         let mut total_ingest_latency_ms: f64 = 0.0;
+        let mut converter_acc = ConverterAcc::new();
+        let mut total_end_to_end_latency_ms: f64 = 0.0;
         while let Ok(frame) = rx.recv() {
+            let adapted = adapt_to_encoder_input_bgra(frame, &mut converter_acc);
             consumed_frames += 1;
-            let _frame_dimensions = (frame.width, frame.height);
-            consumed_bytes += frame.bytes.len();
-            total_ingest_latency_ms += frame.capture_instant.elapsed().as_secs_f64() * 1000.0;
+            let _frame_dimensions = (adapted.width, adapted.height);
+            let _format = match adapted.pixel_format {
+                PixelFormat::Bgra8 => "bgra8",
+                PixelFormat::Rgba8 => "rgba8",
+            };
+            consumed_bytes += adapted.bytes.len();
+            total_ingest_latency_ms += adapted.capture_instant.elapsed().as_secs_f64() * 1000.0;
+            total_end_to_end_latency_ms += adapted.converted_instant.elapsed().as_secs_f64() * 1000.0;
         }
         let avg_ingest_latency_ms = if consumed_frames > 0 {
             total_ingest_latency_ms / consumed_frames as f64
         } else {
             0.0
         };
-        (consumed_frames, consumed_bytes, avg_ingest_latency_ms)
+        let avg_end_to_end_latency_ms = if consumed_frames > 0 {
+            total_end_to_end_latency_ms / consumed_frames as f64
+        } else {
+            0.0
+        };
+        let metrics = converter_acc.finalize();
+        (
+            consumed_frames,
+            consumed_bytes,
+            avg_ingest_latency_ms,
+            avg_end_to_end_latency_ms,
+            metrics.converted_frames,
+            metrics.dropped_frames,
+            metrics.avg_conversion_latency_ms,
+        )
     });
     let mut pipeline_sent_frames: u64 = 0;
     let mut pipeline_dropped_frames: u64 = 0;
@@ -107,7 +135,15 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
         0
     };
     drop(tx);
-    let (pipeline_consumed_frames, pipeline_consumed_bytes, pipeline_avg_ingest_latency_ms) = consumer
+    let (
+        pipeline_consumed_frames,
+        pipeline_consumed_bytes,
+        pipeline_avg_ingest_latency_ms,
+        encoder_avg_end_to_end_latency_ms,
+        encoder_converted_frames,
+        encoder_dropped_frames,
+        encoder_avg_conversion_latency_ms,
+    ) = consumer
         .join()
         .map_err(|_| anyhow::anyhow!("capture pipeline consumer thread panicked"))?;
 
@@ -125,6 +161,10 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
         pipeline_consumed_frames,
         pipeline_consumed_bytes,
         pipeline_avg_ingest_latency_ms,
+        encoder_converted_frames,
+        encoder_dropped_frames,
+        encoder_avg_conversion_latency_ms,
+        encoder_avg_end_to_end_latency_ms,
     })
 }
 
@@ -154,7 +194,7 @@ impl CaptureBackend for WindowsCaptureBackend {
         );
         let stats = run_windows_desktop_capture_probe(tuning)?;
         println!(
-            "[windows] probe done: frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={} pipeline_avg_ingest_latency_ms={:.2}",
+            "[windows] probe done: frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={} pipeline_avg_ingest_latency_ms={:.2} encoder_converted={} encoder_dropped={} encoder_avg_conversion_latency_ms={:.3} encoder_avg_end_to_end_latency_ms={:.2}",
             stats.produced_frames,
             stats.elapsed_ms,
             stats.achieved_fps,
@@ -167,7 +207,11 @@ impl CaptureBackend for WindowsCaptureBackend {
             stats.pipeline_dropped_frames,
             stats.pipeline_consumed_frames,
             stats.pipeline_consumed_bytes,
-            stats.pipeline_avg_ingest_latency_ms
+            stats.pipeline_avg_ingest_latency_ms,
+            stats.encoder_converted_frames,
+            stats.encoder_dropped_frames,
+            stats.encoder_avg_conversion_latency_ms,
+            stats.encoder_avg_end_to_end_latency_ms
         );
         if stats.achieved_fps < (tuning.target_fps as f64 * 0.5) {
             println!(

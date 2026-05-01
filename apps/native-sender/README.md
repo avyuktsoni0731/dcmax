@@ -52,4 +52,6 @@ cargo run -- --dry-run
 - Windows desktop frame capture probe via `scrap` with measured achieved FPS/resolution
 - Windows DXGI adapter probe (primary GPU introspection) to prepare migration to Desktop Duplication
 - Cross-platform pacing probe scaffolding remains for future macOS ScreenCaptureKit integration
+- Encoder-ready frame contract (`CapturedFrame`) with capture timestamp and ingest-latency metrics
+- Encoder-input adapter stage (`EncoderInputFrame`) with conversion metrics and end-to-end ingest timing
 
