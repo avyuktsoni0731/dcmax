@@ -44,6 +44,50 @@ type NativeSessionResponse = {
   sessions: NativeSession[];
 };
 type NativeSessionState = "offline" | "stale" | "active";
+type PublisherState = "starting" | "running" | "stopped" | "error";
+type NativePublisher = {
+  roomName: string;
+  identity: string;
+  state: PublisherState;
+  backend: string;
+  captureBackend: string;
+  encoderBackend: string;
+  message?: string;
+  updatedAt: string;
+};
+type NativePublisherResponse = {
+  roomName: string;
+  count: number;
+  publishers: NativePublisher[];
+};
+type NativeRuntimeStatus = "idle" | "starting" | "running" | "stopping" | "error";
+type NativeRuntime = {
+  roomName: string;
+  identity: string;
+  status: NativeRuntimeStatus;
+  pid?: number;
+  command: string[];
+  startedAt?: string;
+  stoppedAt?: string;
+  lastError?: string;
+  updatedAt: string;
+};
+type NativeRuntimeResponse = {
+  roomName: string;
+  runtime: NativeRuntime | null;
+};
+type NativeRuntimeLogEntry = {
+  ts: string;
+  stream: "stdout" | "stderr" | "system";
+  message: string;
+};
+type NativeRuntimeLogsResponse = {
+  roomName: string;
+  count: number;
+  logs: NativeRuntimeLogEntry[];
+};
+type NativeCaptureMode = "auto" | "scrap" | "ffmpeg-ddagrab";
+type NativeEncoderMode = "fast" | "ffmpeg-libx264" | "ffmpeg-h264-nvenc";
 
 type ToastTone = "neutral" | "success" | "warning" | "error";
 type UaInfo = {
@@ -59,6 +103,8 @@ type ScreenCaptureStats = {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:4000";
 const IS_NGROK_API = API_BASE.includes("ngrok-free.app");
+const NATIVE_CONTROL_SECRET = process.env.NEXT_PUBLIC_NATIVE_CONTROL_SECRET ?? "";
+const NATIVE_EXPERIMENTAL_ENABLED = process.env.NEXT_PUBLIC_ENABLE_NATIVE_EXPERIMENTAL === "true";
 
 function classNames(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
@@ -120,7 +166,18 @@ export default function HomePage() {
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [screenCaptureStats, setScreenCaptureStats] = useState<ScreenCaptureStats | null>(null);
   const [nativeSession, setNativeSession] = useState<NativeSession | null>(null);
-  const [preferNativeSource, setPreferNativeSource] = useState(true);
+  const [nativePublisher, setNativePublisher] = useState<NativePublisher | null>(null);
+  const [nativeRuntime, setNativeRuntime] = useState<NativeRuntime | null>(null);
+  const [nativeRuntimeLogs, setNativeRuntimeLogs] = useState<NativeRuntimeLogEntry[]>([]);
+  const [nativeRuntimeBusy, setNativeRuntimeBusy] = useState(false);
+  const [nativeRuntimeIdentity, setNativeRuntimeIdentity] = useState("native-sender");
+  const [nativeTargetFps, setNativeTargetFps] = useState(60);
+  const [nativeProbeSeconds, setNativeProbeSeconds] = useState(3);
+  const [nativeHeartbeatSeconds, setNativeHeartbeatSeconds] = useState(1);
+  const [nativeCaptureMode, setNativeCaptureMode] = useState<NativeCaptureMode>("auto");
+  const [nativeEncoderMode, setNativeEncoderMode] = useState<NativeEncoderMode>("ffmpeg-h264-nvenc");
+  const [nativeDryRun, setNativeDryRun] = useState(false);
+  const [preferNativeSource, setPreferNativeSource] = useState(NATIVE_EXPERIMENTAL_ENABLED);
   const [selectedSourceLabel, setSelectedSourceLabel] = useState("none");
   const [uaInfo, setUaInfo] = useState<UaInfo>({
     browser: "other",
@@ -225,6 +282,10 @@ export default function HomePage() {
   }, [toastText]);
 
   useEffect(() => {
+    if (!NATIVE_EXPERIMENTAL_ENABLED) {
+      setNativeSession(null);
+      return;
+    }
     const roomKey = roomName.trim().replace(/\s+/g, "_");
     if (!roomKey) {
       setNativeSession(null);
@@ -248,6 +309,120 @@ export default function HomePage() {
           payload.sessions[0] ??
           null;
         setNativeSession(preferred);
+      } catch {
+        // best-effort polling, no user-facing toast needed
+      }
+    };
+
+    void poll();
+    const id = window.setInterval(() => {
+      void poll();
+    }, Boolean(room) ? 1000 : 10000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [roomName, room]);
+
+  useEffect(() => {
+    if (!NATIVE_EXPERIMENTAL_ENABLED) {
+      setNativeRuntimeLogs([]);
+      return;
+    }
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) {
+      setNativeRuntimeLogs([]);
+      return;
+    }
+    let active = true;
+    const poll = async () => {
+      try {
+        const res = await apiFetch(`${API_BASE}/native/runtime/${roomKey}/logs`, {
+          headers: NATIVE_CONTROL_SECRET ? { "x-native-control-secret": NATIVE_CONTROL_SECRET } : undefined
+        });
+        if (!res.ok) return;
+        const contentType = res.headers.get("content-type") ?? "";
+        if (!contentType.includes("application/json")) return;
+        const payload = (await res.json()) as NativeRuntimeLogsResponse;
+        if (!active) return;
+        setNativeRuntimeLogs(payload.logs.slice(-6));
+      } catch {
+        // best-effort polling
+      }
+    };
+    void poll();
+    const id = window.setInterval(() => {
+      void poll();
+    }, Boolean(room) ? 1000 : 5000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [roomName, room]);
+
+  useEffect(() => {
+    if (!NATIVE_EXPERIMENTAL_ENABLED) {
+      setNativeRuntime(null);
+      return;
+    }
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) {
+      setNativeRuntime(null);
+      return;
+    }
+
+    let active = true;
+    const poll = async () => {
+      try {
+        const res = await apiFetch(`${API_BASE}/native/runtime/${roomKey}`, {
+          headers: NATIVE_CONTROL_SECRET ? { "x-native-control-secret": NATIVE_CONTROL_SECRET } : undefined
+        });
+        if (!res.ok) return;
+        const contentType = res.headers.get("content-type") ?? "";
+        if (!contentType.includes("application/json")) return;
+        const payload = (await res.json()) as NativeRuntimeResponse;
+        if (!active) return;
+        setNativeRuntime(payload.runtime);
+      } catch {
+        // best-effort polling
+      }
+    };
+
+    void poll();
+    const id = window.setInterval(() => {
+      void poll();
+    }, Boolean(room) ? 1000 : 10000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [roomName, room]);
+
+  useEffect(() => {
+    if (!NATIVE_EXPERIMENTAL_ENABLED) {
+      setNativePublisher(null);
+      return;
+    }
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) {
+      setNativePublisher(null);
+      return;
+    }
+
+    let active = true;
+    const poll = async () => {
+      try {
+        const res = await apiFetch(`${API_BASE}/native/publisher/${roomKey}`);
+        if (!res.ok) return;
+        const contentType = res.headers.get("content-type") ?? "";
+        if (!contentType.includes("application/json")) return;
+        const payload = (await res.json()) as NativePublisherResponse;
+        if (!active) return;
+        const preferred =
+          payload.publishers.find((p) => p.identity.toLowerCase().includes("native-sender")) ??
+          payload.publishers[0] ??
+          null;
+        setNativePublisher(preferred);
       } catch {
         // best-effort polling, no user-facing toast needed
       }
@@ -610,6 +785,79 @@ export default function HomePage() {
     }
   }
 
+  async function startNativeRuntime() {
+    if (!NATIVE_EXPERIMENTAL_ENABLED) {
+      showToast("Native experimental mode is disabled.", "warning");
+      return;
+    }
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) {
+      showToast("Enter a room name before starting native runtime.", "warning");
+      return;
+    }
+    setNativeRuntimeBusy(true);
+    try {
+      const res = await apiFetch(`${API_BASE}/native/runtime/start`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(NATIVE_CONTROL_SECRET ? { "x-native-control-secret": NATIVE_CONTROL_SECRET } : {})
+        },
+        body: JSON.stringify({
+          roomName: roomKey,
+          identity: nativeRuntimeIdentity.trim() || "native-sender",
+          dryRun: nativeDryRun,
+          targetFps: nativeTargetFps,
+          probeSeconds: nativeProbeSeconds,
+          heartbeatSeconds: nativeHeartbeatSeconds,
+          capture: nativeCaptureMode,
+          encoder: nativeEncoderMode,
+          autoEnsureIngress: true
+        })
+      });
+      if (!res.ok) {
+        showToast("Failed to start native runtime. Check runtime logs section.", "error");
+        return;
+      }
+      showToast("Native runtime start requested.", "success");
+    } catch {
+      showToast("Failed to reach native runtime endpoint.", "error");
+    } finally {
+      setNativeRuntimeBusy(false);
+    }
+  }
+
+  async function stopNativeRuntime() {
+    if (!NATIVE_EXPERIMENTAL_ENABLED) {
+      showToast("Native experimental mode is disabled.", "warning");
+      return;
+    }
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) return;
+    setNativeRuntimeBusy(true);
+    try {
+      const res = await apiFetch(`${API_BASE}/native/runtime/stop`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(NATIVE_CONTROL_SECRET ? { "x-native-control-secret": NATIVE_CONTROL_SECRET } : {})
+        },
+        body: JSON.stringify({
+          roomName: roomKey
+        })
+      });
+      if (!res.ok) {
+        showToast("Failed to stop native runtime. Check runtime logs section.", "error");
+        return;
+      }
+      showToast("Native runtime stop requested.", "success");
+    } catch {
+      showToast("Failed to reach native runtime endpoint.", "error");
+    } finally {
+      setNativeRuntimeBusy(false);
+    }
+  }
+
   const statusLabel =
     callState === "connected"
       ? "Connected"
@@ -625,180 +873,96 @@ export default function HomePage() {
   const nativeUpdatedSeconds = nativeSession
     ? Math.max(0, Math.floor((Date.now() - new Date(nativeSession.updatedAt).getTime()) / 1000))
     : null;
+  const nativePublisherAgeSeconds = nativePublisher
+    ? Math.max(0, Math.floor((Date.now() - new Date(nativePublisher.updatedAt).getTime()) / 1000))
+    : null;
+  const nativeRuntimeAgeSeconds = nativeRuntime
+    ? Math.max(0, Math.floor((Date.now() - new Date(nativeRuntime.updatedAt).getTime()) / 1000))
+    : null;
 
   return (
-    <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(120,140,255,0.14),_transparent_42%),linear-gradient(180deg,_#04070f_0%,_#090d18_100%)] px-4 py-6 text-slate-100">
-      <div className="mx-auto flex w-full max-w-6xl flex-col gap-4">
-        <header className="flex items-center justify-between rounded-2xl border border-slate-800/70 bg-slate-950/70 px-5 py-4 backdrop-blur-md">
-          <div>
-            <h1 className="text-xl font-semibold tracking-tight">MyCord</h1>
-            <p className="text-xs text-slate-400">Clean 1:1 voice and screen collaboration</p>
-          </div>
-          <div className="flex items-center gap-2">
-            {nativeSession && (
+    <main className="min-h-screen bg-[#050608] font-mono text-[#F2F5F8]">
+      <div className="flex min-h-screen">
+        <aside className="hidden w-60 shrink-0 border-r border-[#1C2129] bg-[#07090C] p-4 md:flex md:flex-col">
+          <h1 className="mb-1 text-lg font-semibold tracking-tight">MyCord</h1>
+          <p className="mb-6 text-xs text-[#8E99A8]">Realtime collaboration console</p>
+          <nav className="space-y-1 text-sm">
+            <div className="rounded-sm border-l-2 border-[#22D3EE] bg-[#10141A] px-3 py-2 text-[#F2F5F8]">Sessions</div>
+            <div className="rounded-sm px-3 py-2 text-[#8E99A8]">Overview</div>
+            <div className="rounded-sm px-3 py-2 text-[#8E99A8]">Participants</div>
+            <div className="rounded-sm px-3 py-2 text-[#8E99A8]">Settings</div>
+          </nav>
+        </aside>
+
+        <div className="flex-1 p-4 md:p-6">
+          <header className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-[#1C2129] bg-[#0B0E12] px-4 py-3">
+            <div>
+              <h2 className="text-base font-semibold">Room Dashboard</h2>
+              <p className="text-xs text-[#8E99A8]">Low-latency voice and screen sessions</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {NATIVE_EXPERIMENTAL_ENABLED && nativeSession && (
+                <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-1 text-xs text-cyan-300">
+                  Native {nativeSession.backend} • {nativeSession.achievedFps.toFixed(1)}fps • {nativeSessionState}
+                  {nativeUpdatedSeconds !== null ? ` • ${nativeUpdatedSeconds}s ago` : ""}
+                </div>
+              )}
+              {NATIVE_EXPERIMENTAL_ENABLED && nativePublisher && (
+                <div className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-1 text-xs text-[#A3ACB8]">
+                  Publisher {nativePublisher.state}
+                  {nativePublisherAgeSeconds !== null ? ` • ${nativePublisherAgeSeconds}s ago` : ""}
+                </div>
+              )}
+              {NATIVE_EXPERIMENTAL_ENABLED && nativeRuntime && (
+                <div className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-1 text-xs text-[#A3ACB8]">
+                  Runtime {nativeRuntime.status}
+                  {nativeRuntimeAgeSeconds !== null ? ` • ${nativeRuntimeAgeSeconds}s ago` : ""}
+                </div>
+              )}
+              <button
+                onClick={copyInviteLink}
+                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-xs text-[#F2F5F8] transition duration-150 ease-out hover:bg-[#11161F]"
+              >
+                {copiedInvite ? "Copied" : "Copy Invite"}
+              </button>
               <div
                 className={classNames(
-                  "rounded-lg px-3 py-1 text-xs",
-                  nativeSessionState === "active" && "border border-emerald-500/40 bg-emerald-500/10 text-emerald-200",
-                  nativeSessionState === "stale" && "border border-amber-500/40 bg-amber-500/10 text-amber-200",
-                  nativeSessionState === "offline" && "border border-slate-700 bg-slate-900 text-slate-300"
+                  "rounded-lg border px-3 py-1 text-xs font-medium uppercase tracking-wide",
+                  connectionPill === "good" && "border-emerald-500/50 bg-emerald-500/20 text-emerald-300",
+                  connectionPill === "fair" && "border-amber-500/50 bg-amber-500/20 text-amber-300",
+                  connectionPill === "poor" && "border-red-500/50 bg-red-500/20 text-red-300"
                 )}
               >
-                Native {nativeSession.backend} • {nativeSession.achievedFps.toFixed(1)}fps • {nativeSessionState}
-                {nativeUpdatedSeconds !== null ? ` • ${nativeUpdatedSeconds}s ago` : ""}
+                {connectionPill}
               </div>
-            )}
-            <button
-              onClick={copyInviteLink}
-              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200 transition hover:border-slate-500 hover:bg-slate-800"
-            >
-              {copiedInvite ? "Copied" : "Copy Invite"}
-            </button>
-            <div
-              className={classNames(
-                "rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide",
-                connectionPill === "good" && "bg-emerald-500/20 text-emerald-300",
-                connectionPill === "fair" && "bg-amber-500/20 text-amber-300",
-                connectionPill === "poor" && "bg-rose-500/20 text-rose-300"
-              )}
-            >
-              {connectionPill}
             </div>
-          </div>
-        </header>
+          </header>
 
-        {!onCall && (
-          <section className="grid gap-4 rounded-2xl border border-slate-800/70 bg-slate-950/70 p-5 backdrop-blur md:grid-cols-5">
-            <input
-              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none transition focus:border-indigo-400"
-              placeholder="Your name"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-            />
-            <input
-              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none transition focus:border-indigo-400"
-              placeholder="Room ID"
-              value={roomName}
-              onChange={(e) => setRoomName(e.target.value)}
-            />
-            <select
-              value={qualityMode}
-              onChange={(e) => setQualityMode(e.target.value as QualityMode)}
-              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none transition focus:border-indigo-400"
-            >
-              <option value="smooth">Smooth (720p60)</option>
-              <option value="balanced">Balanced (1080p60)</option>
-              <option value="sharp">Sharp (1440p60)</option>
-            </select>
-            <select
-              className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none transition focus:border-indigo-400"
-              value={selectedMicId}
-              onChange={(e) => void switchMic(e.target.value)}
-            >
-              {audioInputs.length === 0 && <option value="">No microphone found</option>}
-              {audioInputs.map((mic) => (
-                <option key={mic.deviceId} value={mic.deviceId}>
-                  {mic.label || `Microphone ${mic.deviceId.slice(0, 8)}`}
-                </option>
-              ))}
-            </select>
-            <button
-              onClick={joinCall}
-              className="rounded-lg bg-indigo-600 px-4 py-2 font-medium transition hover:bg-indigo-500"
-            >
-              {callState === "connecting" ? "Joining..." : "Join Room"}
-            </button>
-          </section>
-        )}
-
-        {onCall && (
-          <>
-            <section className="grid gap-4 md:grid-cols-4">
-              <div className="relative rounded-2xl border border-slate-800/70 bg-slate-950/70 p-3 backdrop-blur md:col-span-3">
-                <div className="mb-2 flex items-center justify-between px-1">
-                  <p className="text-sm font-medium text-slate-300">
-                    {remoteIdentity} {remoteIsSpeaking ? "is speaking" : ""}
-                  </p>
-                  <div className="flex items-center gap-2 text-xs text-slate-400">
-                    {nativeSession && (
-                      <>
-                        <span>
-                          Native {nativeSession.backend} {nativeSession.achievedFps.toFixed(1)}fps ({nativeSessionState})
-                        </span>
-                        <span>•</span>
-                      </>
-                    )}
-                    <span>{statusLabel}</span>
-                    <span>•</span>
-                    <span>{formatElapsed(elapsedMs)}</span>
-                  </div>
-                </div>
-                <video
-                  ref={remoteVideoRef}
-                  autoPlay
-                  playsInline
-                  className={classNames(
-                    "aspect-video w-full rounded-xl bg-slate-900 object-contain",
-                    remoteIsSpeaking && "ring-2 ring-emerald-400/80"
-                  )}
-                />
-                <button
-                  onClick={toggleRemoteFullscreen}
-                  className="absolute bottom-5 right-5 rounded-lg border border-slate-700 bg-slate-900/90 px-3 py-2 text-xs text-slate-200 transition hover:border-slate-500 hover:bg-slate-800"
-                >
-                  {isRemoteFullscreen ? "Exit Fullscreen (F)" : "Fullscreen (F)"}
-                </button>
-              </div>
-
-              <div className="rounded-2xl border border-slate-800/70 bg-slate-950/70 p-3 backdrop-blur">
-                <p className="mb-2 px-1 text-sm font-medium text-slate-300">Your share preview</p>
-                <video
-                  ref={localVideoRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  className={classNames(
-                    "aspect-video w-full rounded-xl bg-slate-900 object-contain",
-                    localIsSpeaking && "ring-2 ring-emerald-400/80"
-                  )}
-                />
-                <p className="mt-2 px-1 text-xs text-slate-400">
-                  {isSharingScreen ? "Screen share active" : "Not sharing your screen"}
-                </p>
-                {screenCaptureStats && (
-                  <p className="mt-1 px-1 text-xs text-slate-500">
-                    Capturing: {screenCaptureStats.width}x{screenCaptureStats.height} @{" "}
-                    {screenCaptureStats.frameRate}fps
-                  </p>
-                )}
-              </div>
-            </section>
-
-            <section className="grid gap-3 rounded-2xl border border-slate-800/70 bg-slate-950/70 p-4 backdrop-blur md:grid-cols-6">
-              <button
-                onClick={toggleMute}
-                className={classNames(
-                  "rounded-lg px-3 py-2 transition",
-                  isMuted
-                    ? "border border-rose-600/60 bg-rose-950/40 text-rose-200 hover:bg-rose-950/60"
-                    : "border border-slate-700 bg-slate-900 text-slate-200 hover:border-slate-500 hover:bg-slate-800"
-                )}
-              >
-                {isMuted ? "Unmute (M)" : "Mute (M)"}
-              </button>
-              <button
-                onClick={toggleScreenShare}
-                className={classNames(
-                  "rounded-lg px-3 py-2 transition",
-                  isSharingScreen
-                    ? "border border-emerald-600/50 bg-emerald-950/30 text-emerald-200 hover:bg-emerald-950/50"
-                    : "border border-slate-700 bg-slate-900 text-slate-200 hover:border-slate-500 hover:bg-slate-800"
-                )}
-              >
-                {isSharingScreen ? "Stop Share (S)" : "Share Screen (S)"}
-              </button>
+          {!onCall && (
+            <section className="grid gap-4 rounded-md border border-[#1C2129] bg-[#0B0E12] p-4 md:grid-cols-5 md:p-6">
+              <input
+                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out placeholder:text-[#667185] focus:border-[#22D3EE]"
+                placeholder="Your name"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+              />
+              <input
+                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out placeholder:text-[#667185] focus:border-[#22D3EE]"
+                placeholder="Room ID"
+                value={roomName}
+                onChange={(e) => setRoomName(e.target.value)}
+              />
               <select
-                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm outline-none transition focus:border-indigo-400"
+                value={qualityMode}
+                onChange={(e) => setQualityMode(e.target.value as QualityMode)}
+                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
+              >
+                <option value="smooth">Smooth (720p60)</option>
+                <option value="balanced">Balanced (1080p60)</option>
+                <option value="sharp">Sharp (1440p60)</option>
+              </select>
+              <select
+                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
                 value={selectedMicId}
                 onChange={(e) => void switchMic(e.target.value)}
               >
@@ -810,59 +974,271 @@ export default function HomePage() {
                 ))}
               </select>
               <button
-                onClick={copyInviteLink}
-                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-slate-200 transition hover:border-slate-500 hover:bg-slate-800"
+                onClick={joinCall}
+                className="rounded-sm bg-[#22D3EE] px-4 py-2 text-sm font-medium text-[#050608] transition duration-150 ease-out hover:bg-[#67E8F9]"
               >
-                {copiedInvite ? "Copied link" : "Copy invite"}
-              </button>
-              <button
-                onClick={() => setPreferNativeSource((v) => !v)}
-                className={classNames(
-                  "rounded-lg border px-3 py-2 transition",
-                  preferNativeSource
-                    ? "border-indigo-500/50 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20"
-                    : "border-slate-700 bg-slate-900 text-slate-200 hover:border-slate-500 hover:bg-slate-800"
-                )}
-              >
-                {preferNativeSource ? "Prefer Native: ON" : "Prefer Native: OFF"}
-              </button>
-              <button
-                onClick={leaveCall}
-                className="rounded-lg border border-rose-600/60 bg-rose-950/40 px-3 py-2 text-rose-200 transition hover:bg-rose-950/60"
-              >
-                End Call
+                {callState === "connecting" ? "Joining..." : "Join Room"}
               </button>
             </section>
-          </>
-        )}
+          )}
 
-        <section className="rounded-2xl border border-slate-800/70 bg-slate-950/70 px-4 py-3 text-sm text-slate-400">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <p>
-              Browser: <span className="text-slate-200">{uaInfo.browser}</span> | OS:{" "}
-              <span className="text-slate-200">{uaInfo.os}</span>
-            </p>
-            <p className="text-xs text-slate-500">
-              Selected source: <span className="text-slate-300">{selectedSourceLabel}</span>
-            </p>
-            <p className="text-xs text-slate-500">{uaInfo.message}</p>
-          </div>
-          <div ref={remoteAudioContainerRef} />
-        </section>
+          {onCall && (
+            <div className="grid gap-4 md:grid-cols-12">
+              <section className="rounded-md border border-[#1C2129] bg-[#0B0E12] p-3 md:col-span-8">
+                <div className="mb-2 flex items-center justify-between px-1">
+                  <p className="text-sm font-medium text-[#DCE3EA]">
+                    {remoteIdentity} {remoteIsSpeaking ? "is speaking" : ""}
+                  </p>
+                  <div className="flex items-center gap-2 text-xs text-[#8E99A8]">
+                    <span>{statusLabel}</span>
+                    <span>•</span>
+                    <span>{formatElapsed(elapsedMs)}</span>
+                  </div>
+                </div>
+                <video
+                  ref={remoteVideoRef}
+                  autoPlay
+                  playsInline
+                  className={classNames(
+                    "aspect-video w-full rounded-sm bg-[#0A0D12] object-contain",
+                    remoteIsSpeaking && "ring-1 ring-cyan-400/70"
+                  )}
+                />
+                <button
+                  onClick={toggleRemoteFullscreen}
+                  className="mt-3 rounded-sm border border-[#2A313D] bg-[#0D1117] px-3 py-2 text-xs text-[#DCE3EA] transition duration-150 ease-out hover:bg-[#151A23]"
+                >
+                  {isRemoteFullscreen ? "Exit Fullscreen (F)" : "Fullscreen (F)"}
+                </button>
+              </section>
 
-        {toastText && (
-          <section
-            className={classNames(
-              "rounded-xl border px-4 py-3 text-sm",
-              toastTone === "error" && "border-rose-500/40 bg-rose-950/30 text-rose-200",
-              toastTone === "warning" && "border-amber-500/40 bg-amber-950/30 text-amber-200",
-              toastTone === "success" && "border-emerald-500/40 bg-emerald-950/30 text-emerald-200",
-              toastTone === "neutral" && "border-slate-700 bg-slate-900 text-slate-200"
-            )}
-          >
-            {toastText}
+              <section className="rounded-md border border-[#1C2129] bg-[#0B0E12] p-3 md:col-span-4">
+                <p className="mb-2 px-1 text-sm font-medium text-[#DCE3EA]">Your share preview</p>
+                <video
+                  ref={localVideoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className={classNames(
+                    "aspect-video w-full rounded-sm bg-[#0A0D12] object-contain",
+                    localIsSpeaking && "ring-1 ring-cyan-400/70"
+                  )}
+                />
+                <p className="mt-2 px-1 text-xs text-[#8E99A8]">
+                  {isSharingScreen ? "Screen share active" : "Not sharing your screen"}
+                </p>
+                {screenCaptureStats && (
+                  <p className="mt-1 px-1 text-xs text-[#667185]">
+                    Capturing: {screenCaptureStats.width}x{screenCaptureStats.height} @ {screenCaptureStats.frameRate}fps
+                  </p>
+                )}
+              </section>
+
+              <section className="rounded-md border border-[#1C2129] bg-[#0B0E12] p-4 md:col-span-12">
+                <div className="grid gap-3 md:grid-cols-6">
+                  <button
+                    onClick={toggleMute}
+                    className={classNames(
+                      "rounded-lg border px-3 py-2 text-sm transition duration-150 ease-out",
+                      isMuted
+                        ? "border-red-500/50 bg-red-500/20 text-red-300 hover:bg-red-500/25"
+                        : "border-[#1C2129] bg-[#090C11] text-[#F2F5F8] hover:bg-[#11161F]"
+                    )}
+                  >
+                    {isMuted ? "Unmute (M)" : "Mute (M)"}
+                  </button>
+                  <button
+                    onClick={toggleScreenShare}
+                    className={classNames(
+                      "rounded-lg border px-3 py-2 text-sm transition duration-150 ease-out",
+                      isSharingScreen
+                        ? "border-emerald-500/50 bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/25"
+                        : "border-[#1C2129] bg-[#090C11] text-[#F2F5F8] hover:bg-[#11161F]"
+                    )}
+                  >
+                    {isSharingScreen ? "Stop Share (S)" : "Share Screen (S)"}
+                  </button>
+                  <select
+                    className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
+                    value={selectedMicId}
+                    onChange={(e) => void switchMic(e.target.value)}
+                  >
+                    {audioInputs.length === 0 && <option value="">No microphone found</option>}
+                    {audioInputs.map((mic) => (
+                      <option key={mic.deviceId} value={mic.deviceId}>
+                        {mic.label || `Microphone ${mic.deviceId.slice(0, 8)}`}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={copyInviteLink}
+                    className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] transition duration-150 ease-out hover:bg-[#11161F]"
+                  >
+                    {copiedInvite ? "Copied link" : "Copy invite"}
+                  </button>
+                  {NATIVE_EXPERIMENTAL_ENABLED && (
+                    <button
+                      onClick={() => setPreferNativeSource((v) => !v)}
+                      className={classNames(
+                        "rounded-lg border px-3 py-2 text-sm transition duration-150 ease-out",
+                        preferNativeSource
+                          ? "border-cyan-500/50 bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/25"
+                          : "border-[#1C2129] bg-[#090C11] text-[#F2F5F8] hover:bg-[#11161F]"
+                      )}
+                    >
+                      {preferNativeSource ? "Prefer Native: ON" : "Prefer Native: OFF"}
+                    </button>
+                  )}
+                  <button
+                    onClick={leaveCall}
+                    className="rounded-sm border border-red-500/50 bg-red-500/20 px-3 py-2 text-sm text-red-300 transition duration-150 ease-out hover:bg-red-500/25"
+                  >
+                    End Call
+                  </button>
+                </div>
+              </section>
+
+              {NATIVE_EXPERIMENTAL_ENABLED && (
+              <section className="rounded-md border border-[#1C2129] bg-[#0B0E12] p-4 md:col-span-12">
+                  <div className="grid gap-3 md:grid-cols-4">
+                    <input
+                      value={nativeRuntimeIdentity}
+                      onChange={(e) => setNativeRuntimeIdentity(e.target.value.replace(/\s+/g, "_"))}
+                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
+                      placeholder="Native identity"
+                    />
+                    <select
+                      value={nativeCaptureMode}
+                      onChange={(e) => setNativeCaptureMode(e.target.value as NativeCaptureMode)}
+                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
+                    >
+                      <option value="auto">Capture: auto (DXGI to scrap fallback)</option>
+                      <option value="scrap">Capture: scrap (stable)</option>
+                      <option value="ffmpeg-ddagrab">Capture: ffmpeg-ddagrab (DXGI)</option>
+                    </select>
+                    <select
+                      value={nativeEncoderMode}
+                      onChange={(e) => setNativeEncoderMode(e.target.value as NativeEncoderMode)}
+                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
+                    >
+                      <option value="ffmpeg-h264-nvenc">Encoder: ffmpeg-h264-nvenc</option>
+                      <option value="ffmpeg-libx264">Encoder: ffmpeg-libx264</option>
+                      <option value="fast">Encoder: fast (placeholder)</option>
+                    </select>
+                    <label className="flex items-center gap-2 rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8]">
+                      <input type="checkbox" checked={nativeDryRun} onChange={(e) => setNativeDryRun(e.target.checked)} />
+                      Dry run
+                    </label>
+                    <input
+                      type="number"
+                      min={24}
+                      max={240}
+                      value={nativeTargetFps}
+                      onChange={(e) => setNativeTargetFps(Math.min(240, Math.max(24, Number(e.target.value) || 60)))}
+                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
+                      placeholder="Target FPS"
+                    />
+                    <input
+                      type="number"
+                      min={1}
+                      max={60}
+                      value={nativeProbeSeconds}
+                      onChange={(e) => setNativeProbeSeconds(Math.min(60, Math.max(1, Number(e.target.value) || 3)))}
+                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
+                      placeholder="Probe seconds"
+                    />
+                    <input
+                      type="number"
+                      min={1}
+                      max={60}
+                      value={nativeHeartbeatSeconds}
+                      onChange={(e) => setNativeHeartbeatSeconds(Math.min(60, Math.max(1, Number(e.target.value) || 1)))}
+                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
+                      placeholder="Heartbeat seconds"
+                    />
+                    <div className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-xs text-[#A3ACB8]">
+                      Runtime identity: <span className="text-[#DCE3EA]">{nativeRuntime?.identity ?? "native-sender"}</span>
+                    </div>
+                    <button
+                      onClick={startNativeRuntime}
+                      disabled={nativeRuntimeBusy || nativeRuntime?.status === "running" || nativeRuntime?.status === "starting"}
+                      className={classNames(
+                        "rounded-lg border px-3 py-2 text-sm transition duration-150 ease-out",
+                        nativeRuntimeBusy || nativeRuntime?.status === "running" || nativeRuntime?.status === "starting"
+                          ? "cursor-not-allowed border-[#1C2129] bg-[#090C11] text-[#667185]"
+                          : "border-emerald-500/50 bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/25"
+                      )}
+                    >
+                      {nativeRuntimeBusy ? "Working..." : "Start Native Runtime"}
+                    </button>
+                    <button
+                      onClick={stopNativeRuntime}
+                      disabled={nativeRuntimeBusy || !nativeRuntime || nativeRuntime.status === "idle"}
+                      className={classNames(
+                        "rounded-lg border px-3 py-2 text-sm transition duration-150 ease-out",
+                        nativeRuntimeBusy || !nativeRuntime || nativeRuntime.status === "idle"
+                          ? "cursor-not-allowed border-[#1C2129] bg-[#090C11] text-[#667185]"
+                          : "border-red-500/50 bg-red-500/20 text-red-300 hover:bg-red-500/25"
+                      )}
+                    >
+                      {nativeRuntimeBusy ? "Working..." : "Stop Native Runtime"}
+                    </button>
+                    <div className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-xs text-[#A3ACB8]">
+                      {nativeRuntime?.lastError ? `Last runtime error: ${nativeRuntime.lastError}` : "Last runtime error: none"}
+                    </div>
+                  </div>
+                </section>
+              )}
+
+              {NATIVE_EXPERIMENTAL_ENABLED && (
+              <section className="rounded-md border border-[#1C2129] bg-[#0B0E12] p-4 md:col-span-12">
+                  <p className="mb-2 text-xs uppercase tracking-wide text-[#667185]">Native runtime logs</p>
+                  {nativeRuntimeLogs.length === 0 ? (
+                    <p className="text-xs text-[#667185]">No runtime logs yet.</p>
+                  ) : (
+                    <div className="space-y-1 text-xs">
+                      {nativeRuntimeLogs.map((log, idx) => (
+                        <p key={`${log.ts}-${idx}`} className="rounded-sm bg-[#090C11] px-2 py-1 text-[#A3ACB8]">
+                          <span className="text-[#667185]">{new Date(log.ts).toLocaleTimeString()} </span>
+                          <span className="text-cyan-300/70">[{log.stream}] </span>
+                          {log.message}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              )}
+            </div>
+          )}
+
+          <section className="mt-4 rounded-md border border-[#1C2129] bg-[#0B0E12] px-4 py-3 text-sm text-[#A3ACB8]">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p>
+                Browser: <span className="text-[#DCE3EA]">{uaInfo.browser}</span> | OS:{" "}
+                <span className="text-[#DCE3EA]">{uaInfo.os}</span>
+              </p>
+              <p className="text-xs">
+                Selected source: <span className="text-[#DCE3EA]">{selectedSourceLabel}</span>
+              </p>
+              <p className="text-xs text-[#667185]">{uaInfo.message}</p>
+            </div>
+            <div ref={remoteAudioContainerRef} />
           </section>
-        )}
+
+          {toastText && (
+            <section
+              className={classNames(
+                "fixed bottom-4 right-4 z-50 max-w-md rounded-sm border px-4 py-3 text-sm",
+                toastTone === "error" && "border-red-500/50 bg-red-500/20 text-red-300",
+                toastTone === "warning" && "border-amber-500/50 bg-amber-500/20 text-amber-300",
+                toastTone === "success" && "border-emerald-500/50 bg-emerald-500/20 text-emerald-300",
+                toastTone === "neutral" && "border-[#1C2129] bg-[#0B0E12] text-[#F2F5F8]"
+              )}
+            >
+              {toastText}
+            </section>
+          )}
+        </div>
       </div>
     </main>
   );

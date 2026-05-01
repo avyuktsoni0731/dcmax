@@ -40,6 +40,20 @@ struct NativeSessionRequest<'a> {
     avg_payload_bytes: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct NativePublisherEventRequest<'a> {
+    #[serde(rename = "roomName")]
+    room_name: &'a str,
+    identity: &'a str,
+    state: &'a str,
+    backend: &'a str,
+    #[serde(rename = "captureBackend")]
+    capture_backend: &'a str,
+    #[serde(rename = "encoderBackend")]
+    encoder_backend: &'a str,
+    message: Option<&'a str>,
+}
+
 pub async fn health_check(client: &Client, api_base_url: &str) -> Result<()> {
     let endpoint = format!("{}/health", api_base_url.trim_end_matches('/'));
     let res = client
@@ -132,6 +146,43 @@ pub async fn report_native_session(
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
         anyhow::bail!("native session report returned {}: {}", status, body);
+    }
+    Ok(())
+}
+
+pub async fn report_native_publisher_event(
+    client: &Client,
+    api_base_url: &str,
+    room_name: &str,
+    identity: &str,
+    state: &str,
+    backend: &str,
+    capture_backend: &str,
+    encoder_backend: &str,
+    message: Option<&str>,
+) -> Result<()> {
+    let endpoint = format!("{}/native/publisher/events", api_base_url.trim_end_matches('/'));
+    let req = NativePublisherEventRequest {
+        room_name,
+        identity,
+        state,
+        backend,
+        capture_backend,
+        encoder_backend,
+        message,
+    };
+
+    let res = client
+        .post(endpoint)
+        .json(&req)
+        .send()
+        .await
+        .context("native publisher event request failed")?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        anyhow::bail!("native publisher event returned {}: {}", status, body);
     }
     Ok(())
 }

@@ -9,7 +9,12 @@ use clap::Parser;
 use capture::CaptureTuning;
 use config::{AppConfig, CliArgs, TargetPlatform};
 use platform::CaptureBackend;
+use publisher::PublisherState;
 use reqwest::Client;
+use std::io::{BufRead, BufReader};
+use std::process::Child;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use tokio::time::{interval, Duration};
 
 async fn post_native_report(client: &Client, config: &AppConfig, report: &capture::PipelineReport) -> Result<()> {
@@ -26,6 +31,37 @@ async fn post_native_report(client: &Client, config: &AppConfig, report: &captur
         report.avg_payload_bytes,
     )
     .await
+}
+
+async fn post_publisher_event(
+    client: &Client,
+    config: &AppConfig,
+    state: PublisherState,
+    backend: &str,
+    message: Option<&str>,
+) -> Result<()> {
+    let capture_backend = format!("{:?}", config.capture_backend).to_ascii_lowercase();
+    let encoder_backend = format!("{:?}", config.encoder_backend).to_ascii_lowercase();
+    api::report_native_publisher_event(
+        client,
+        &config.api_base_url,
+        &config.room_name,
+        &config.identity,
+        state.as_str(),
+        backend,
+        &capture_backend,
+        &encoder_backend,
+        message,
+    )
+    .await
+}
+
+fn stop_publisher_child(child: &mut Option<Child>) {
+    if let Some(proc) = child.as_mut() {
+        let _ = proc.kill();
+        let _ = proc.wait();
+    }
+    *child = None;
 }
 
 #[tokio::main]
@@ -75,48 +111,150 @@ async fn main() -> Result<()> {
         }
         println!("selected backend: {}", backend.name());
         println!("hint: {}", backend.diagnostics_hint());
+        let _ = post_publisher_event(&client, &config, PublisherState::Starting, backend.name(), None).await;
+        if let Err(err) = publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await {
+            let _ = post_publisher_event(
+                &client,
+                &config,
+                PublisherState::Error,
+                backend.name(),
+                Some("publisher bootstrap failed"),
+            )
+            .await;
+            anyhow::bail!("publisher bootstrap failed: {}", err);
+        }
+        let mut ffmpeg_publisher: Option<Child> = if config.dry_run {
+            None
+        } else {
+            match publisher::start_ffmpeg_whip_publisher(
+                backend.name(),
+                &token,
+                config.target_fps,
+                config.capture_backend,
+                config.encoder_backend,
+            ) {
+                Ok(child) => {
+                    println!("ffmpeg WHIP publisher process started");
+                    Some(child)
+                }
+                Err(err) => {
+                    let _ = post_publisher_event(
+                        &client,
+                        &config,
+                        PublisherState::Error,
+                        backend.name(),
+                        Some("ffmpeg WHIP publisher failed to start"),
+                    )
+                    .await;
+                    anyhow::bail!("ffmpeg WHIP publisher failed to start: {}", err);
+                }
+            }
+        };
+        let ffmpeg_stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        if let Some(proc) = ffmpeg_publisher.as_mut() {
+            if let Some(stderr) = proc.stderr.take() {
+                let stderr_tail = Arc::clone(&ffmpeg_stderr_tail);
+                thread::spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines() {
+                        let line = match line {
+                            Ok(value) => value,
+                            Err(_) => break,
+                        };
+                        eprintln!("[ffmpeg-whip] {}", line);
+                        if let Ok(mut guard) = stderr_tail.lock() {
+                            if !guard.is_empty() {
+                                guard.push('\n');
+                            }
+                            guard.push_str(&line);
+                            if guard.len() > 4000 {
+                                let keep_from = guard.len().saturating_sub(3000);
+                                *guard = guard[keep_from..].to_string();
+                            }
+                        }
+                    }
+                });
+            }
+        }
         let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
         if let Some(report) = report {
-            post_native_report(&client, &config, &report).await?;
+            let last_report = report;
+            post_native_report(&client, &config, &last_report).await?;
             println!("native session report: posted");
+            let _ = post_publisher_event(&client, &config, PublisherState::Running, backend.name(), None).await;
             if !config.dry_run {
                 println!(
                     "native session heartbeat started (every {}s). Press Ctrl+C to stop.",
                     config.heartbeat_seconds
                 );
                 let mut ticker = interval(Duration::from_secs(config.heartbeat_seconds));
-                let heartbeat_tuning = CaptureTuning {
-                    target_fps: config.target_fps,
-                    probe_seconds: 1,
-                    encoder_backend: config.encoder_backend,
-                    capture_backend: config.capture_backend,
-                };
                 loop {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => {
                             println!("shutdown signal received, stopping native sender heartbeat");
+                            stop_publisher_child(&mut ffmpeg_publisher);
+                            let _ = post_publisher_event(
+                                &client,
+                                &config,
+                                PublisherState::Stopped,
+                                backend.name(),
+                                Some("shutdown signal received"),
+                            )
+                            .await;
                             break;
                         }
                         _ = ticker.tick() => {
-                            match backend.bootstrap_capture_pipeline(false, heartbeat_tuning) {
-                                Ok(Some(live_report)) => {
-                                    if let Err(err) = post_native_report(&client, &config, &live_report).await {
-                                        eprintln!("native session heartbeat post failed: {}", err);
+                            if let Some(proc) = ffmpeg_publisher.as_mut() {
+                                match proc.try_wait() {
+                                    Ok(Some(status)) => {
+                                        let mut msg = format!("ffmpeg WHIP publisher exited: {}", status);
+                                        let stderr_tail = ffmpeg_stderr_tail
+                                            .lock()
+                                            .map(|s| s.clone())
+                                            .unwrap_or_default();
+                                        if !stderr_tail.trim().is_empty() {
+                                            msg = format!("{} :: {}", msg, stderr_tail.trim());
+                                            if stderr_tail.contains("Invalid answer: OK") {
+                                                msg = format!(
+                                                    "{} :: hint: LiveKit signaling URL is not a WHIP ingest endpoint. Set LIVEKIT_WHIP_URL (and optionally LIVEKIT_WHIP_BEARER_TOKEN) for a valid ingest target.",
+                                                    msg
+                                                );
+                                            }
+                                        }
+                                        let _ = post_publisher_event(
+                                            &client,
+                                            &config,
+                                            PublisherState::Error,
+                                            backend.name(),
+                                            Some("ffmpeg WHIP publisher exited"),
+                                        )
+                                        .await;
+                                        anyhow::bail!("{}", msg);
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        eprintln!("ffmpeg WHIP publisher status check failed: {}", err);
                                     }
                                 }
-                                Ok(None) => {
-                                    // no-op
-                                }
-                                Err(err) => {
-                                    eprintln!("native session heartbeat sampling failed: {}", err);
-                                }
+                            }
+
+                            if let Err(err) = post_native_report(&client, &config, &last_report).await {
+                                eprintln!("native session heartbeat post failed: {}", err);
+                                let _ = post_publisher_event(
+                                    &client,
+                                    &config,
+                                    PublisherState::Error,
+                                    backend.name(),
+                                    Some("native session heartbeat post failed"),
+                                )
+                                .await;
                             }
                         }
                     }
                 }
             }
         }
-        publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await;
+        stop_publisher_child(&mut ffmpeg_publisher);
         return Ok(());
     }
 
@@ -128,10 +266,23 @@ async fn main() -> Result<()> {
         }
         println!("selected backend: {}", backend.name());
         println!("hint: {}", backend.diagnostics_hint());
+        let _ = post_publisher_event(&client, &config, PublisherState::Starting, backend.name(), None).await;
+        if let Err(err) = publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await {
+            let _ = post_publisher_event(
+                &client,
+                &config,
+                PublisherState::Error,
+                backend.name(),
+                Some("publisher bootstrap failed"),
+            )
+            .await;
+            anyhow::bail!("publisher bootstrap failed: {}", err);
+        }
         let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
         if let Some(report) = report {
             post_native_report(&client, &config, &report).await?;
             println!("native session report: posted");
+            let _ = post_publisher_event(&client, &config, PublisherState::Running, backend.name(), None).await;
             if !config.dry_run {
                 println!(
                     "native session heartbeat started (every {}s). Press Ctrl+C to stop.",
@@ -148,6 +299,14 @@ async fn main() -> Result<()> {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => {
                             println!("shutdown signal received, stopping native sender heartbeat");
+                            let _ = post_publisher_event(
+                                &client,
+                                &config,
+                                PublisherState::Stopped,
+                                backend.name(),
+                                Some("shutdown signal received"),
+                            )
+                            .await;
                             break;
                         }
                         _ = ticker.tick() => {
@@ -155,6 +314,14 @@ async fn main() -> Result<()> {
                                 Ok(Some(live_report)) => {
                                     if let Err(err) = post_native_report(&client, &config, &live_report).await {
                                         eprintln!("native session heartbeat post failed: {}", err);
+                                        let _ = post_publisher_event(
+                                            &client,
+                                            &config,
+                                            PublisherState::Error,
+                                            backend.name(),
+                                            Some("native session heartbeat post failed"),
+                                        )
+                                        .await;
                                     }
                                 }
                                 Ok(None) => {
@@ -162,6 +329,14 @@ async fn main() -> Result<()> {
                                 }
                                 Err(err) => {
                                     eprintln!("native session heartbeat sampling failed: {}", err);
+                                    let _ = post_publisher_event(
+                                        &client,
+                                        &config,
+                                        PublisherState::Error,
+                                        backend.name(),
+                                        Some("native session heartbeat sampling failed"),
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -169,7 +344,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await;
         return Ok(());
     }
 
