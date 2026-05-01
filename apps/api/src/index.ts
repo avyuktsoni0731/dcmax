@@ -53,7 +53,8 @@ const tokenSchema = z.object({
     .string()
     .min(2)
     .max(32)
-    .regex(/^[a-zA-Z0-9_-]+$/)
+    .regex(/^[a-zA-Z0-9_-]+$/),
+  clientType: z.enum(["web", "native_sender"]).default("web")
 });
 
 app.post("/token", async (req, res) => {
@@ -63,17 +64,24 @@ app.post("/token", async (req, res) => {
     return;
   }
 
-  const { roomName, identity } = parsed.data;
+  const { roomName, identity, clientType } = parsed.data;
   const at = new AccessToken(env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET, {
     identity
   });
+
+  const canPublishData = clientType === "web";
+  const metadata =
+    clientType === "native_sender"
+      ? JSON.stringify({ role: "native_sender", source: "windows-desktop-duplication" })
+      : JSON.stringify({ role: "web_client" });
+  at.metadata = metadata;
 
   at.addGrant({
     roomJoin: true,
     room: roomName,
     canPublish: true,
     canSubscribe: true,
-    canPublishData: false
+    canPublishData
   });
 
   const token = await at.toJwt();

@@ -56,6 +56,7 @@ Defaults are configured for local LiveKit:
 ## Validation Matrix
 
 See `docs/test-matrix.md` for browser/OS validation checklist and known limitations.
+For the high-fidelity native-capture roadmap, see `docs/native-capture-blueprint.md`.
 
 ## Cross-Device HTTPS Setup (Recommended)
 
