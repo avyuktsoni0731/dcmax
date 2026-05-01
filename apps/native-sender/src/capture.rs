@@ -7,6 +7,14 @@ use anyhow::Result;
 pub struct CaptureTuning {
     pub target_fps: u32,
     pub probe_seconds: u64,
+    pub encoder_backend: EncoderBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderBackend {
+    Fast,
+    FfmpegLibx264,
+    FfmpegH264Nvenc,
 }
 
 #[cfg_attr(target_os = "windows", allow(dead_code))]

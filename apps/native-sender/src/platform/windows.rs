@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use scrap::{Capturer, Display};
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, TrySendError};
 use std::thread;
@@ -10,7 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_
 use super::CaptureBackend;
 use crate::capture::{
     adapt_to_encoder_input_bgra, encode_frame_fast, CaptureTuning, CapturedFrame, ConverterAcc,
-    EncodedFrame, PipelineReport,
+    EncodedFrame, EncoderBackend, PipelineReport,
 };
 use crate::platform::windows_dxgi::probe_primary_adapter;
 
@@ -79,8 +79,38 @@ where
         let mut dropped: u64 = 0;
         let mut total_encode_latency_ms: f64 = 0.0;
         while let Ok(frame) = rx_enc_in.recv() {
-            let encoded = encode_frame_fast(frame);
+            let encode_start = Instant::now();
+            let encoded = match tuning.encoder_backend {
+                EncoderBackend::Fast => encode_frame_fast(frame),
+                EncoderBackend::FfmpegLibx264 => match encode_frame_ffmpeg_single(&frame, "libx264") {
+                    Ok(payload) => EncodedFrame {
+                        width: frame.width,
+                        height: frame.height,
+                        payload,
+                        capture_instant: frame.capture_instant,
+                        encoded_instant: Instant::now(),
+                    },
+                    Err(_) => {
+                        dropped += 1;
+                        continue;
+                    }
+                },
+                EncoderBackend::FfmpegH264Nvenc => match encode_frame_ffmpeg_single(&frame, "h264_nvenc") {
+                    Ok(payload) => EncodedFrame {
+                        width: frame.width,
+                        height: frame.height,
+                        payload,
+                        capture_instant: frame.capture_instant,
+                        encoded_instant: Instant::now(),
+                    },
+                    Err(_) => {
+                        dropped += 1;
+                        continue;
+                    }
+                },
+            };
             total_encode_latency_ms += encoded.encoded_instant.elapsed().as_secs_f64() * 1000.0;
+            total_encode_latency_ms += encode_start.elapsed().as_secs_f64() * 1000.0;
             match tx_pub.try_send(encoded) {
                 Ok(()) => encoded_frames += 1,
                 Err(TrySendError::Full(_)) => dropped += 1,
@@ -204,6 +234,58 @@ where
         publisher_avg_payload_bytes,
         capture_backend,
     })
+}
+
+fn encode_frame_ffmpeg_single(
+    frame: &crate::capture::EncoderInputFrame,
+    codec: &str,
+) -> Result<Vec<u8>> {
+    let size = format!("{}x{}", frame.width, frame.height);
+    let mut child = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("bgra")
+        .arg("-s")
+        .arg(size)
+        .arg("-r")
+        .arg("60")
+        .arg("-i")
+        .arg("pipe:0")
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-an")
+        .arg("-c:v")
+        .arg(codec)
+        .arg("-f")
+        .arg("h264")
+        .arg("pipe:1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn ffmpeg encoder ({codec})"))?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("ffmpeg stdin missing for encoder")?;
+        stdin
+            .write_all(&frame.bytes)
+            .context("failed writing raw frame bytes to ffmpeg encoder stdin")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed waiting for ffmpeg encoder process output")?;
+    if !output.status.success() {
+        anyhow::bail!("ffmpeg encoder exited with non-zero status");
+    }
+    Ok(output.stdout)
 }
 
 fn run_windows_desktop_capture_probe_scrap(tuning: CaptureTuning) -> Result<DesktopCaptureProbeStats> {

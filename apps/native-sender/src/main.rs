@@ -36,18 +36,20 @@ async fn main() -> Result<()> {
     let client = Client::new();
 
     println!(
-        "native-sender starting: room='{}' identity='{}' platform='{:?}' dry_run={} target_fps={} probe_seconds={} heartbeat_seconds={}",
+        "native-sender starting: room='{}' identity='{}' platform='{:?}' dry_run={} target_fps={} probe_seconds={} heartbeat_seconds={} encoder={:?}",
         config.room_name,
         config.identity,
         config.platform,
         config.dry_run,
         config.target_fps,
         config.probe_seconds,
-        config.heartbeat_seconds
+        config.heartbeat_seconds,
+        config.encoder_backend
     );
     let tuning = CaptureTuning {
         target_fps: config.target_fps,
         probe_seconds: config.probe_seconds,
+        encoder_backend: config.encoder_backend,
     };
 
     api::health_check(&client, &config.api_base_url).await?;
@@ -84,6 +86,7 @@ async fn main() -> Result<()> {
                 let heartbeat_tuning = CaptureTuning {
                     target_fps: config.target_fps,
                     probe_seconds: 1,
+                    encoder_backend: config.encoder_backend,
                 };
                 loop {
                     tokio::select! {
@@ -135,6 +138,7 @@ async fn main() -> Result<()> {
                 let heartbeat_tuning = CaptureTuning {
                     target_fps: config.target_fps,
                     probe_seconds: 1,
+                    encoder_backend: config.encoder_backend,
                 };
                 loop {
                     tokio::select! {

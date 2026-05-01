@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use clap::Parser;
+use crate::capture::EncoderBackend;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "native-sender")]
@@ -19,6 +20,8 @@ pub struct CliArgs {
     pub probe_seconds: u64,
     #[arg(long, default_value_t = 3)]
     pub heartbeat_seconds: u64,
+    #[arg(long, default_value = "fast")]
+    pub encoder: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +53,7 @@ pub struct AppConfig {
     pub target_fps: u32,
     pub probe_seconds: u64,
     pub heartbeat_seconds: u64,
+    pub encoder_backend: EncoderBackend,
 }
 
 impl AppConfig {
@@ -91,6 +95,15 @@ impl AppConfig {
         if args.heartbeat_seconds == 0 || args.heartbeat_seconds > 60 {
             bail!("--heartbeat-seconds must be between 1 and 60");
         }
+        let encoder_backend = match args.encoder.to_ascii_lowercase().as_str() {
+            "fast" => EncoderBackend::Fast,
+            "ffmpeg-libx264" => EncoderBackend::FfmpegLibx264,
+            "ffmpeg-h264-nvenc" => EncoderBackend::FfmpegH264Nvenc,
+            other => bail!(
+                "invalid --encoder value '{}'; expected fast|ffmpeg-libx264|ffmpeg-h264-nvenc",
+                other
+            ),
+        };
 
         Ok(Self {
             api_base_url,
@@ -102,6 +115,7 @@ impl AppConfig {
             target_fps: args.target_fps,
             probe_seconds: args.probe_seconds,
             heartbeat_seconds: args.heartbeat_seconds,
+            encoder_backend,
         })
     }
 }

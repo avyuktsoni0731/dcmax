@@ -43,6 +43,7 @@ cargo run -- --dry-run
 - `--target-fps <fps>` probe/pipeline target fps (default `60`)
 - `--probe-seconds <sec>` pacing probe duration when not dry-run (default `5`)
 - `--heartbeat-seconds <sec>` API report heartbeat interval after probe (default `3`)
+- `--encoder fast|ffmpeg-libx264|ffmpeg-h264-nvenc` choose encoder stage backend
 
 ## Current status (M1)
 
@@ -58,6 +59,7 @@ cargo run -- --dry-run
 - Windows capture now attempts `ffmpeg` DXGI source (`ddagrab`) first, then falls back to `scrap`
 - Native sender now posts session quality reports to API (`POST /native/sessions`)
 - Native sender keeps posting heartbeat reports until stopped (`Ctrl+C`)
+- Windows encoder stage can now run FFmpeg H.264 encoding (NVENC/libx264) for real encode telemetry
 
 ## FFmpeg Requirement (Windows Real Capture Path)
 
