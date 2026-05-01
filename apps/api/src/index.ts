@@ -17,6 +17,18 @@ const envSchema = z.object({
 
 const env = envSchema.parse(process.env);
 const app = express();
+type NativeSessionRecord = {
+  roomName: string;
+  identity: string;
+  backend: string;
+  achievedFps: number;
+  producedFrames: number;
+  droppedFrames: number;
+  avgIngestLatencyMs: number;
+  avgPayloadBytes: number;
+  updatedAt: string;
+};
+const nativeSessions = new Map<string, NativeSessionRecord>();
 const allowedOrigins = (
   env.WEB_ORIGINS ??
   env.WEB_ORIGIN ??
@@ -41,6 +53,44 @@ app.use(express.json());
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+const nativeSessionSchema = z.object({
+  roomName: z.string().min(2).max(64).regex(/^[a-zA-Z0-9_-]+$/),
+  identity: z.string().min(2).max(64),
+  backend: z.string().min(2).max(64),
+  achievedFps: z.number().min(0),
+  producedFrames: z.number().int().min(0),
+  droppedFrames: z.number().int().min(0),
+  avgIngestLatencyMs: z.number().min(0),
+  avgPayloadBytes: z.number().int().min(0)
+});
+
+app.post("/native/sessions", (req, res) => {
+  const parsed = nativeSessionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid native session payload", details: parsed.error.flatten() });
+    return;
+  }
+
+  const payload = parsed.data;
+  const key = `${payload.roomName}:${payload.identity}`;
+  const record: NativeSessionRecord = {
+    ...payload,
+    updatedAt: new Date().toISOString()
+  };
+  nativeSessions.set(key, record);
+  res.json({ ok: true, key, record });
+});
+
+app.get("/native/sessions/:roomName", (req, res) => {
+  const roomName = req.params.roomName;
+  const entries = Array.from(nativeSessions.values()).filter((row) => row.roomName === roomName);
+  res.json({
+    roomName,
+    count: entries.length,
+    sessions: entries
+  });
 });
 
 const tokenSchema = z.object({

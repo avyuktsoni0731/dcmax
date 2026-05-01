@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use clap::Parser;
+use crate::capture::{CaptureBackend, EncoderBackend};
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "native-sender")]
@@ -17,6 +18,12 @@ pub struct CliArgs {
     pub target_fps: u32,
     #[arg(long, default_value_t = 5)]
     pub probe_seconds: u64,
+    #[arg(long, default_value_t = 3)]
+    pub heartbeat_seconds: u64,
+    #[arg(long, default_value = "fast")]
+    pub encoder: String,
+    #[arg(long, default_value = "scrap")]
+    pub capture: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +54,9 @@ pub struct AppConfig {
     pub dry_run: bool,
     pub target_fps: u32,
     pub probe_seconds: u64,
+    pub heartbeat_seconds: u64,
+    pub encoder_backend: EncoderBackend,
+    pub capture_backend: CaptureBackend,
 }
 
 impl AppConfig {
@@ -85,6 +95,27 @@ impl AppConfig {
         if args.probe_seconds == 0 || args.probe_seconds > 60 {
             bail!("--probe-seconds must be between 1 and 60");
         }
+        if args.heartbeat_seconds == 0 || args.heartbeat_seconds > 60 {
+            bail!("--heartbeat-seconds must be between 1 and 60");
+        }
+        let encoder_backend = match args.encoder.to_ascii_lowercase().as_str() {
+            "fast" => EncoderBackend::Fast,
+            "ffmpeg-libx264" => EncoderBackend::FfmpegLibx264,
+            "ffmpeg-h264-nvenc" => EncoderBackend::FfmpegH264Nvenc,
+            other => bail!(
+                "invalid --encoder value '{}'; expected fast|ffmpeg-libx264|ffmpeg-h264-nvenc",
+                other
+            ),
+        };
+        let capture_backend = match args.capture.to_ascii_lowercase().as_str() {
+            "auto" => CaptureBackend::Auto,
+            "scrap" => CaptureBackend::Scrap,
+            "ffmpeg-ddagrab" => CaptureBackend::FfmpegDdagrab,
+            other => bail!(
+                "invalid --capture value '{}'; expected auto|scrap|ffmpeg-ddagrab",
+                other
+            ),
+        };
 
         Ok(Self {
             api_base_url,
@@ -95,6 +126,9 @@ impl AppConfig {
             dry_run: args.dry_run,
             target_fps: args.target_fps,
             probe_seconds: args.probe_seconds,
+            heartbeat_seconds: args.heartbeat_seconds,
+            encoder_backend,
+            capture_backend,
         })
     }
 }

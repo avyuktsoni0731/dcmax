@@ -27,6 +27,23 @@ type TokenResponse = {
   token: string;
   url: string;
 };
+type NativeSession = {
+  roomName: string;
+  identity: string;
+  backend: string;
+  achievedFps: number;
+  producedFrames: number;
+  droppedFrames: number;
+  avgIngestLatencyMs: number;
+  avgPayloadBytes: number;
+  updatedAt: string;
+};
+type NativeSessionResponse = {
+  roomName: string;
+  count: number;
+  sessions: NativeSession[];
+};
+type NativeSessionState = "offline" | "stale" | "active";
 
 type ToastTone = "neutral" | "success" | "warning" | "error";
 type UaInfo = {
@@ -41,6 +58,7 @@ type ScreenCaptureStats = {
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:4000";
+const IS_NGROK_API = API_BASE.includes("ngrok-free.app");
 
 function classNames(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
@@ -59,6 +77,25 @@ function formatElapsed(ms: number): string {
   const ss = total % 60;
   if (hh > 0) return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
   return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+}
+
+function getNativeSessionState(session: NativeSession | null): NativeSessionState {
+  if (!session) return "offline";
+  const ageMs = Date.now() - new Date(session.updatedAt).getTime();
+  if (!Number.isFinite(ageMs) || ageMs < 0) return "stale";
+  if (ageMs <= 15_000) return "active";
+  return "stale";
+}
+
+async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+  const headers = new Headers(init?.headers ?? {});
+  if (IS_NGROK_API) {
+    headers.set("ngrok-skip-browser-warning", "true");
+  }
+  return fetch(input, {
+    ...init,
+    headers
+  });
 }
 
 export default function HomePage() {
@@ -82,6 +119,9 @@ export default function HomePage() {
   const [isRemoteFullscreen, setIsRemoteFullscreen] = useState(false);
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [screenCaptureStats, setScreenCaptureStats] = useState<ScreenCaptureStats | null>(null);
+  const [nativeSession, setNativeSession] = useState<NativeSession | null>(null);
+  const [preferNativeSource, setPreferNativeSource] = useState(true);
+  const [selectedSourceLabel, setSelectedSourceLabel] = useState("none");
   const [uaInfo, setUaInfo] = useState<UaInfo>({
     browser: "other",
     os: "other",
@@ -184,8 +224,85 @@ export default function HomePage() {
     return () => window.clearTimeout(t);
   }, [toastText]);
 
+  useEffect(() => {
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) {
+      setNativeSession(null);
+      return;
+    }
+
+    let active = true;
+    const poll = async () => {
+      try {
+        const res = await apiFetch(`${API_BASE}/native/sessions/${roomKey}`);
+        if (!res.ok) return;
+        const contentType = res.headers.get("content-type") ?? "";
+        if (!contentType.includes("application/json")) {
+          showToast("Native session API returned non-JSON response. Check ngrok tunnel/warning page.", "warning");
+          return;
+        }
+        const payload = (await res.json()) as NativeSessionResponse;
+        if (!active) return;
+        const preferred =
+          payload.sessions.find((s) => s.identity.toLowerCase().includes("native-sender")) ??
+          payload.sessions[0] ??
+          null;
+        setNativeSession(preferred);
+      } catch {
+        // best-effort polling, no user-facing toast needed
+      }
+    };
+
+    void poll();
+    const id = window.setInterval(() => {
+      void poll();
+    }, Boolean(room) ? 1000 : 10000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [roomName, room]);
+
+  useEffect(() => {
+    if (!room) return;
+    const participants = Array.from(room.remoteParticipants.values());
+    const native = participants.find((p) => p.identity.toLowerCase().includes("native"));
+    const nonNative = participants.find((p) => !p.identity.toLowerCase().includes("native"));
+    const preferred = preferNativeSource ? native ?? nonNative ?? null : nonNative ?? native ?? null;
+    if (!preferred) return;
+    setRemoteIdentity(preferred.identity);
+    setSelectedSourceLabel(preferred.identity.toLowerCase().includes("native") ? "native" : "web");
+    setRemoteIsSpeaking(preferred.isSpeaking);
+    const publications = Array.from(preferred.trackPublications.values());
+    const screenPub = publications.find(
+      (p) => p.track?.kind === Track.Kind.Video && p.trackName.includes("screen")
+    );
+    const camPub = publications.find((p) => p.track?.kind === Track.Kind.Video);
+    const targetPub = screenPub ?? camPub;
+    const videoTrack = targetPub?.videoTrack;
+    if (videoTrack && remoteVideoRef.current) {
+      videoTrack.attach(remoteVideoRef.current);
+    }
+    if (remoteAudioContainerRef.current) {
+      remoteAudioContainerRef.current.innerHTML = "";
+      const audioPublications = publications.filter((pub) => pub.track?.kind === Track.Kind.Audio);
+      for (const pub of audioPublications) {
+        const audioTrack = pub.audioTrack;
+        if (!audioTrack) continue;
+        const el = audioTrack.attach();
+        el.autoplay = true;
+        el.controls = false;
+        el.className = "hidden";
+        remoteAudioContainerRef.current.appendChild(el);
+        void el.play().catch(() => {
+          showToast("Remote audio is blocked by autoplay policy. Click anywhere and try again.", "warning");
+        });
+      }
+    }
+  }, [preferNativeSource, nativeSession, room]);
+
   async function requestToken(identity: string, roomToJoin: string): Promise<TokenResponse> {
-    const res = await fetch(`${API_BASE}/token`, {
+    const res = await apiFetch(`${API_BASE}/token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ identity, roomName: roomToJoin })
@@ -193,6 +310,10 @@ export default function HomePage() {
 
     if (!res.ok) {
       throw new Error("Token request failed");
+    }
+    const contentType = res.headers.get("content-type") ?? "";
+    if (!contentType.includes("application/json")) {
+      throw new Error("Token API returned non-JSON response. Check ngrok tunnel/warning page.");
     }
     return (await res.json()) as TokenResponse;
   }
@@ -208,6 +329,32 @@ export default function HomePage() {
     if (track && remoteVideoRef.current) {
       track.attach(remoteVideoRef.current);
     }
+  }
+
+  function pickPreferredParticipant(roomInstance: Room): Participant | null {
+    const participants = Array.from(roomInstance.remoteParticipants.values());
+    if (participants.length === 0) return null;
+    const native = participants.find((p) => p.identity.toLowerCase().includes("native"));
+    const nonNative = participants.find((p) => !p.identity.toLowerCase().includes("native"));
+    if (preferNativeSource) return native ?? nonNative ?? participants[0];
+    return nonNative ?? native ?? participants[0];
+  }
+
+  function refreshPreferredRemote(roomInstance: Room) {
+    const preferred = pickPreferredParticipant(roomInstance);
+    if (!preferred) {
+      setRemoteIdentity("Waiting for participant");
+      setRemoteIsSpeaking(false);
+      setSelectedSourceLabel("none");
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+      if (remoteAudioContainerRef.current) remoteAudioContainerRef.current.innerHTML = "";
+      return;
+    }
+    setRemoteIdentity(preferred.identity);
+    setSelectedSourceLabel(preferred.identity.toLowerCase().includes("native") ? "native" : "web");
+    setRemoteIsSpeaking(preferred.isSpeaking);
+    attachRemoteTrack(preferred);
+    attachRemoteAudio(preferred);
   }
 
   function attachRemoteAudio(participant: Participant) {
@@ -298,22 +445,14 @@ export default function HomePage() {
       roomInstance.on(RoomEvent.Reconnecting, () => setCallState("reconnecting"));
       roomInstance.on(RoomEvent.Reconnected, () => setCallState("connected"));
       roomInstance.on(RoomEvent.ParticipantConnected, (participant) => {
-        setRemoteIdentity(participant.identity);
         setRemoteIsSpeaking(participant.isSpeaking);
-        attachRemoteTrack(participant);
-        attachRemoteAudio(participant);
+        refreshPreferredRemote(roomInstance);
       });
       roomInstance.on(RoomEvent.ParticipantDisconnected, () => {
-        setRemoteIdentity("Waiting for participant");
-        setRemoteIsSpeaking(false);
-        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-        if (remoteAudioContainerRef.current) remoteAudioContainerRef.current.innerHTML = "";
+        refreshPreferredRemote(roomInstance);
       });
-      roomInstance.on(RoomEvent.TrackSubscribed, (_track, _publication, participant) => {
-        if (participant.identity === roomInstance.remoteParticipants.values().next().value?.identity) {
-          attachRemoteTrack(participant);
-          attachRemoteAudio(participant);
-        }
+      roomInstance.on(RoomEvent.TrackSubscribed, () => {
+        refreshPreferredRemote(roomInstance);
       });
       roomInstance.on(RoomEvent.LocalTrackPublished, () => {
         attachLocalScreen(roomInstance);
@@ -482,6 +621,10 @@ export default function HomePage() {
             ? "Ended"
             : "Idle";
   const onCall = Boolean(room);
+  const nativeSessionState = getNativeSessionState(nativeSession);
+  const nativeUpdatedSeconds = nativeSession
+    ? Math.max(0, Math.floor((Date.now() - new Date(nativeSession.updatedAt).getTime()) / 1000))
+    : null;
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(120,140,255,0.14),_transparent_42%),linear-gradient(180deg,_#04070f_0%,_#090d18_100%)] px-4 py-6 text-slate-100">
@@ -492,6 +635,19 @@ export default function HomePage() {
             <p className="text-xs text-slate-400">Clean 1:1 voice and screen collaboration</p>
           </div>
           <div className="flex items-center gap-2">
+            {nativeSession && (
+              <div
+                className={classNames(
+                  "rounded-lg px-3 py-1 text-xs",
+                  nativeSessionState === "active" && "border border-emerald-500/40 bg-emerald-500/10 text-emerald-200",
+                  nativeSessionState === "stale" && "border border-amber-500/40 bg-amber-500/10 text-amber-200",
+                  nativeSessionState === "offline" && "border border-slate-700 bg-slate-900 text-slate-300"
+                )}
+              >
+                Native {nativeSession.backend} • {nativeSession.achievedFps.toFixed(1)}fps • {nativeSessionState}
+                {nativeUpdatedSeconds !== null ? ` • ${nativeUpdatedSeconds}s ago` : ""}
+              </div>
+            )}
             <button
               onClick={copyInviteLink}
               className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200 transition hover:border-slate-500 hover:bg-slate-800"
@@ -564,6 +720,14 @@ export default function HomePage() {
                     {remoteIdentity} {remoteIsSpeaking ? "is speaking" : ""}
                   </p>
                   <div className="flex items-center gap-2 text-xs text-slate-400">
+                    {nativeSession && (
+                      <>
+                        <span>
+                          Native {nativeSession.backend} {nativeSession.achievedFps.toFixed(1)}fps ({nativeSessionState})
+                        </span>
+                        <span>•</span>
+                      </>
+                    )}
                     <span>{statusLabel}</span>
                     <span>•</span>
                     <span>{formatElapsed(elapsedMs)}</span>
@@ -610,7 +774,7 @@ export default function HomePage() {
               </div>
             </section>
 
-            <section className="grid gap-3 rounded-2xl border border-slate-800/70 bg-slate-950/70 p-4 backdrop-blur md:grid-cols-5">
+            <section className="grid gap-3 rounded-2xl border border-slate-800/70 bg-slate-950/70 p-4 backdrop-blur md:grid-cols-6">
               <button
                 onClick={toggleMute}
                 className={classNames(
@@ -652,6 +816,17 @@ export default function HomePage() {
                 {copiedInvite ? "Copied link" : "Copy invite"}
               </button>
               <button
+                onClick={() => setPreferNativeSource((v) => !v)}
+                className={classNames(
+                  "rounded-lg border px-3 py-2 transition",
+                  preferNativeSource
+                    ? "border-indigo-500/50 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20"
+                    : "border-slate-700 bg-slate-900 text-slate-200 hover:border-slate-500 hover:bg-slate-800"
+                )}
+              >
+                {preferNativeSource ? "Prefer Native: ON" : "Prefer Native: OFF"}
+              </button>
+              <button
                 onClick={leaveCall}
                 className="rounded-lg border border-rose-600/60 bg-rose-950/40 px-3 py-2 text-rose-200 transition hover:bg-rose-950/60"
               >
@@ -666,6 +841,9 @@ export default function HomePage() {
             <p>
               Browser: <span className="text-slate-200">{uaInfo.browser}</span> | OS:{" "}
               <span className="text-slate-200">{uaInfo.os}</span>
+            </p>
+            <p className="text-xs text-slate-500">
+              Selected source: <span className="text-slate-300">{selectedSourceLabel}</span>
             </p>
             <p className="text-xs text-slate-500">{uaInfo.message}</p>
           </div>

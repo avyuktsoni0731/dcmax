@@ -42,6 +42,9 @@ cargo run -- --dry-run
 - `--dry-run` skip media pipeline boot
 - `--target-fps <fps>` probe/pipeline target fps (default `60`)
 - `--probe-seconds <sec>` pacing probe duration when not dry-run (default `5`)
+- `--heartbeat-seconds <sec>` API report heartbeat interval after probe (default `3`)
+- `--encoder fast|ffmpeg-libx264|ffmpeg-h264-nvenc` choose encoder stage backend
+- `--capture auto|scrap|ffmpeg-ddagrab` choose capture backend (default `scrap`)
 
 ## Current status (M1)
 
@@ -49,5 +52,24 @@ cargo run -- --dry-run
 - Token fetch (`POST /token` with `clientType: native_sender`)
 - Platform backend selection (windows/macos)
 - Backend diagnostics hints and bootstrap placeholders
-- Capture pacing probe with measured achieved FPS (pre-DXGI/ScreenCaptureKit integration)
+- Windows desktop frame capture probe via `scrap` with measured achieved FPS/resolution
+- Windows DXGI adapter probe (primary GPU introspection) to prepare migration to Desktop Duplication
+- Cross-platform pacing probe scaffolding remains for future macOS ScreenCaptureKit integration
+- Encoder-ready frame contract (`CapturedFrame`) with capture timestamp and ingest-latency metrics
+- Encoder-input adapter stage (`EncoderInputFrame`) with conversion metrics and end-to-end ingest timing
+- Windows capture now attempts `ffmpeg` DXGI source (`ddagrab`) first, then falls back to `scrap`
+  - For machines where ffmpeg capture is unreliable, use `--capture scrap` (now default).
+- Native sender now posts session quality reports to API (`POST /native/sessions`)
+- Native sender keeps posting heartbeat reports until stopped (`Ctrl+C`)
+- Windows encoder stage can now run FFmpeg H.264 encoding (NVENC/libx264) for real encode telemetry
+
+## FFmpeg Requirement (Windows Real Capture Path)
+
+For the new `ffmpeg-ddagrab` backend, install FFmpeg and make sure `ffmpeg` is in `PATH`.
+
+Example (winget):
+
+```bash
+winget install Gyan.FFmpeg
+```
 
