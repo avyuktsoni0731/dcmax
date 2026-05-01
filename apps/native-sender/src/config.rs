@@ -17,6 +17,8 @@ pub struct CliArgs {
     pub target_fps: u32,
     #[arg(long, default_value_t = 5)]
     pub probe_seconds: u64,
+    #[arg(long, default_value_t = 3)]
+    pub heartbeat_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +49,7 @@ pub struct AppConfig {
     pub dry_run: bool,
     pub target_fps: u32,
     pub probe_seconds: u64,
+    pub heartbeat_seconds: u64,
 }
 
 impl AppConfig {
@@ -85,6 +88,9 @@ impl AppConfig {
         if args.probe_seconds == 0 || args.probe_seconds > 60 {
             bail!("--probe-seconds must be between 1 and 60");
         }
+        if args.heartbeat_seconds == 0 || args.heartbeat_seconds > 60 {
+            bail!("--heartbeat-seconds must be between 1 and 60");
+        }
 
         Ok(Self {
             api_base_url,
@@ -95,6 +101,7 @@ impl AppConfig {
             dry_run: args.dry_run,
             target_fps: args.target_fps,
             probe_seconds: args.probe_seconds,
+            heartbeat_seconds: args.heartbeat_seconds,
         })
     }
 }

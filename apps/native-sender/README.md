@@ -42,6 +42,7 @@ cargo run -- --dry-run
 - `--dry-run` skip media pipeline boot
 - `--target-fps <fps>` probe/pipeline target fps (default `60`)
 - `--probe-seconds <sec>` pacing probe duration when not dry-run (default `5`)
+- `--heartbeat-seconds <sec>` API report heartbeat interval after probe (default `3`)
 
 ## Current status (M1)
 
@@ -56,6 +57,7 @@ cargo run -- --dry-run
 - Encoder-input adapter stage (`EncoderInputFrame`) with conversion metrics and end-to-end ingest timing
 - Windows capture now attempts `ffmpeg` DXGI source (`ddagrab`) first, then falls back to `scrap`
 - Native sender now posts session quality reports to API (`POST /native/sessions`)
+- Native sender keeps posting heartbeat reports until stopped (`Ctrl+C`)
 
 ## FFmpeg Requirement (Windows Real Capture Path)
 
