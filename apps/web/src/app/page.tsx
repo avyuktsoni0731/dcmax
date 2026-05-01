@@ -315,34 +315,29 @@ export default function HomePage() {
           maxFramerate: quality.frameRate
         }
       };
+      const audioConstraints: MediaTrackConstraints = {
+        // Keep shared-system audio raw to preserve source volume dynamics.
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      };
 
-      try {
-        await localParticipant.setScreenShareEnabled(
-          true,
-          {
-            audio: true,
-            selfBrowserSurface: "include"
-          },
-          publishOptions
-        );
-      } catch {
-        try {
-          await localParticipant.setScreenShareEnabled(true, { audio: true }, publishOptions);
-          setErrorText("Screen sharing started, but advanced browser surface options were skipped.");
-        } catch {
-          await localParticipant.setScreenShareEnabled(true, { audio: false }, publishOptions);
-          setErrorText(
-            "Screen sharing started without audio. Windows/browser may not support system audio for this capture."
-          );
-        }
-      }
+      await localParticipant.setScreenShareEnabled(
+        true,
+        {
+          audio: audioConstraints as unknown as DisplayMediaStreamOptions["audio"],
+          selfBrowserSurface: "include",
+          systemAudio: "include"
+        },
+        publishOptions
+      );
       setIsSharingScreen(true);
       attachLocalScreen(room);
     } catch (err) {
       setErrorText(
         err instanceof Error
-          ? `Screen sharing failed: ${err.message}`
-          : "Screen sharing failed. Check browser permissions and OS support."
+          ? `Screen sharing with audio failed: ${err.message}. Re-try and ensure "Share system audio" is enabled in the picker.`
+          : 'Screen sharing with audio failed. Re-try and ensure "Share system audio" is enabled in the picker.'
       );
     }
   }
