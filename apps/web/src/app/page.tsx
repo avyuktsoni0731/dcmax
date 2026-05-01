@@ -86,6 +86,8 @@ type NativeRuntimeLogsResponse = {
   count: number;
   logs: NativeRuntimeLogEntry[];
 };
+type NativeCaptureMode = "auto" | "scrap" | "ffmpeg-ddagrab";
+type NativeEncoderMode = "fast" | "ffmpeg-libx264" | "ffmpeg-h264-nvenc";
 
 type ToastTone = "neutral" | "success" | "warning" | "error";
 type UaInfo = {
@@ -167,6 +169,13 @@ export default function HomePage() {
   const [nativeRuntime, setNativeRuntime] = useState<NativeRuntime | null>(null);
   const [nativeRuntimeLogs, setNativeRuntimeLogs] = useState<NativeRuntimeLogEntry[]>([]);
   const [nativeRuntimeBusy, setNativeRuntimeBusy] = useState(false);
+  const [nativeRuntimeIdentity, setNativeRuntimeIdentity] = useState("native-sender");
+  const [nativeTargetFps, setNativeTargetFps] = useState(60);
+  const [nativeProbeSeconds, setNativeProbeSeconds] = useState(3);
+  const [nativeHeartbeatSeconds, setNativeHeartbeatSeconds] = useState(1);
+  const [nativeCaptureMode, setNativeCaptureMode] = useState<NativeCaptureMode>("scrap");
+  const [nativeEncoderMode, setNativeEncoderMode] = useState<NativeEncoderMode>("ffmpeg-h264-nvenc");
+  const [nativeDryRun, setNativeDryRun] = useState(false);
   const [preferNativeSource, setPreferNativeSource] = useState(true);
   const [selectedSourceLabel, setSelectedSourceLabel] = useState("none");
   const [uaInfo, setUaInfo] = useState<UaInfo>({
@@ -775,13 +784,13 @@ export default function HomePage() {
         },
         body: JSON.stringify({
           roomName: roomKey,
-          identity: "native-sender",
-          dryRun: false,
-          targetFps: 60,
-          probeSeconds: 3,
-          heartbeatSeconds: 1,
-          capture: "scrap",
-          encoder: "ffmpeg-h264-nvenc"
+          identity: nativeRuntimeIdentity.trim() || "native-sender",
+          dryRun: nativeDryRun,
+          targetFps: nativeTargetFps,
+          probeSeconds: nativeProbeSeconds,
+          heartbeatSeconds: nativeHeartbeatSeconds,
+          capture: nativeCaptureMode,
+          encoder: nativeEncoderMode
         })
       });
       if (!res.ok) {
@@ -1095,6 +1104,65 @@ export default function HomePage() {
               </button>
             </section>
             <section className="grid gap-3 rounded-2xl border border-slate-800/70 bg-slate-950/70 p-4 backdrop-blur md:grid-cols-4">
+              <input
+                value={nativeRuntimeIdentity}
+                onChange={(e) => setNativeRuntimeIdentity(e.target.value.replace(/\s+/g, "_"))}
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 outline-none transition focus:border-indigo-400"
+                placeholder="Native identity"
+              />
+              <select
+                value={nativeCaptureMode}
+                onChange={(e) => setNativeCaptureMode(e.target.value as NativeCaptureMode)}
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 outline-none transition focus:border-indigo-400"
+              >
+                <option value="scrap">Capture: scrap (stable)</option>
+                <option value="ffmpeg-ddagrab">Capture: ffmpeg-ddagrab (DXGI)</option>
+                <option value="auto">Capture: auto</option>
+              </select>
+              <select
+                value={nativeEncoderMode}
+                onChange={(e) => setNativeEncoderMode(e.target.value as NativeEncoderMode)}
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 outline-none transition focus:border-indigo-400"
+              >
+                <option value="ffmpeg-h264-nvenc">Encoder: ffmpeg-h264-nvenc</option>
+                <option value="ffmpeg-libx264">Encoder: ffmpeg-libx264</option>
+                <option value="fast">Encoder: fast (placeholder)</option>
+              </select>
+              <label className="flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200">
+                <input
+                  type="checkbox"
+                  checked={nativeDryRun}
+                  onChange={(e) => setNativeDryRun(e.target.checked)}
+                />
+                Dry run
+              </label>
+              <input
+                type="number"
+                min={24}
+                max={240}
+                value={nativeTargetFps}
+                onChange={(e) => setNativeTargetFps(Math.min(240, Math.max(24, Number(e.target.value) || 60)))}
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 outline-none transition focus:border-indigo-400"
+                placeholder="Target FPS"
+              />
+              <input
+                type="number"
+                min={1}
+                max={60}
+                value={nativeProbeSeconds}
+                onChange={(e) => setNativeProbeSeconds(Math.min(60, Math.max(1, Number(e.target.value) || 3)))}
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 outline-none transition focus:border-indigo-400"
+                placeholder="Probe seconds"
+              />
+              <input
+                type="number"
+                min={1}
+                max={60}
+                value={nativeHeartbeatSeconds}
+                onChange={(e) => setNativeHeartbeatSeconds(Math.min(60, Math.max(1, Number(e.target.value) || 1)))}
+                className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 outline-none transition focus:border-indigo-400"
+                placeholder="Heartbeat seconds"
+              />
               <button
                 onClick={startNativeRuntime}
                 disabled={nativeRuntimeBusy || nativeRuntime?.status === "running" || nativeRuntime?.status === "starting"}
