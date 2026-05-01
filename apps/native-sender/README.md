@@ -54,4 +54,15 @@ cargo run -- --dry-run
 - Cross-platform pacing probe scaffolding remains for future macOS ScreenCaptureKit integration
 - Encoder-ready frame contract (`CapturedFrame`) with capture timestamp and ingest-latency metrics
 - Encoder-input adapter stage (`EncoderInputFrame`) with conversion metrics and end-to-end ingest timing
+- Windows capture now attempts `ffmpeg` DXGI source (`ddagrab`) first, then falls back to `scrap`
+
+## FFmpeg Requirement (Windows Real Capture Path)
+
+For the new `ffmpeg-ddagrab` backend, install FFmpeg and make sure `ffmpeg` is in `PATH`.
+
+Example (winget):
+
+```bash
+winget install Gyan.FFmpeg
+```
 

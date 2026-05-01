@@ -281,7 +281,11 @@ fn run_windows_desktop_capture_probe_ffmpeg(tuning: CaptureTuning) -> Result<Des
 
     let _ = child.kill();
     let _ = child.wait();
-    result
+    let stats = result?;
+    if stats.produced_frames == 0 {
+        anyhow::bail!("ffmpeg-ddagrab produced zero frames during probe window");
+    }
+    Ok(stats)
 }
 
 impl CaptureBackend for WindowsCaptureBackend {
