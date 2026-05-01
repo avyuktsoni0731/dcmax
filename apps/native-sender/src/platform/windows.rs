@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use scrap::{Capturer, Display};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
 use super::CaptureBackend;
 use crate::capture::{
@@ -35,13 +37,19 @@ struct DesktopCaptureProbeStats {
     encoder_avg_end_to_end_latency_ms: f64,
     publisher_avg_latency_ms: f64,
     publisher_avg_payload_bytes: usize,
+    capture_backend: &'static str,
 }
 
-fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCaptureProbeStats> {
-    let display = Display::primary().context("failed to resolve primary display")?;
-    let width = display.width();
-    let height = display.height();
-
+fn run_pipeline_with_frame_pump<F>(
+    tuning: CaptureTuning,
+    width: usize,
+    height: usize,
+    mut pump: F,
+    capture_backend: &'static str,
+) -> Result<DesktopCaptureProbeStats>
+where
+    F: FnMut() -> Result<Option<Vec<u8>>>,
+{
     let start = Instant::now();
     let deadline = Duration::from_secs(tuning.probe_seconds);
     let (tx, rx) = mpsc::sync_channel::<CapturedFrame>(32);
@@ -113,47 +121,35 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
         };
         (consumed_frames, consumed_bytes, avg_latency_ms, avg_payload_bytes)
     });
-    let mut capturer = Capturer::new(display).context("failed to initialize desktop capturer")?;
+
     let mut frames: u64 = 0;
     let mut would_block_events: u64 = 0;
     let mut poll_attempts: u64 = 0;
     let mut total_bytes: usize = 0;
     let mut pipeline_sent_frames: u64 = 0;
     let mut pipeline_dropped_frames: u64 = 0;
-    let frame_interval = Duration::from_micros(1_000_000 / tuning.target_fps as u64);
 
     while start.elapsed() < deadline {
         poll_attempts += 1;
-        match capturer.frame() {
-            Ok(frame) => {
+        match pump()? {
+            Some(frame_bytes) => {
                 frames += 1;
-                total_bytes += frame.len();
+                total_bytes += frame_bytes.len();
                 let captured = CapturedFrame {
                     width,
                     height,
-                    bytes: frame.to_vec(),
+                    bytes: frame_bytes,
                     capture_instant: Instant::now(),
                 };
                 match tx.try_send(captured) {
-                    Ok(()) => {
-                        pipeline_sent_frames += 1;
-                    }
-                    Err(TrySendError::Full(_)) => {
-                        pipeline_dropped_frames += 1;
-                    }
-                    Err(TrySendError::Disconnected(_)) => {
-                        pipeline_dropped_frames += 1;
-                    }
+                    Ok(()) => pipeline_sent_frames += 1,
+                    Err(TrySendError::Full(_)) => pipeline_dropped_frames += 1,
+                    Err(TrySendError::Disconnected(_)) => pipeline_dropped_frames += 1,
                 }
-                // Target pacing after successful frame capture.
-                thread::sleep(frame_interval);
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            None => {
                 would_block_events += 1;
                 thread::sleep(Duration::from_millis(1));
-            }
-            Err(err) => {
-                return Err(err).context("desktop frame capture failed");
             }
         }
     }
@@ -167,6 +163,7 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
     } else {
         0
     };
+
     drop(tx);
     let (converter_metrics, _adapter_sent, adapter_dropped) = adapter_worker
         .join()
@@ -205,7 +202,86 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
         encoder_avg_end_to_end_latency_ms: pipeline_avg_end_to_end_latency_ms,
         publisher_avg_latency_ms: pipeline_avg_end_to_end_latency_ms,
         publisher_avg_payload_bytes,
+        capture_backend,
     })
+}
+
+fn run_windows_desktop_capture_probe_scrap(tuning: CaptureTuning) -> Result<DesktopCaptureProbeStats> {
+    let display = Display::primary().context("failed to resolve primary display")?;
+    let width = display.width();
+    let height = display.height();
+    let mut capturer = Capturer::new(display).context("failed to initialize desktop capturer")?;
+    let frame_interval = Duration::from_micros(1_000_000 / tuning.target_fps as u64);
+    run_pipeline_with_frame_pump(
+        tuning,
+        width,
+        height,
+        move || match capturer.frame() {
+            Ok(frame) => {
+                thread::sleep(frame_interval);
+                Ok(Some(frame.to_vec()))
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(None),
+            Err(err) => Err(err).context("desktop frame capture failed"),
+        },
+        "scrap",
+    )
+}
+
+fn run_windows_desktop_capture_probe_ffmpeg(tuning: CaptureTuning) -> Result<DesktopCaptureProbeStats> {
+    let (width, height) = unsafe {
+        (
+            GetSystemMetrics(SM_CXSCREEN) as usize,
+            GetSystemMetrics(SM_CYSCREEN) as usize,
+        )
+    };
+    if width == 0 || height == 0 {
+        anyhow::bail!("failed to resolve screen dimensions for ffmpeg capture");
+    }
+    let frame_size = width * height * 4;
+    let filter = format!("ddagrab=framerate={}", tuning.target_fps);
+    let mut child = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg(filter)
+        .arg("-pix_fmt")
+        .arg("bgra")
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("pipe:1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn ffmpeg (install ffmpeg and ensure it is in PATH)")?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("failed to get ffmpeg stdout for rawvideo stream")?;
+
+    let result = run_pipeline_with_frame_pump(
+        tuning,
+        width,
+        height,
+        move || {
+            let mut frame = vec![0u8; frame_size];
+            match stdout.read_exact(&mut frame) {
+                Ok(()) => Ok(Some(frame)),
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(None),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(None),
+                Err(err) => Err(err).context("ffmpeg raw frame read failed"),
+            }
+        },
+        "ffmpeg-ddagrab",
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 impl CaptureBackend for WindowsCaptureBackend {
@@ -232,9 +308,19 @@ impl CaptureBackend for WindowsCaptureBackend {
             "[windows] running desktop capture probe at {} fps for {}s",
             tuning.target_fps, tuning.probe_seconds
         );
-        let stats = run_windows_desktop_capture_probe(tuning)?;
+        let stats = match run_windows_desktop_capture_probe_ffmpeg(tuning) {
+            Ok(stats) => stats,
+            Err(err) => {
+                println!(
+                    "[windows] ffmpeg-ddagrab capture probe failed: {}. Falling back to scrap backend.",
+                    err
+                );
+                run_windows_desktop_capture_probe_scrap(tuning)?
+            }
+        };
         println!(
-            "[windows] probe done: frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={} pipeline_avg_ingest_latency_ms={:.2} encoder_converted={} encoder_dropped={} encoder_avg_conversion_latency_ms={:.3} encoder_avg_end_to_end_latency_ms={:.2} publisher_avg_latency_ms={:.2} publisher_avg_payload_bytes={}",
+            "[windows] probe done: backend={} frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={} pipeline_avg_ingest_latency_ms={:.2} encoder_converted={} encoder_dropped={} encoder_avg_conversion_latency_ms={:.3} encoder_avg_end_to_end_latency_ms={:.2} publisher_avg_latency_ms={:.2} publisher_avg_payload_bytes={}",
+            stats.capture_backend,
             stats.produced_frames,
             stats.elapsed_ms,
             stats.achieved_fps,
