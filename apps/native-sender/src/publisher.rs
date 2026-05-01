@@ -1,6 +1,8 @@
 use crate::api::TokenResponse;
 use anyhow::{Context, Result};
+use crate::capture::{CaptureBackend, EncoderBackend};
 use futures_util::SinkExt;
+use std::process::{Child, Command, Stdio};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -114,5 +116,82 @@ pub async fn publish_bootstrap(platform_name: &str, token: &TokenResponse, dry_r
         ws_probe_ok
     );
     Ok(())
+}
+
+fn whip_base_url_from_livekit_url(raw: &str) -> Result<String> {
+    let parsed = Url::parse(raw).context("invalid LiveKit URL for WHIP publisher")?;
+    let scheme = match parsed.scheme() {
+        "wss" | "https" => "https",
+        "ws" | "http" => "http",
+        other => anyhow::bail!("unsupported LiveKit URL scheme '{}' for WHIP publisher", other),
+    };
+    let authority = if let Some(port) = parsed.port() {
+        format!("{}:{}", parsed.host_str().unwrap_or_default(), port)
+    } else {
+        parsed.host_str().unwrap_or_default().to_string()
+    };
+    Ok(format!("{}://{}/whip", scheme, authority))
+}
+
+pub fn start_ffmpeg_whip_publisher(
+    platform_name: &str,
+    token: &TokenResponse,
+    target_fps: u32,
+    capture_backend: CaptureBackend,
+    encoder_backend: EncoderBackend,
+) -> Result<Child> {
+    if platform_name != "windows" {
+        anyhow::bail!("ffmpeg WHIP publisher is currently wired for windows only");
+    }
+
+    let whip_base = whip_base_url_from_livekit_url(&token.url)?;
+    let whip_url = format!("{}?access_token={}", whip_base, token.token);
+    let capture_filter = match capture_backend {
+        CaptureBackend::Auto | CaptureBackend::FfmpegDdagrab => format!("ddagrab=framerate={}", target_fps),
+        CaptureBackend::Scrap => format!("ddagrab=framerate={}", target_fps),
+    };
+    let encoder_codec = match encoder_backend {
+        EncoderBackend::Fast | EncoderBackend::FfmpegLibx264 => "libx264",
+        EncoderBackend::FfmpegH264Nvenc => "h264_nvenc",
+    };
+    let mut command = Command::new("ffmpeg");
+    command
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("warning")
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg(capture_filter)
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-c:v")
+        .arg(encoder_codec)
+        .arg("-preset")
+        .arg("veryfast")
+        .arg("-tune")
+        .arg("zerolatency")
+        .arg("-g")
+        .arg((target_fps * 2).to_string())
+        .arg("-r")
+        .arg(target_fps.to_string())
+        .arg("-b:v")
+        .arg("12M")
+        .arg("-maxrate")
+        .arg("16M")
+        .arg("-bufsize")
+        .arg("24M")
+        .arg("-an")
+        .arg("-f")
+        .arg("whip")
+        .arg(whip_url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let child = command
+        .spawn()
+        .context("failed to spawn ffmpeg WHIP publisher (ensure ffmpeg is installed and in PATH)")?;
+    Ok(child)
 }
 
