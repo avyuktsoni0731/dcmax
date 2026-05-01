@@ -10,11 +10,16 @@ This project will use a hybrid architecture:
 
 Browser-only capture is the current quality bottleneck for smooth 60fps screen sharing. Native capture can provide more consistent frame pacing, better hardware encoder usage, and more reliable system-audio behavior.
 
-## v1 Scope (Windows Native Sender)
+## v1 Scope (Windows + macOS Native Sender)
 
-- Capture desktop frames via DXGI Desktop Duplication
-- Capture system audio via WASAPI loopback
-- Encode video with hardware acceleration (NVENC/AMF/Quick Sync where available)
+- **Windows path**
+  - Capture desktop frames via DXGI Desktop Duplication
+  - Capture system audio via WASAPI loopback
+  - Encode video with hardware acceleration (NVENC/AMF/Quick Sync where available)
+- **macOS path**
+  - Capture display via ScreenCaptureKit
+  - Capture system audio via CoreAudio-compatible loopback path
+  - Hardware-accelerated encode via VideoToolbox
 - Publish to LiveKit room as a `native_sender`
 
 Web client remains unchanged as the receiver/controller.
@@ -43,7 +48,7 @@ Choose one implementation track:
 1. **Rust + GStreamer/WebRTC bindings** (recommended balance)
 2. C++ + libwebrtc (max control, highest complexity)
 
-Initial target: stable 1080p60 motion at low jitter before 1440p/4K tuning.
+Initial target on both platforms: stable 1080p60 motion at low jitter before 1440p/4K tuning.
 
 ## Milestones
 
@@ -51,9 +56,9 @@ Initial target: stable 1080p60 motion at low jitter before 1440p/4K tuning.
    - Native app fetches token from `POST /token`
    - Joins LiveKit room as publisher
 2. **M2 - Video Capture**
-   - Desktop Duplication feed visible in remote web client
+   - Windows DXGI and macOS ScreenCaptureKit feed visible in remote web client
 3. **M3 - System Audio**
-   - WASAPI loopback track published and audible remotely
+   - Windows WASAPI and macOS CoreAudio loopback track published and audible remotely
 4. **M4 - Performance Tuning**
    - Hardware encode selection
    - Target bitrate ladder and frame pacing
