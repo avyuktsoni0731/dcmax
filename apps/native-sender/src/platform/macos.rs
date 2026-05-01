@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use super::CaptureBackend;
-use crate::capture::{run_frame_pacing_probe, CaptureTuning};
+use crate::capture::{run_frame_pacing_probe, CaptureTuning, PipelineReport};
 
 pub struct MacOsCaptureBackend;
 
@@ -10,10 +10,14 @@ impl CaptureBackend for MacOsCaptureBackend {
         "macos"
     }
 
-    fn bootstrap_capture_pipeline(&self, dry_run: bool, tuning: CaptureTuning) -> Result<()> {
+    fn bootstrap_capture_pipeline(
+        &self,
+        dry_run: bool,
+        tuning: CaptureTuning,
+    ) -> Result<Option<PipelineReport>> {
         if dry_run {
             println!("[macos] dry-run capture bootstrap: ScreenCaptureKit + CoreAudio placeholder");
-            return Ok(());
+            return Ok(None);
         }
 
         println!(
@@ -30,7 +34,14 @@ impl CaptureBackend for MacOsCaptureBackend {
             stats.avg_frame_interval_ms
         );
         println!("[macos] next milestone: replace probe with ScreenCaptureKit frame source");
-        Ok(())
+        Ok(Some(PipelineReport {
+            backend: "macos-pacing-probe".to_string(),
+            achieved_fps: stats.achieved_fps,
+            produced_frames: stats.produced_frames,
+            dropped_frames: 0,
+            avg_ingest_latency_ms: stats.avg_frame_interval_ms,
+            avg_payload_bytes: 0,
+        }))
     }
 
     fn diagnostics_hint(&self) -> &'static str {

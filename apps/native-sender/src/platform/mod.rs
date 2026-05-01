@@ -1,10 +1,14 @@
 use anyhow::Result;
 
-use crate::capture::CaptureTuning;
+use crate::capture::{CaptureTuning, PipelineReport};
 
 pub trait CaptureBackend {
     fn name(&self) -> &'static str;
-    fn bootstrap_capture_pipeline(&self, dry_run: bool, tuning: CaptureTuning) -> Result<()>;
+    fn bootstrap_capture_pipeline(
+        &self,
+        dry_run: bool,
+        tuning: CaptureTuning,
+    ) -> Result<Option<PipelineReport>>;
     fn diagnostics_hint(&self) -> &'static str;
 }
 

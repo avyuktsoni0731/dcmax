@@ -55,6 +55,16 @@ pub struct EncodedFrame {
     pub encoded_instant: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct PipelineReport {
+    pub backend: String,
+    pub achieved_fps: f64,
+    pub produced_frames: u64,
+    pub dropped_frames: u64,
+    pub avg_ingest_latency_ms: f64,
+    pub avg_payload_bytes: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderAdapterMetrics {
     pub converted_frames: u64,

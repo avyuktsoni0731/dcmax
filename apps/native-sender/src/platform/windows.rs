@@ -10,7 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_
 use super::CaptureBackend;
 use crate::capture::{
     adapt_to_encoder_input_bgra, encode_frame_fast, CaptureTuning, CapturedFrame, ConverterAcc,
-    EncodedFrame,
+    EncodedFrame, PipelineReport,
 };
 use crate::platform::windows_dxgi::probe_primary_adapter;
 
@@ -293,7 +293,11 @@ impl CaptureBackend for WindowsCaptureBackend {
         "windows"
     }
 
-    fn bootstrap_capture_pipeline(&self, dry_run: bool, tuning: CaptureTuning) -> Result<()> {
+    fn bootstrap_capture_pipeline(
+        &self,
+        dry_run: bool,
+        tuning: CaptureTuning,
+    ) -> Result<Option<PipelineReport>> {
         let adapter_probe = probe_primary_adapter()?;
         println!(
             "[windows] dxgi adapter: name='{}' vendor_id={} vram={}MB shared={}MB",
@@ -305,7 +309,7 @@ impl CaptureBackend for WindowsCaptureBackend {
 
         if dry_run {
             println!("[windows] dry-run capture bootstrap: DXGI + WASAPI pipeline placeholder");
-            return Ok(());
+            return Ok(None);
         }
 
         println!(
@@ -351,7 +355,14 @@ impl CaptureBackend for WindowsCaptureBackend {
             );
         }
         println!("[windows] next milestone: route captured frames into encoder/publisher pipeline");
-        Ok(())
+        Ok(Some(PipelineReport {
+            backend: stats.capture_backend.to_string(),
+            achieved_fps: stats.achieved_fps,
+            produced_frames: stats.produced_frames,
+            dropped_frames: stats.pipeline_dropped_frames + stats.encoder_dropped_frames,
+            avg_ingest_latency_ms: stats.pipeline_avg_ingest_latency_ms,
+            avg_payload_bytes: stats.publisher_avg_payload_bytes,
+        }))
     }
 
     fn diagnostics_hint(&self) -> &'static str {
