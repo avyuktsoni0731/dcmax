@@ -49,5 +49,6 @@ cargo run -- --dry-run
 - Token fetch (`POST /token` with `clientType: native_sender`)
 - Platform backend selection (windows/macos)
 - Backend diagnostics hints and bootstrap placeholders
-- Capture pacing probe with measured achieved FPS (pre-DXGI/ScreenCaptureKit integration)
+- Windows desktop frame capture probe via `scrap` with measured achieved FPS/resolution
+- Cross-platform pacing probe scaffolding remains for future macOS ScreenCaptureKit integration
 
