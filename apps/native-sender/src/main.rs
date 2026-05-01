@@ -100,6 +100,17 @@ async fn main() -> Result<()> {
         println!("selected backend: {}", backend.name());
         println!("hint: {}", backend.diagnostics_hint());
         let _ = post_publisher_event(&client, &config, PublisherState::Starting, backend.name(), None).await;
+        if let Err(err) = publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await {
+            let _ = post_publisher_event(
+                &client,
+                &config,
+                PublisherState::Error,
+                backend.name(),
+                Some("publisher bootstrap failed"),
+            )
+            .await;
+            anyhow::bail!("publisher bootstrap failed: {}", err);
+        }
         let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
         if let Some(report) = report {
             post_native_report(&client, &config, &report).await?;
@@ -166,7 +177,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await;
         return Ok(());
     }
 
@@ -179,6 +189,17 @@ async fn main() -> Result<()> {
         println!("selected backend: {}", backend.name());
         println!("hint: {}", backend.diagnostics_hint());
         let _ = post_publisher_event(&client, &config, PublisherState::Starting, backend.name(), None).await;
+        if let Err(err) = publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await {
+            let _ = post_publisher_event(
+                &client,
+                &config,
+                PublisherState::Error,
+                backend.name(),
+                Some("publisher bootstrap failed"),
+            )
+            .await;
+            anyhow::bail!("publisher bootstrap failed: {}", err);
+        }
         let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
         if let Some(report) = report {
             post_native_report(&client, &config, &report).await?;
@@ -245,7 +266,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await;
         return Ok(());
     }
 
