@@ -44,6 +44,22 @@ type NativeSessionResponse = {
   sessions: NativeSession[];
 };
 type NativeSessionState = "offline" | "stale" | "active";
+type PublisherState = "starting" | "running" | "stopped" | "error";
+type NativePublisher = {
+  roomName: string;
+  identity: string;
+  state: PublisherState;
+  backend: string;
+  captureBackend: string;
+  encoderBackend: string;
+  message?: string;
+  updatedAt: string;
+};
+type NativePublisherResponse = {
+  roomName: string;
+  count: number;
+  publishers: NativePublisher[];
+};
 
 type ToastTone = "neutral" | "success" | "warning" | "error";
 type UaInfo = {
@@ -120,6 +136,7 @@ export default function HomePage() {
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [screenCaptureStats, setScreenCaptureStats] = useState<ScreenCaptureStats | null>(null);
   const [nativeSession, setNativeSession] = useState<NativeSession | null>(null);
+  const [nativePublisher, setNativePublisher] = useState<NativePublisher | null>(null);
   const [preferNativeSource, setPreferNativeSource] = useState(true);
   const [selectedSourceLabel, setSelectedSourceLabel] = useState("none");
   const [uaInfo, setUaInfo] = useState<UaInfo>({
@@ -248,6 +265,42 @@ export default function HomePage() {
           payload.sessions[0] ??
           null;
         setNativeSession(preferred);
+      } catch {
+        // best-effort polling, no user-facing toast needed
+      }
+    };
+
+    void poll();
+    const id = window.setInterval(() => {
+      void poll();
+    }, Boolean(room) ? 1000 : 10000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [roomName, room]);
+
+  useEffect(() => {
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) {
+      setNativePublisher(null);
+      return;
+    }
+
+    let active = true;
+    const poll = async () => {
+      try {
+        const res = await apiFetch(`${API_BASE}/native/publisher/${roomKey}`);
+        if (!res.ok) return;
+        const contentType = res.headers.get("content-type") ?? "";
+        if (!contentType.includes("application/json")) return;
+        const payload = (await res.json()) as NativePublisherResponse;
+        if (!active) return;
+        const preferred =
+          payload.publishers.find((p) => p.identity.toLowerCase().includes("native-sender")) ??
+          payload.publishers[0] ??
+          null;
+        setNativePublisher(preferred);
       } catch {
         // best-effort polling, no user-facing toast needed
       }
@@ -625,6 +678,9 @@ export default function HomePage() {
   const nativeUpdatedSeconds = nativeSession
     ? Math.max(0, Math.floor((Date.now() - new Date(nativeSession.updatedAt).getTime()) / 1000))
     : null;
+  const nativePublisherAgeSeconds = nativePublisher
+    ? Math.max(0, Math.floor((Date.now() - new Date(nativePublisher.updatedAt).getTime()) / 1000))
+    : null;
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(120,140,255,0.14),_transparent_42%),linear-gradient(180deg,_#04070f_0%,_#090d18_100%)] px-4 py-6 text-slate-100">
@@ -646,6 +702,20 @@ export default function HomePage() {
               >
                 Native {nativeSession.backend} • {nativeSession.achievedFps.toFixed(1)}fps • {nativeSessionState}
                 {nativeUpdatedSeconds !== null ? ` • ${nativeUpdatedSeconds}s ago` : ""}
+              </div>
+            )}
+            {nativePublisher && (
+              <div
+                className={classNames(
+                  "rounded-lg border px-3 py-1 text-xs",
+                  nativePublisher.state === "running" && "border-indigo-400/40 bg-indigo-500/10 text-indigo-200",
+                  nativePublisher.state === "starting" && "border-sky-500/40 bg-sky-500/10 text-sky-200",
+                  nativePublisher.state === "stopped" && "border-slate-700 bg-slate-900 text-slate-300",
+                  nativePublisher.state === "error" && "border-rose-500/40 bg-rose-500/10 text-rose-200"
+                )}
+              >
+                Publisher {nativePublisher.state} • {nativePublisher.captureBackend}/{nativePublisher.encoderBackend}
+                {nativePublisherAgeSeconds !== null ? ` • ${nativePublisherAgeSeconds}s ago` : ""}
               </div>
             )}
             <button
@@ -725,6 +795,12 @@ export default function HomePage() {
                         <span>
                           Native {nativeSession.backend} {nativeSession.achievedFps.toFixed(1)}fps ({nativeSessionState})
                         </span>
+                        <span>•</span>
+                      </>
+                    )}
+                    {nativePublisher && (
+                      <>
+                        <span>Publisher {nativePublisher.state}</span>
                         <span>•</span>
                       </>
                     )}
