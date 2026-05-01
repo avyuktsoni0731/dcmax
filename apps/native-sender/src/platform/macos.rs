@@ -18,5 +18,9 @@ impl CaptureBackend for MacOsCaptureBackend {
         println!("[macos] capture pipeline bootstrap placeholder (implement ScreenCaptureKit next)");
         Ok(())
     }
+
+    fn diagnostics_hint(&self) -> &'static str {
+        "Grant Screen Recording permission, keep app in foreground for first capture grant, and prefer wired/strong Wi-Fi for 1080p60."
+    }
 }
 

@@ -17,6 +17,33 @@ pub struct TokenResponse {
     pub url: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct HealthResponse {
+    pub ok: bool,
+}
+
+pub async fn health_check(client: &Client, api_base_url: &str) -> Result<()> {
+    let endpoint = format!("{}/health", api_base_url.trim_end_matches('/'));
+    let res = client
+        .get(endpoint)
+        .send()
+        .await
+        .context("health request failed")?;
+
+    if !res.status().is_success() {
+        anyhow::bail!("health request returned non-success status {}", res.status());
+    }
+
+    let payload = res
+        .json::<HealthResponse>()
+        .await
+        .context("health response parse failed")?;
+    if !payload.ok {
+        anyhow::bail!("health endpoint responded with ok=false");
+    }
+    Ok(())
+}
+
 pub async fn fetch_token(
     client: &Client,
     api_base_url: &str,

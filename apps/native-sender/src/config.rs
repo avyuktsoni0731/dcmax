@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use clap::Parser;
 
 #[derive(Debug, Clone, Parser)]
@@ -14,16 +15,36 @@ pub struct CliArgs {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetPlatform {
+    Auto,
+    Windows,
+    MacOs,
+}
+
+impl TargetPlatform {
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "windows" => Ok(Self::Windows),
+            "macos" => Ok(Self::MacOs),
+            _ => bail!("invalid --platform value '{}'; expected auto|windows|macos", raw),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub api_base_url: String,
     pub room_name: String,
     pub identity: String,
     pub client_type: String,
+    pub platform: TargetPlatform,
+    pub dry_run: bool,
 }
 
 impl AppConfig {
-    pub fn from_env(args: &CliArgs) -> Self {
+    pub fn from_env(args: &CliArgs) -> Result<Self> {
         let api_base_url =
             std::env::var("API_BASE_URL").unwrap_or_else(|_| "http://localhost:4000".to_string());
         let room_name = args
@@ -38,13 +59,29 @@ impl AppConfig {
             .unwrap_or_else(|| "native-sender".to_string());
         let client_type =
             std::env::var("CLIENT_TYPE").unwrap_or_else(|_| "native_sender".to_string());
+        let platform = TargetPlatform::parse(&args.platform)?;
 
-        Self {
+        if !api_base_url.starts_with("http://") && !api_base_url.starts_with("https://") {
+            bail!("API_BASE_URL must start with http:// or https://");
+        }
+        if room_name.trim().len() < 2 {
+            bail!("room name must be at least 2 characters");
+        }
+        if identity.trim().len() < 2 {
+            bail!("identity must be at least 2 characters");
+        }
+        if client_type != "native_sender" {
+            bail!("CLIENT_TYPE must be native_sender for native capture publisher");
+        }
+
+        Ok(Self {
             api_base_url,
             room_name,
             identity,
             client_type,
-        }
+            platform,
+            dry_run: args.dry_run,
+        })
     }
 }
 

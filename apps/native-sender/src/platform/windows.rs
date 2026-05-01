@@ -18,5 +18,9 @@ impl CaptureBackend for WindowsCaptureBackend {
         println!("[windows] capture pipeline bootstrap placeholder (implement DXGI/WASAPI next)");
         Ok(())
     }
+
+    fn diagnostics_hint(&self) -> &'static str {
+        "Use latest GPU drivers, keep display refresh >= 60Hz, and disable Windows power saver for stable capture pacing."
+    }
 }
 

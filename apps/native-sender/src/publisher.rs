@@ -1,6 +1,13 @@
 use crate::api::TokenResponse;
 
 pub async fn publish_bootstrap(platform_name: &str, token: &TokenResponse, dry_run: bool) {
+    println!(
+        "publisher config: platform={} livekit_url={} token_size={}",
+        platform_name,
+        token.url,
+        token.token.len()
+    );
+
     if dry_run {
         println!(
             "[dry-run] platform={} livekit_url={} token_prefix={}...",
@@ -12,7 +19,7 @@ pub async fn publish_bootstrap(platform_name: &str, token: &TokenResponse, dry_r
     }
 
     println!(
-        "publisher bootstrap ready for platform={} (LiveKit integration next)",
+        "publisher bootstrap ready for platform={} (LiveKit room join integration next)",
         platform_name
     );
 }

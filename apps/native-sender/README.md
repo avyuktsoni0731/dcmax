@@ -31,7 +31,7 @@ cp .env.example .env
 3. Run:
 
 ```bash
-cargo run
+cargo run -- --dry-run
 ```
 
 ## CLI
@@ -40,4 +40,11 @@ cargo run
 - `--identity <id>` override sender identity
 - `--platform windows|macos|auto` choose platform backend
 - `--dry-run` skip media pipeline boot
+
+## Current status (M1)
+
+- API health check (`GET /health`)
+- Token fetch (`POST /token` with `clientType: native_sender`)
+- Platform backend selection (windows/macos)
+- Backend diagnostics hints and bootstrap placeholders
 

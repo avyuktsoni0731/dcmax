@@ -5,15 +5,24 @@ mod publisher;
 
 use anyhow::Result;
 use clap::Parser;
-use config::{AppConfig, CliArgs};
+use config::{AppConfig, CliArgs, TargetPlatform};
+use platform::CaptureBackend;
 use reqwest::Client;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let args = CliArgs::parse();
-    let config = AppConfig::from_env(&args);
+    let config = AppConfig::from_env(&args)?;
     let client = Client::new();
+
+    println!(
+        "native-sender starting: room='{}' identity='{}' platform='{:?}' dry_run={}",
+        config.room_name, config.identity, config.platform, config.dry_run
+    );
+
+    api::health_check(&client, &config.api_base_url).await?;
+    println!("api health check: ok");
 
     let token = api::fetch_token(
         &client,
@@ -23,34 +32,37 @@ async fn main() -> Result<()> {
         &config.client_type,
     )
     .await?;
-
-    let requested = args.platform.to_lowercase();
+    println!("token fetch: ok");
 
     #[cfg(target_os = "windows")]
     {
         let backend = platform::windows::WindowsCaptureBackend;
-        if requested != "auto" && requested != "windows" {
-            anyhow::bail!("requested platform '{}' does not match current OS windows", requested);
+        if config.platform == TargetPlatform::MacOs {
+            anyhow::bail!("requested macos backend on windows host");
         }
-        backend.bootstrap_capture_pipeline(args.dry_run)?;
-        publisher::publish_bootstrap(backend.name(), &token, args.dry_run).await;
+        println!("selected backend: {}", backend.name());
+        println!("hint: {}", backend.diagnostics_hint());
+        backend.bootstrap_capture_pipeline(config.dry_run)?;
+        publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await;
         return Ok(());
     }
 
     #[cfg(target_os = "macos")]
     {
         let backend = platform::macos::MacOsCaptureBackend;
-        if requested != "auto" && requested != "macos" {
-            anyhow::bail!("requested platform '{}' does not match current OS macos", requested);
+        if config.platform == TargetPlatform::Windows {
+            anyhow::bail!("requested windows backend on macos host");
         }
-        backend.bootstrap_capture_pipeline(args.dry_run)?;
-        publisher::publish_bootstrap(backend.name(), &token, args.dry_run).await;
+        println!("selected backend: {}", backend.name());
+        println!("hint: {}", backend.diagnostics_hint());
+        backend.bootstrap_capture_pipeline(config.dry_run)?;
+        publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await;
         return Ok(());
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let _ = requested;
+        let _ = config;
         anyhow::bail!("native-sender currently supports windows and macos only");
     }
 }
