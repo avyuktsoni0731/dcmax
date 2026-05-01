@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  LocalTrackPublication,
   ConnectionQuality,
   ConnectionState,
   LocalParticipant,
@@ -68,6 +69,7 @@ export default function HomePage() {
 
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteAudioContainerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const browser = detectBrowser(window.navigator.userAgent);
@@ -144,6 +146,27 @@ export default function HomePage() {
     }
   }
 
+  function attachRemoteAudio(participant: Participant) {
+    if (!remoteAudioContainerRef.current) return;
+    remoteAudioContainerRef.current.innerHTML = "";
+
+    const audioPublications = Array.from(participant.trackPublications.values()).filter(
+      (pub) => pub.track?.kind === Track.Kind.Audio
+    );
+
+    for (const pub of audioPublications) {
+      const audioTrack = pub.audioTrack;
+      if (!audioTrack) continue;
+      const el = audioTrack.attach();
+      el.autoplay = true;
+      el.controls = false;
+      remoteAudioContainerRef.current.appendChild(el);
+      void el.play().catch(() => {
+        setErrorText("Remote audio is blocked by autoplay policy. Click anywhere and try again.");
+      });
+    }
+  }
+
   function attachLocalScreen(roomInstance: Room) {
     const screenPub = Array.from(roomInstance.localParticipant.videoTrackPublications.values()).find((p) =>
       p.trackName.includes("screen")
@@ -199,14 +222,17 @@ export default function HomePage() {
       roomInstance.on(RoomEvent.ParticipantConnected, (participant) => {
         setRemoteIsSpeaking(participant.isSpeaking);
         attachRemoteTrack(participant);
+        attachRemoteAudio(participant);
       });
       roomInstance.on(RoomEvent.ParticipantDisconnected, () => {
         setRemoteIsSpeaking(false);
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+        if (remoteAudioContainerRef.current) remoteAudioContainerRef.current.innerHTML = "";
       });
       roomInstance.on(RoomEvent.TrackSubscribed, (_track, _publication, participant) => {
         if (participant.identity === roomInstance.remoteParticipants.values().next().value?.identity) {
           attachRemoteTrack(participant);
+          attachRemoteAudio(participant);
         }
       });
       roomInstance.on(RoomEvent.LocalTrackPublished, () => {
@@ -282,23 +308,42 @@ export default function HomePage() {
         return;
       }
 
-      await room.localParticipant.setScreenShareEnabled(
-        true,
-        {
-          audio: true,
-          selfBrowserSurface: "include"
-        },
-        {
-          screenShareEncoding: {
-            maxBitrate: quality.maxBitrate,
-            maxFramerate: quality.frameRate
-          }
+      const localParticipant = room.localParticipant;
+      const publishOptions = {
+        screenShareEncoding: {
+          maxBitrate: quality.maxBitrate,
+          maxFramerate: quality.frameRate
         }
-      );
+      };
+
+      try {
+        await localParticipant.setScreenShareEnabled(
+          true,
+          {
+            audio: true,
+            selfBrowserSurface: "include"
+          },
+          publishOptions
+        );
+      } catch {
+        try {
+          await localParticipant.setScreenShareEnabled(true, { audio: true }, publishOptions);
+          setErrorText("Screen sharing started, but advanced browser surface options were skipped.");
+        } catch {
+          await localParticipant.setScreenShareEnabled(true, { audio: false }, publishOptions);
+          setErrorText(
+            "Screen sharing started without audio. Windows/browser may not support system audio for this capture."
+          );
+        }
+      }
       setIsSharingScreen(true);
       attachLocalScreen(room);
-    } catch {
-      setErrorText("Screen sharing failed. Check browser permissions and OS support.");
+    } catch (err) {
+      setErrorText(
+        err instanceof Error
+          ? `Screen sharing failed: ${err.message}`
+          : "Screen sharing failed. Check browser permissions and OS support."
+      );
     }
   }
 
@@ -455,6 +500,7 @@ export default function HomePage() {
           Browser: <span className="text-slate-200">{uaInfo.browser}</span> | OS:{" "}
           <span className="text-slate-200">{uaInfo.os}</span>
         </p>
+        <div ref={remoteAudioContainerRef} />
       </section>
     </main>
   );

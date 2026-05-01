@@ -56,3 +56,50 @@ Defaults are configured for local LiveKit:
 ## Validation Matrix
 
 See `docs/test-matrix.md` for browser/OS validation checklist and known limitations.
+
+## Cross-Device HTTPS Setup (Recommended)
+
+For testing from another laptop/phone, keep media on LiveKit Cloud and tunnel only web/API.
+
+1. Create a LiveKit Cloud project and copy:
+   - project URL (WSS)
+   - API key
+   - API secret
+
+2. Run local services:
+
+```bash
+npm run dev:api
+npm run dev:web -- --hostname 0.0.0.0 --port 3000
+```
+
+3. Start ngrok for web and api:
+
+```bash
+ngrok http 3000
+ngrok http 4000
+```
+
+4. Update env files:
+
+- `apps/web/.env.local`
+
+```env
+NEXT_PUBLIC_API_BASE_URL=https://YOUR_API_NGROK_URL
+```
+
+- `apps/api/.env`
+
+```env
+PORT=4000
+WEB_ORIGINS=https://YOUR_WEB_NGROK_URL,http://localhost:3000
+LIVEKIT_URL=wss://YOUR_LIVEKIT_CLOUD_URL
+LIVEKIT_API_KEY=YOUR_LIVEKIT_CLOUD_KEY
+LIVEKIT_API_SECRET=YOUR_LIVEKIT_CLOUD_SECRET
+```
+
+5. Restart web + api processes and open `https://YOUR_WEB_NGROK_URL` on both devices.
+
+Notes:
+- Do not tunnel LiveKit media plane with `ngrok http 7880`; signaling can connect but peer/media transport will fail.
+- If Next.js warns about dev origins, add your ngrok hostname to `allowedDevOrigins` in `apps/web/next.config.mjs`.
