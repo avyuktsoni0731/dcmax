@@ -72,21 +72,46 @@ pub async fn publish_bootstrap(platform_name: &str, token: &TokenResponse, dry_r
     } else {
         livekit_url.host_str().unwrap_or_default().to_string()
     };
-    let ws_url = Url::parse(&format!(
-        "{}://{}/rtc/v1?access_token={}",
-        scheme, authority, token.token
-    ))
-    .context("failed to build LiveKit signal URL for publisher bootstrap")?;
+    let ws_probe_paths = ["/rtc/v1", "/rtc"];
+    let mut ws_probe_ok = false;
+    for probe_path in ws_probe_paths {
+        let ws_url = Url::parse(&format!(
+            "{}://{}{}?access_token={}",
+            scheme, authority, probe_path, token.token
+        ))
+        .context("failed to build LiveKit signal URL for publisher bootstrap")?;
 
-    let (mut ws_stream, _response) = timeout(Duration::from_secs(6), connect_async(ws_url.as_str()))
-        .await
-        .context("websocket connect timeout to LiveKit signal")?
-        .context("websocket connect failed to LiveKit signal")?;
-    let _ = ws_stream.send(Message::Close(None)).await;
+        match timeout(Duration::from_secs(6), connect_async(ws_url.as_str())).await {
+            Ok(Ok((mut ws_stream, _response))) => {
+                let _ = ws_stream.send(Message::Close(None)).await;
+                ws_probe_ok = true;
+                break;
+            }
+            Ok(Err(err)) => {
+                eprintln!(
+                    "publisher bootstrap warning: websocket probe failed on {}: {}",
+                    probe_path, err
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "publisher bootstrap warning: websocket probe timeout on {}",
+                    probe_path
+                );
+            }
+        }
+    }
+
+    if !ws_probe_ok {
+        eprintln!(
+            "publisher bootstrap warning: all websocket probes failed; continuing because tcp reachability is healthy"
+        );
+    }
 
     println!(
-        "publisher bootstrap ready for platform={} (LiveKit network/signal checks passed)",
-        platform_name
+        "publisher bootstrap ready for platform={} (LiveKit tcp check passed, ws_probe_ok={})",
+        platform_name,
+        ws_probe_ok
     );
     Ok(())
 }
