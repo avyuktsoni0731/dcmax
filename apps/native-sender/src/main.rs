@@ -192,6 +192,12 @@ async fn main() -> Result<()> {
                                                     let _ = stderr.read_to_string(&mut buf);
                                                     if !buf.trim().is_empty() {
                                                         msg = format!("{} :: {}", msg, buf.trim());
+                                                        if buf.contains("Invalid answer: OK") {
+                                                            msg = format!(
+                                                                "{} :: hint: LiveKit signaling URL is not a WHIP ingest endpoint. Set LIVEKIT_WHIP_URL (and optionally LIVEKIT_WHIP_BEARER_TOKEN) for a valid ingest target.",
+                                                                msg
+                                                            );
+                                                        }
                                                     }
                                                 }
                                                 let _ = post_publisher_event(

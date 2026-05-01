@@ -133,6 +133,15 @@ fn whip_base_url_from_livekit_url(raw: &str) -> Result<String> {
     Ok(format!("{}://{}/whip", scheme, authority))
 }
 
+fn resolve_whip_target(token: &TokenResponse) -> Result<(String, Option<String>)> {
+    if let Ok(explicit_url) = std::env::var("LIVEKIT_WHIP_URL") {
+        let bearer = std::env::var("LIVEKIT_WHIP_BEARER_TOKEN").ok();
+        return Ok((explicit_url, bearer));
+    }
+    let whip_base = whip_base_url_from_livekit_url(&token.url)?;
+    Ok((format!("{}?access_token={}", whip_base, token.token), None))
+}
+
 pub fn start_ffmpeg_whip_publisher(
     platform_name: &str,
     token: &TokenResponse,
@@ -144,33 +153,67 @@ pub fn start_ffmpeg_whip_publisher(
         anyhow::bail!("ffmpeg WHIP publisher is currently wired for windows only");
     }
 
-    let whip_base = whip_base_url_from_livekit_url(&token.url)?;
-    let whip_url = format!("{}?access_token={}", whip_base, token.token);
-    let capture_filter = match capture_backend {
-        CaptureBackend::Auto | CaptureBackend::FfmpegDdagrab => format!("ddagrab=framerate={}", target_fps),
-        CaptureBackend::Scrap => format!("ddagrab=framerate={}", target_fps),
-    };
+    let (whip_url, whip_bearer_token) = resolve_whip_target(token)?;
+    let use_ddagrab = matches!(capture_backend, CaptureBackend::FfmpegDdagrab);
     let encoder_codec = match encoder_backend {
         EncoderBackend::Fast | EncoderBackend::FfmpegLibx264 => "libx264",
         EncoderBackend::FfmpegH264Nvenc => "h264_nvenc",
+    };
+    let encoder_preset = match encoder_backend {
+        EncoderBackend::Fast | EncoderBackend::FfmpegLibx264 => "veryfast",
+        EncoderBackend::FfmpegH264Nvenc => "p4",
+    };
+    let encoder_tune = match encoder_backend {
+        EncoderBackend::Fast | EncoderBackend::FfmpegLibx264 => Some("zerolatency"),
+        EncoderBackend::FfmpegH264Nvenc => None,
+    };
+    let encoder_filter = match (use_ddagrab, encoder_backend) {
+        (true, EncoderBackend::Fast | EncoderBackend::FfmpegLibx264) => {
+            "hwdownload,format=bgra,format=yuv420p"
+        }
+        (true, EncoderBackend::FfmpegH264Nvenc) => "hwdownload,format=bgra,format=nv12",
+        (false, EncoderBackend::Fast | EncoderBackend::FfmpegLibx264) => "format=yuv420p",
+        (false, EncoderBackend::FfmpegH264Nvenc) => "format=nv12",
+    };
+    let output_pix_fmt = match encoder_backend {
+        EncoderBackend::Fast | EncoderBackend::FfmpegLibx264 => "yuv420p",
+        EncoderBackend::FfmpegH264Nvenc => "nv12",
     };
     let mut command = Command::new("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("warning")
-        .arg("-f")
-        .arg("lavfi")
-        .arg("-i")
-        .arg(capture_filter)
+        .args(if use_ddagrab {
+            vec![
+                "-f".to_string(),
+                "lavfi".to_string(),
+                "-i".to_string(),
+                format!("ddagrab=framerate={}", target_fps),
+            ]
+        } else {
+            vec![
+                "-f".to_string(),
+                "gdigrab".to_string(),
+                "-framerate".to_string(),
+                target_fps.to_string(),
+                "-i".to_string(),
+                "desktop".to_string(),
+            ]
+        })
+        .arg("-vf")
+        .arg(encoder_filter)
         .arg("-pix_fmt")
-        .arg("yuv420p")
+        .arg(output_pix_fmt)
         .arg("-c:v")
         .arg(encoder_codec)
         .arg("-preset")
-        .arg("veryfast")
-        .arg("-tune")
-        .arg("zerolatency")
+        .arg(encoder_preset)
+        .args(if let Some(tune) = encoder_tune {
+            vec!["-tune", tune]
+        } else {
+            Vec::new()
+        })
         .arg("-g")
         .arg((target_fps * 2).to_string())
         .arg("-r")
@@ -188,6 +231,9 @@ pub fn start_ffmpeg_whip_publisher(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    if let Some(bearer) = whip_bearer_token {
+        command.arg("-headers").arg(format!("Authorization: Bearer {}", bearer));
+    }
 
     let child = command
         .spawn()

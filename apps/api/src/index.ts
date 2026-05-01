@@ -4,7 +4,7 @@ import express from "express";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { AccessToken } from "livekit-server-sdk";
+import { AccessToken, IngressClient, IngressInput } from "livekit-server-sdk";
 import { z } from "zod";
 
 dotenv.config();
@@ -105,6 +105,10 @@ function requireNativeControl(req: express.Request, res: express.Response) {
   if (provided === env.NATIVE_CONTROL_SECRET) return true;
   res.status(401).json({ error: "Unauthorized native control request" });
   return false;
+}
+
+function resolveLiveKitHttpUrl() {
+  return env.LIVEKIT_URL.replace(/^wss:\/\//, "https://").replace(/^ws:\/\//, "http://");
 }
 
 function appendRuntimeLog(roomName: string, stream: NativeRuntimeLogEntry["stream"], message: string) {
@@ -388,6 +392,63 @@ app.get("/native/runtime/:roomName/logs", (req, res) => {
   const roomName = req.params.roomName;
   const logs = nativeRuntimeLogs.get(roomName) ?? [];
   res.json({ roomName, count: logs.length, logs });
+});
+
+const nativeIngressEnsureSchema = z.object({
+  roomName: z.string().min(2).max(64).regex(/^[a-zA-Z0-9_-]+$/),
+  identity: z.string().min(2).max(64).default("native-sender"),
+  name: z.string().min(2).max(128).optional().default("native-whip"),
+  enableTranscoding: z.boolean().optional().default(true)
+});
+
+app.post("/native/ingress/ensure", async (req, res) => {
+  if (!requireNativeControl(req, res)) return;
+  const parsed = nativeIngressEnsureSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid native ingress payload", details: parsed.error.flatten() });
+    return;
+  }
+  const payload = parsed.data;
+  try {
+    const ingressClient = new IngressClient(resolveLiveKitHttpUrl(), env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET);
+    const existing = await ingressClient.listIngress({
+      roomName: payload.roomName
+    });
+    const byIdentity = existing.find(
+      (ingress) => ingress.inputType === IngressInput.WHIP_INPUT && ingress.participantIdentity === payload.identity
+    );
+
+    const ingress =
+      byIdentity ??
+      (await ingressClient.createIngress(IngressInput.WHIP_INPUT, {
+        name: `${payload.name}-${payload.roomName}`,
+        roomName: payload.roomName,
+        participantIdentity: payload.identity,
+        participantName: payload.identity,
+        enableTranscoding: payload.enableTranscoding,
+        bypassTranscoding: !payload.enableTranscoding
+      }));
+
+    const base = ingress.url ?? "";
+    const streamKey = ingress.streamKey ?? "";
+    const whipUrl = base && streamKey ? `${base.replace(/\/$/, "")}/${streamKey}` : base;
+    res.json({
+      ok: true,
+      roomName: payload.roomName,
+      identity: payload.identity,
+      ingressId: ingress.ingressId,
+      inputType: ingress.inputType,
+      whipBaseUrl: ingress.url,
+      streamKey: ingress.streamKey,
+      whipUrl,
+      note: "Set native-sender LIVEKIT_WHIP_URL to whipUrl. LIVEKIT_WHIP_BEARER_TOKEN is not required for this mode."
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: "Failed to ensure WHIP ingress",
+      message: err instanceof Error ? err.message : "unknown error"
+    });
+  }
 });
 
 const tokenSchema = z.object({
