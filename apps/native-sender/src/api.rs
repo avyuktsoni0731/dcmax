@@ -66,8 +66,9 @@ pub async fn fetch_token(
         .context("token request failed")?;
 
     if !res.status().is_success() {
+        let status = res.status();
         let body = res.text().await.unwrap_or_default();
-        anyhow::bail!("token request returned {}: {}", res.status(), body);
+        anyhow::bail!("token request returned {}: {}", status, body);
     }
 
     let payload = res
