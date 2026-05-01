@@ -19,6 +19,14 @@ pub struct CaptureProbeStats {
     pub avg_frame_interval_ms: f64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CapturedFrame {
+    pub width: usize,
+    pub height: usize,
+    pub bytes: Vec<u8>,
+    pub capture_instant: Instant,
+}
+
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 pub fn run_frame_pacing_probe(tuning: CaptureTuning) -> Result<CaptureProbeStats> {
     let frame_interval = Duration::from_micros(1_000_000 / tuning.target_fps as u64);

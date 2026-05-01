@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::CaptureBackend;
-use crate::capture::CaptureTuning;
+use crate::capture::{CaptureTuning, CapturedFrame};
 use crate::platform::windows_dxgi::probe_primary_adapter;
 
 pub struct WindowsCaptureBackend;
@@ -25,6 +25,7 @@ struct DesktopCaptureProbeStats {
     pipeline_dropped_frames: u64,
     pipeline_consumed_frames: u64,
     pipeline_consumed_bytes: usize,
+    pipeline_avg_ingest_latency_ms: f64,
 }
 
 fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCaptureProbeStats> {
@@ -39,15 +40,23 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
     let mut would_block_events: u64 = 0;
     let mut poll_attempts: u64 = 0;
     let mut total_bytes: usize = 0;
-    let (tx, rx) = mpsc::sync_channel::<usize>(32);
+    let (tx, rx) = mpsc::sync_channel::<CapturedFrame>(32);
     let consumer = thread::spawn(move || {
         let mut consumed_frames: u64 = 0;
         let mut consumed_bytes: usize = 0;
-        while let Ok(frame_bytes) = rx.recv() {
+        let mut total_ingest_latency_ms: f64 = 0.0;
+        while let Ok(frame) = rx.recv() {
             consumed_frames += 1;
-            consumed_bytes += frame_bytes;
+            let _frame_dimensions = (frame.width, frame.height);
+            consumed_bytes += frame.bytes.len();
+            total_ingest_latency_ms += frame.capture_instant.elapsed().as_secs_f64() * 1000.0;
         }
-        (consumed_frames, consumed_bytes)
+        let avg_ingest_latency_ms = if consumed_frames > 0 {
+            total_ingest_latency_ms / consumed_frames as f64
+        } else {
+            0.0
+        };
+        (consumed_frames, consumed_bytes, avg_ingest_latency_ms)
     });
     let mut pipeline_sent_frames: u64 = 0;
     let mut pipeline_dropped_frames: u64 = 0;
@@ -58,7 +67,13 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
             Ok(frame) => {
                 frames += 1;
                 total_bytes += frame.len();
-                match tx.try_send(frame.len()) {
+                let captured = CapturedFrame {
+                    width,
+                    height,
+                    bytes: frame.to_vec(),
+                    capture_instant: Instant::now(),
+                };
+                match tx.try_send(captured) {
                     Ok(()) => {
                         pipeline_sent_frames += 1;
                     }
@@ -92,7 +107,7 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
         0
     };
     drop(tx);
-    let (pipeline_consumed_frames, pipeline_consumed_bytes) = consumer
+    let (pipeline_consumed_frames, pipeline_consumed_bytes, pipeline_avg_ingest_latency_ms) = consumer
         .join()
         .map_err(|_| anyhow::anyhow!("capture pipeline consumer thread panicked"))?;
 
@@ -109,6 +124,7 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
         pipeline_dropped_frames,
         pipeline_consumed_frames,
         pipeline_consumed_bytes,
+        pipeline_avg_ingest_latency_ms,
     })
 }
 
@@ -138,7 +154,7 @@ impl CaptureBackend for WindowsCaptureBackend {
         );
         let stats = run_windows_desktop_capture_probe(tuning)?;
         println!(
-            "[windows] probe done: frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={}",
+            "[windows] probe done: frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={} pipeline_avg_ingest_latency_ms={:.2}",
             stats.produced_frames,
             stats.elapsed_ms,
             stats.achieved_fps,
@@ -150,7 +166,8 @@ impl CaptureBackend for WindowsCaptureBackend {
             stats.pipeline_sent_frames,
             stats.pipeline_dropped_frames,
             stats.pipeline_consumed_frames,
-            stats.pipeline_consumed_bytes
+            stats.pipeline_consumed_bytes,
+            stats.pipeline_avg_ingest_latency_ms
         );
         if stats.achieved_fps < (tuning.target_fps as f64 * 0.5) {
             println!(
