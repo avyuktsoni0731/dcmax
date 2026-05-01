@@ -81,6 +81,10 @@ async fn main() -> Result<()> {
                     config.heartbeat_seconds
                 );
                 let mut ticker = interval(Duration::from_secs(config.heartbeat_seconds));
+                let heartbeat_tuning = CaptureTuning {
+                    target_fps: config.target_fps,
+                    probe_seconds: 1,
+                };
                 loop {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => {
@@ -88,8 +92,18 @@ async fn main() -> Result<()> {
                             break;
                         }
                         _ = ticker.tick() => {
-                            if let Err(err) = post_native_report(&client, &config, &report).await {
-                                eprintln!("native session heartbeat failed: {}", err);
+                            match backend.bootstrap_capture_pipeline(false, heartbeat_tuning) {
+                                Ok(Some(live_report)) => {
+                                    if let Err(err) = post_native_report(&client, &config, &live_report).await {
+                                        eprintln!("native session heartbeat post failed: {}", err);
+                                    }
+                                }
+                                Ok(None) => {
+                                    // no-op
+                                }
+                                Err(err) => {
+                                    eprintln!("native session heartbeat sampling failed: {}", err);
+                                }
                             }
                         }
                     }
@@ -118,6 +132,10 @@ async fn main() -> Result<()> {
                     config.heartbeat_seconds
                 );
                 let mut ticker = interval(Duration::from_secs(config.heartbeat_seconds));
+                let heartbeat_tuning = CaptureTuning {
+                    target_fps: config.target_fps,
+                    probe_seconds: 1,
+                };
                 loop {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => {
@@ -125,8 +143,18 @@ async fn main() -> Result<()> {
                             break;
                         }
                         _ = ticker.tick() => {
-                            if let Err(err) = post_native_report(&client, &config, &report).await {
-                                eprintln!("native session heartbeat failed: {}", err);
+                            match backend.bootstrap_capture_pipeline(false, heartbeat_tuning) {
+                                Ok(Some(live_report)) => {
+                                    if let Err(err) = post_native_report(&client, &config, &live_report).await {
+                                        eprintln!("native session heartbeat post failed: {}", err);
+                                    }
+                                }
+                                Ok(None) => {
+                                    // no-op
+                                }
+                                Err(err) => {
+                                    eprintln!("native session heartbeat sampling failed: {}", err);
+                                }
                             }
                         }
                     }

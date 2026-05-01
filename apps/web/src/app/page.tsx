@@ -256,7 +256,7 @@ export default function HomePage() {
     void poll();
     const id = window.setInterval(() => {
       void poll();
-    }, Boolean(room) ? 4000 : 10000);
+    }, Boolean(room) ? 1000 : 10000);
     return () => {
       active = false;
       window.clearInterval(id);
