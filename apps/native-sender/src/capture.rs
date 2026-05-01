@@ -9,6 +9,7 @@ pub struct CaptureTuning {
     pub probe_seconds: u64,
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub struct CaptureProbeStats {
     pub target_fps: u32,
@@ -18,6 +19,7 @@ pub struct CaptureProbeStats {
     pub avg_frame_interval_ms: f64,
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub fn run_frame_pacing_probe(tuning: CaptureTuning) -> Result<CaptureProbeStats> {
     let frame_interval = Duration::from_micros(1_000_000 / tuning.target_fps as u64);
     let start = Instant::now();
