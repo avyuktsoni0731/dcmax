@@ -53,7 +53,23 @@ async fn main() -> Result<()> {
         }
         println!("selected backend: {}", backend.name());
         println!("hint: {}", backend.diagnostics_hint());
-        backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
+        let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
+        if let Some(report) = report {
+            api::report_native_session(
+                &client,
+                &config.api_base_url,
+                &config.room_name,
+                &config.identity,
+                &report.backend,
+                report.achieved_fps,
+                report.produced_frames,
+                report.dropped_frames,
+                report.avg_ingest_latency_ms,
+                report.avg_payload_bytes,
+            )
+            .await?;
+            println!("native session report: posted");
+        }
         publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await;
         return Ok(());
     }
@@ -66,7 +82,23 @@ async fn main() -> Result<()> {
         }
         println!("selected backend: {}", backend.name());
         println!("hint: {}", backend.diagnostics_hint());
-        backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
+        let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
+        if let Some(report) = report {
+            api::report_native_session(
+                &client,
+                &config.api_base_url,
+                &config.room_name,
+                &config.identity,
+                &report.backend,
+                report.achieved_fps,
+                report.produced_frames,
+                report.dropped_frames,
+                report.avg_ingest_latency_ms,
+                report.avg_payload_bytes,
+            )
+            .await?;
+            println!("native session report: posted");
+        }
         publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await;
         return Ok(());
     }

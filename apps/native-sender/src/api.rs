@@ -22,6 +22,24 @@ pub struct HealthResponse {
     pub ok: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct NativeSessionRequest<'a> {
+    #[serde(rename = "roomName")]
+    room_name: &'a str,
+    identity: &'a str,
+    backend: &'a str,
+    #[serde(rename = "achievedFps")]
+    achieved_fps: f64,
+    #[serde(rename = "producedFrames")]
+    produced_frames: u64,
+    #[serde(rename = "droppedFrames")]
+    dropped_frames: u64,
+    #[serde(rename = "avgIngestLatencyMs")]
+    avg_ingest_latency_ms: f64,
+    #[serde(rename = "avgPayloadBytes")]
+    avg_payload_bytes: usize,
+}
+
 pub async fn health_check(client: &Client, api_base_url: &str) -> Result<()> {
     let endpoint = format!("{}/health", api_base_url.trim_end_matches('/'));
     let res = client
@@ -77,5 +95,44 @@ pub async fn fetch_token(
         .context("token response parse failed")?;
 
     Ok(payload)
+}
+
+pub async fn report_native_session(
+    client: &Client,
+    api_base_url: &str,
+    room_name: &str,
+    identity: &str,
+    backend: &str,
+    achieved_fps: f64,
+    produced_frames: u64,
+    dropped_frames: u64,
+    avg_ingest_latency_ms: f64,
+    avg_payload_bytes: usize,
+) -> Result<()> {
+    let endpoint = format!("{}/native/sessions", api_base_url.trim_end_matches('/'));
+    let req = NativeSessionRequest {
+        room_name,
+        identity,
+        backend,
+        achieved_fps,
+        produced_frames,
+        dropped_frames,
+        avg_ingest_latency_ms,
+        avg_payload_bytes,
+    };
+
+    let res = client
+        .post(endpoint)
+        .json(&req)
+        .send()
+        .await
+        .context("native session report request failed")?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        anyhow::bail!("native session report returned {}: {}", status, body);
+    }
+    Ok(())
 }
 
