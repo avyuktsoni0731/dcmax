@@ -5,6 +5,7 @@ import {
   ConnectionState,
   LocalParticipant,
   Participant,
+  ParticipantEvent,
   Room,
   RoomEvent,
   Track,
@@ -43,7 +44,6 @@ export default function HomePage() {
   const [qualityMode, setQualityMode] = useState<QualityMode>("balanced");
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
   const [selectedMicId, setSelectedMicId] = useState<string>("");
-  const [remoteParticipant, setRemoteParticipant] = useState<Participant | null>(null);
   const [remoteIsSpeaking, setRemoteIsSpeaking] = useState(false);
   const [localIsSpeaking, setLocalIsSpeaking] = useState(false);
   const [connectionPill, setConnectionPill] = useState<"good" | "fair" | "poor">("good");
@@ -93,19 +93,6 @@ export default function HomePage() {
       room?.disconnect();
     };
   }, [room]);
-
-  function bindParticipantAudioSpeaking(participant: Participant, local: boolean) {
-    const update = () => {
-      if (local) {
-        setLocalIsSpeaking(participant.isSpeaking);
-      } else {
-        setRemoteIsSpeaking(participant.isSpeaking);
-      }
-    };
-    update();
-    participant.on(ParticipantEvent.IsSpeakingChanged, update);
-    return () => participant.off(ParticipantEvent.IsSpeakingChanged, update);
-  }
 
   async function requestToken(identity: string, roomToJoin: string): Promise<TokenResponse> {
     const res = await fetch(`${API_BASE}/token`, {
@@ -177,12 +164,10 @@ export default function HomePage() {
       roomInstance.on(RoomEvent.Reconnecting, () => setCallState("reconnecting"));
       roomInstance.on(RoomEvent.Reconnected, () => setCallState("connected"));
       roomInstance.on(RoomEvent.ParticipantConnected, (participant) => {
-        setRemoteParticipant(participant);
         setRemoteIsSpeaking(participant.isSpeaking);
         attachRemoteTrack(participant);
       });
       roomInstance.on(RoomEvent.ParticipantDisconnected, () => {
-        setRemoteParticipant(null);
         setRemoteIsSpeaking(false);
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
       });
@@ -230,7 +215,6 @@ export default function HomePage() {
     setRoom(null);
     setCallState("ended");
     setIsSharingScreen(false);
-    setRemoteParticipant(null);
     setRemoteIsSpeaking(false);
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
