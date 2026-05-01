@@ -60,6 +60,22 @@ type NativePublisherResponse = {
   count: number;
   publishers: NativePublisher[];
 };
+type NativeRuntimeStatus = "idle" | "starting" | "running" | "stopping" | "error";
+type NativeRuntime = {
+  roomName: string;
+  identity: string;
+  status: NativeRuntimeStatus;
+  pid?: number;
+  command: string[];
+  startedAt?: string;
+  stoppedAt?: string;
+  lastError?: string;
+  updatedAt: string;
+};
+type NativeRuntimeResponse = {
+  roomName: string;
+  runtime: NativeRuntime | null;
+};
 
 type ToastTone = "neutral" | "success" | "warning" | "error";
 type UaInfo = {
@@ -75,6 +91,7 @@ type ScreenCaptureStats = {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:4000";
 const IS_NGROK_API = API_BASE.includes("ngrok-free.app");
+const NATIVE_CONTROL_SECRET = process.env.NEXT_PUBLIC_NATIVE_CONTROL_SECRET ?? "";
 
 function classNames(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
@@ -137,6 +154,8 @@ export default function HomePage() {
   const [screenCaptureStats, setScreenCaptureStats] = useState<ScreenCaptureStats | null>(null);
   const [nativeSession, setNativeSession] = useState<NativeSession | null>(null);
   const [nativePublisher, setNativePublisher] = useState<NativePublisher | null>(null);
+  const [nativeRuntime, setNativeRuntime] = useState<NativeRuntime | null>(null);
+  const [nativeRuntimeBusy, setNativeRuntimeBusy] = useState(false);
   const [preferNativeSource, setPreferNativeSource] = useState(true);
   const [selectedSourceLabel, setSelectedSourceLabel] = useState("none");
   const [uaInfo, setUaInfo] = useState<UaInfo>({
@@ -267,6 +286,40 @@ export default function HomePage() {
         setNativeSession(preferred);
       } catch {
         // best-effort polling, no user-facing toast needed
+      }
+    };
+
+    void poll();
+    const id = window.setInterval(() => {
+      void poll();
+    }, Boolean(room) ? 1000 : 10000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [roomName, room]);
+
+  useEffect(() => {
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) {
+      setNativeRuntime(null);
+      return;
+    }
+
+    let active = true;
+    const poll = async () => {
+      try {
+        const res = await apiFetch(`${API_BASE}/native/runtime/${roomKey}`, {
+          headers: NATIVE_CONTROL_SECRET ? { "x-native-control-secret": NATIVE_CONTROL_SECRET } : undefined
+        });
+        if (!res.ok) return;
+        const contentType = res.headers.get("content-type") ?? "";
+        if (!contentType.includes("application/json")) return;
+        const payload = (await res.json()) as NativeRuntimeResponse;
+        if (!active) return;
+        setNativeRuntime(payload.runtime);
+      } catch {
+        // best-effort polling
       }
     };
 
@@ -663,6 +716,70 @@ export default function HomePage() {
     }
   }
 
+  async function startNativeRuntime() {
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) {
+      showToast("Enter a room name before starting native runtime.", "warning");
+      return;
+    }
+    setNativeRuntimeBusy(true);
+    try {
+      const res = await apiFetch(`${API_BASE}/native/runtime/start`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(NATIVE_CONTROL_SECRET ? { "x-native-control-secret": NATIVE_CONTROL_SECRET } : {})
+        },
+        body: JSON.stringify({
+          roomName: roomKey,
+          identity: "native-sender",
+          dryRun: false,
+          targetFps: 60,
+          probeSeconds: 3,
+          heartbeatSeconds: 1,
+          capture: "scrap",
+          encoder: "ffmpeg-h264-nvenc"
+        })
+      });
+      if (!res.ok) {
+        showToast("Failed to start native runtime. Check API logs.", "error");
+        return;
+      }
+      showToast("Native runtime start requested.", "success");
+    } catch {
+      showToast("Failed to reach native runtime endpoint.", "error");
+    } finally {
+      setNativeRuntimeBusy(false);
+    }
+  }
+
+  async function stopNativeRuntime() {
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) return;
+    setNativeRuntimeBusy(true);
+    try {
+      const res = await apiFetch(`${API_BASE}/native/runtime/stop`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(NATIVE_CONTROL_SECRET ? { "x-native-control-secret": NATIVE_CONTROL_SECRET } : {})
+        },
+        body: JSON.stringify({
+          roomName: roomKey
+        })
+      });
+      if (!res.ok) {
+        showToast("Failed to stop native runtime. Check API logs.", "error");
+        return;
+      }
+      showToast("Native runtime stop requested.", "success");
+    } catch {
+      showToast("Failed to reach native runtime endpoint.", "error");
+    } finally {
+      setNativeRuntimeBusy(false);
+    }
+  }
+
   const statusLabel =
     callState === "connected"
       ? "Connected"
@@ -680,6 +797,9 @@ export default function HomePage() {
     : null;
   const nativePublisherAgeSeconds = nativePublisher
     ? Math.max(0, Math.floor((Date.now() - new Date(nativePublisher.updatedAt).getTime()) / 1000))
+    : null;
+  const nativeRuntimeAgeSeconds = nativeRuntime
+    ? Math.max(0, Math.floor((Date.now() - new Date(nativeRuntime.updatedAt).getTime()) / 1000))
     : null;
 
   return (
@@ -716,6 +836,22 @@ export default function HomePage() {
               >
                 Publisher {nativePublisher.state} • {nativePublisher.captureBackend}/{nativePublisher.encoderBackend}
                 {nativePublisherAgeSeconds !== null ? ` • ${nativePublisherAgeSeconds}s ago` : ""}
+              </div>
+            )}
+            {nativeRuntime && (
+              <div
+                className={classNames(
+                  "rounded-lg border px-3 py-1 text-xs",
+                  nativeRuntime.status === "running" && "border-cyan-500/40 bg-cyan-500/10 text-cyan-200",
+                  nativeRuntime.status === "starting" && "border-sky-500/40 bg-sky-500/10 text-sky-200",
+                  nativeRuntime.status === "stopping" && "border-amber-500/40 bg-amber-500/10 text-amber-200",
+                  nativeRuntime.status === "error" && "border-rose-500/40 bg-rose-500/10 text-rose-200",
+                  nativeRuntime.status === "idle" && "border-slate-700 bg-slate-900 text-slate-300"
+                )}
+              >
+                Runtime {nativeRuntime.status}
+                {nativeRuntime.pid ? ` • pid ${nativeRuntime.pid}` : ""}
+                {nativeRuntimeAgeSeconds !== null ? ` • ${nativeRuntimeAgeSeconds}s ago` : ""}
               </div>
             )}
             <button
@@ -801,6 +937,12 @@ export default function HomePage() {
                     {nativePublisher && (
                       <>
                         <span>Publisher {nativePublisher.state}</span>
+                        <span>•</span>
+                      </>
+                    )}
+                    {nativeRuntime && (
+                      <>
+                        <span>Runtime {nativeRuntime.status}</span>
                         <span>•</span>
                       </>
                     )}
@@ -908,6 +1050,38 @@ export default function HomePage() {
               >
                 End Call
               </button>
+            </section>
+            <section className="grid gap-3 rounded-2xl border border-slate-800/70 bg-slate-950/70 p-4 backdrop-blur md:grid-cols-4">
+              <button
+                onClick={startNativeRuntime}
+                disabled={nativeRuntimeBusy || nativeRuntime?.status === "running" || nativeRuntime?.status === "starting"}
+                className={classNames(
+                  "rounded-lg border px-3 py-2 transition",
+                  nativeRuntimeBusy || nativeRuntime?.status === "running" || nativeRuntime?.status === "starting"
+                    ? "cursor-not-allowed border-slate-700 bg-slate-900 text-slate-500"
+                    : "border-emerald-600/50 bg-emerald-950/30 text-emerald-200 hover:bg-emerald-950/50"
+                )}
+              >
+                {nativeRuntimeBusy ? "Working..." : "Start Native Runtime"}
+              </button>
+              <button
+                onClick={stopNativeRuntime}
+                disabled={nativeRuntimeBusy || !nativeRuntime || nativeRuntime.status === "idle"}
+                className={classNames(
+                  "rounded-lg border px-3 py-2 transition",
+                  nativeRuntimeBusy || !nativeRuntime || nativeRuntime.status === "idle"
+                    ? "cursor-not-allowed border-slate-700 bg-slate-900 text-slate-500"
+                    : "border-amber-600/50 bg-amber-950/30 text-amber-200 hover:bg-amber-950/50"
+                )}
+              >
+                {nativeRuntimeBusy ? "Working..." : "Stop Native Runtime"}
+              </button>
+              <div className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-300">
+                Runtime identity: <span className="text-slate-100">{nativeRuntime?.identity ?? "native-sender"}</span>
+              </div>
+              <div className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-300">
+                {nativeRuntime?.lastError ? `Last runtime error: ${nativeRuntime.lastError}` : "Last runtime error: none"}
+              </div>
             </section>
           </>
         )}

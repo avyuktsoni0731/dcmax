@@ -1,6 +1,9 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import { AccessToken } from "livekit-server-sdk";
 import { z } from "zod";
 
@@ -10,6 +13,9 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(4000),
   WEB_ORIGIN: z.string().optional(),
   WEB_ORIGINS: z.string().optional(),
+  NATIVE_CONTROL_SECRET: z.string().optional(),
+  NATIVE_SENDER_BIN: z.string().default("cargo"),
+  NATIVE_SENDER_WORKDIR: z.string().optional(),
   LIVEKIT_URL: z.string().default("ws://localhost:7880"),
   LIVEKIT_API_KEY: z.string().min(1),
   LIVEKIT_API_SECRET: z.string().min(1)
@@ -38,8 +44,22 @@ type NativePublisherRecord = {
   message?: string;
   updatedAt: string;
 };
+type NativeRuntimeStatus = "idle" | "starting" | "running" | "stopping" | "error";
+type NativeRuntimeRecord = {
+  roomName: string;
+  identity: string;
+  status: NativeRuntimeStatus;
+  pid?: number;
+  command: string[];
+  startedAt?: string;
+  stoppedAt?: string;
+  lastError?: string;
+  updatedAt: string;
+};
 const nativeSessions = new Map<string, NativeSessionRecord>();
 const nativePublishers = new Map<string, NativePublisherRecord>();
+const nativeRuntimes = new Map<string, NativeRuntimeRecord>();
+const nativeRuntimeProcs = new Map<string, ReturnType<typeof spawn>>();
 const allowedOrigins = (
   env.WEB_ORIGINS ??
   env.WEB_ORIGIN ??
@@ -61,6 +81,25 @@ app.use(
   })
 );
 app.use(express.json());
+
+function resolveNativeSenderWorkdir() {
+  if (env.NATIVE_SENDER_WORKDIR) return env.NATIVE_SENDER_WORKDIR;
+  const candidates = [
+    path.resolve(process.cwd(), "../native-sender"),
+    path.resolve(process.cwd(), "apps/native-sender"),
+    path.resolve(process.cwd(), "../../apps/native-sender")
+  ];
+  const existing = candidates.find((candidate) => fs.existsSync(candidate));
+  return existing ?? candidates[1];
+}
+
+function requireNativeControl(req: express.Request, res: express.Response) {
+  if (!env.NATIVE_CONTROL_SECRET) return true;
+  const provided = req.header("x-native-control-secret");
+  if (provided === env.NATIVE_CONTROL_SECRET) return true;
+  res.status(401).json({ error: "Unauthorized native control request" });
+  return false;
+}
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
@@ -139,6 +178,161 @@ app.get("/native/publisher/:roomName", (req, res) => {
     count: entries.length,
     publishers: entries
   });
+});
+
+const nativeRuntimeStartSchema = z.object({
+  roomName: z.string().min(2).max(64).regex(/^[a-zA-Z0-9_-]+$/),
+  identity: z.string().min(2).max(64).default("native-sender"),
+  dryRun: z.boolean().optional().default(false),
+  targetFps: z.number().int().min(24).max(240).optional().default(60),
+  probeSeconds: z.number().int().min(1).max(60).optional().default(3),
+  heartbeatSeconds: z.number().int().min(1).max(60).optional().default(1),
+  capture: z.enum(["auto", "scrap", "ffmpeg-ddagrab"]).optional().default("scrap"),
+  encoder: z.enum(["fast", "ffmpeg-libx264", "ffmpeg-h264-nvenc"]).optional().default("ffmpeg-h264-nvenc")
+});
+
+const nativeRuntimeStopSchema = z.object({
+  roomName: z.string().min(2).max(64).regex(/^[a-zA-Z0-9_-]+$/)
+});
+
+app.post("/native/runtime/start", (req, res) => {
+  if (!requireNativeControl(req, res)) return;
+  const parsed = nativeRuntimeStartSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid native runtime start payload", details: parsed.error.flatten() });
+    return;
+  }
+
+  const payload = parsed.data;
+  const existing = nativeRuntimeProcs.get(payload.roomName);
+  if (existing && !existing.killed) {
+    const running = nativeRuntimes.get(payload.roomName);
+    res.status(409).json({ error: "Native runtime already running for room", runtime: running ?? null });
+    return;
+  }
+
+  const workdir = resolveNativeSenderWorkdir();
+  const args = [
+    "run",
+    "--",
+    "--room",
+    payload.roomName,
+    "--identity",
+    payload.identity,
+    "--target-fps",
+    String(payload.targetFps),
+    "--probe-seconds",
+    String(payload.probeSeconds),
+    "--heartbeat-seconds",
+    String(payload.heartbeatSeconds),
+    "--capture",
+    payload.capture,
+    "--encoder",
+    payload.encoder
+  ];
+  if (payload.dryRun) args.push("--dry-run");
+
+  const child = spawn(env.NATIVE_SENDER_BIN, args, {
+    cwd: workdir,
+    env: {
+      ...process.env,
+      API_BASE_URL: `http://localhost:${env.PORT}`,
+      ROOM_NAME: payload.roomName,
+      IDENTITY: payload.identity,
+      CLIENT_TYPE: "native_sender"
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  const command = [env.NATIVE_SENDER_BIN, ...args];
+  const now = new Date().toISOString();
+  const record: NativeRuntimeRecord = {
+    roomName: payload.roomName,
+    identity: payload.identity,
+    status: "starting",
+    pid: child.pid,
+    command,
+    startedAt: now,
+    updatedAt: now
+  };
+  nativeRuntimeProcs.set(payload.roomName, child);
+  nativeRuntimes.set(payload.roomName, record);
+
+  child.stdout.on("data", (chunk) => {
+    const text = chunk.toString("utf8");
+    if (text.includes("native session heartbeat started")) {
+      const prev = nativeRuntimes.get(payload.roomName);
+      if (!prev) return;
+      nativeRuntimes.set(payload.roomName, {
+        ...prev,
+        status: "running",
+        updatedAt: new Date().toISOString()
+      });
+    }
+  });
+
+  child.stderr.on("data", (chunk) => {
+    const text = chunk.toString("utf8").trim();
+    if (!text) return;
+    const prev = nativeRuntimes.get(payload.roomName);
+    if (!prev) return;
+    nativeRuntimes.set(payload.roomName, {
+      ...prev,
+      status: "error",
+      lastError: text.slice(0, 500),
+      updatedAt: new Date().toISOString()
+    });
+  });
+
+  child.on("exit", (code, signal) => {
+    nativeRuntimeProcs.delete(payload.roomName);
+    const prev = nativeRuntimes.get(payload.roomName);
+    if (!prev) return;
+    const isExpectedStop = prev.status === "stopping" || (code === 0 && signal == null);
+    nativeRuntimes.set(payload.roomName, {
+      ...prev,
+      status: isExpectedStop ? "idle" : "error",
+      pid: undefined,
+      stoppedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastError: isExpectedStop ? prev.lastError : `native sender exited unexpectedly (code=${code}, signal=${signal})`
+    });
+  });
+
+  res.json({ ok: true, runtime: record });
+});
+
+app.post("/native/runtime/stop", (req, res) => {
+  if (!requireNativeControl(req, res)) return;
+  const parsed = nativeRuntimeStopSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid native runtime stop payload", details: parsed.error.flatten() });
+    return;
+  }
+  const payload = parsed.data;
+  const child = nativeRuntimeProcs.get(payload.roomName);
+  if (!child) {
+    res.status(404).json({ error: "No native runtime process found for room" });
+    return;
+  }
+
+  const prev = nativeRuntimes.get(payload.roomName);
+  if (prev) {
+    nativeRuntimes.set(payload.roomName, {
+      ...prev,
+      status: "stopping",
+      updatedAt: new Date().toISOString()
+    });
+  }
+  const killed = child.kill("SIGINT");
+  res.json({ ok: true, roomName: payload.roomName, killed });
+});
+
+app.get("/native/runtime/:roomName", (req, res) => {
+  if (!requireNativeControl(req, res)) return;
+  const roomName = req.params.roomName;
+  const runtime = nativeRuntimes.get(roomName) ?? null;
+  res.json({ roomName, runtime });
 });
 
 const tokenSchema = z.object({
