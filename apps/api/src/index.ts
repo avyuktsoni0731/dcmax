@@ -56,10 +56,16 @@ type NativeRuntimeRecord = {
   lastError?: string;
   updatedAt: string;
 };
+type NativeRuntimeLogEntry = {
+  ts: string;
+  stream: "stdout" | "stderr" | "system";
+  message: string;
+};
 const nativeSessions = new Map<string, NativeSessionRecord>();
 const nativePublishers = new Map<string, NativePublisherRecord>();
 const nativeRuntimes = new Map<string, NativeRuntimeRecord>();
 const nativeRuntimeProcs = new Map<string, ReturnType<typeof spawn>>();
+const nativeRuntimeLogs = new Map<string, NativeRuntimeLogEntry[]>();
 const allowedOrigins = (
   env.WEB_ORIGINS ??
   env.WEB_ORIGIN ??
@@ -99,6 +105,20 @@ function requireNativeControl(req: express.Request, res: express.Response) {
   if (provided === env.NATIVE_CONTROL_SECRET) return true;
   res.status(401).json({ error: "Unauthorized native control request" });
   return false;
+}
+
+function appendRuntimeLog(roomName: string, stream: NativeRuntimeLogEntry["stream"], message: string) {
+  if (!message.trim()) return;
+  const prev = nativeRuntimeLogs.get(roomName) ?? [];
+  const next: NativeRuntimeLogEntry[] = [
+    ...prev,
+    {
+      ts: new Date().toISOString(),
+      stream,
+      message: message.slice(0, 1000)
+    }
+  ].slice(-200);
+  nativeRuntimeLogs.set(roomName, next);
 }
 
 app.get("/health", (_req, res) => {
@@ -167,6 +187,26 @@ app.post("/native/publisher/events", (req, res) => {
     updatedAt: new Date().toISOString()
   };
   nativePublishers.set(key, record);
+  appendRuntimeLog(payload.roomName, "system", `[publisher:${payload.state}] ${payload.backend} ${payload.captureBackend}/${payload.encoderBackend}${payload.message ? ` - ${payload.message}` : ""}`);
+
+  const runtime = nativeRuntimes.get(payload.roomName);
+  if (runtime && runtime.identity === payload.identity) {
+    const mappedStatus: NativeRuntimeStatus =
+      payload.state === "running"
+        ? "running"
+        : payload.state === "starting"
+          ? "starting"
+          : payload.state === "stopped"
+            ? "idle"
+            : "error";
+    nativeRuntimes.set(payload.roomName, {
+      ...runtime,
+      status: mappedStatus,
+      lastError: payload.state === "error" ? payload.message ?? runtime.lastError : runtime.lastError,
+      updatedAt: new Date().toISOString()
+    });
+  }
+
   res.json({ ok: true, key, record });
 });
 
@@ -212,6 +252,10 @@ app.post("/native/runtime/start", (req, res) => {
   }
 
   const workdir = resolveNativeSenderWorkdir();
+  if (!fs.existsSync(workdir)) {
+    res.status(500).json({ error: `Native sender workdir does not exist: ${workdir}` });
+    return;
+  }
   const args = [
     "run",
     "--",
@@ -257,9 +301,12 @@ app.post("/native/runtime/start", (req, res) => {
   };
   nativeRuntimeProcs.set(payload.roomName, child);
   nativeRuntimes.set(payload.roomName, record);
+  nativeRuntimeLogs.set(payload.roomName, []);
+  appendRuntimeLog(payload.roomName, "system", `spawning native runtime: ${command.join(" ")}`);
 
   child.stdout.on("data", (chunk) => {
     const text = chunk.toString("utf8");
+    appendRuntimeLog(payload.roomName, "stdout", text);
     if (text.includes("native session heartbeat started")) {
       const prev = nativeRuntimes.get(payload.roomName);
       if (!prev) return;
@@ -273,6 +320,7 @@ app.post("/native/runtime/start", (req, res) => {
 
   child.stderr.on("data", (chunk) => {
     const text = chunk.toString("utf8").trim();
+    appendRuntimeLog(payload.roomName, "stderr", text);
     if (!text) return;
     const prev = nativeRuntimes.get(payload.roomName);
     if (!prev) return;
@@ -333,6 +381,13 @@ app.get("/native/runtime/:roomName", (req, res) => {
   const roomName = req.params.roomName;
   const runtime = nativeRuntimes.get(roomName) ?? null;
   res.json({ roomName, runtime });
+});
+
+app.get("/native/runtime/:roomName/logs", (req, res) => {
+  if (!requireNativeControl(req, res)) return;
+  const roomName = req.params.roomName;
+  const logs = nativeRuntimeLogs.get(roomName) ?? [];
+  res.json({ roomName, count: logs.length, logs });
 });
 
 const tokenSchema = z.object({

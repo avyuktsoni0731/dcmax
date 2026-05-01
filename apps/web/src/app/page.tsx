@@ -76,6 +76,16 @@ type NativeRuntimeResponse = {
   roomName: string;
   runtime: NativeRuntime | null;
 };
+type NativeRuntimeLogEntry = {
+  ts: string;
+  stream: "stdout" | "stderr" | "system";
+  message: string;
+};
+type NativeRuntimeLogsResponse = {
+  roomName: string;
+  count: number;
+  logs: NativeRuntimeLogEntry[];
+};
 
 type ToastTone = "neutral" | "success" | "warning" | "error";
 type UaInfo = {
@@ -155,6 +165,7 @@ export default function HomePage() {
   const [nativeSession, setNativeSession] = useState<NativeSession | null>(null);
   const [nativePublisher, setNativePublisher] = useState<NativePublisher | null>(null);
   const [nativeRuntime, setNativeRuntime] = useState<NativeRuntime | null>(null);
+  const [nativeRuntimeLogs, setNativeRuntimeLogs] = useState<NativeRuntimeLogEntry[]>([]);
   const [nativeRuntimeBusy, setNativeRuntimeBusy] = useState(false);
   const [preferNativeSource, setPreferNativeSource] = useState(true);
   const [selectedSourceLabel, setSelectedSourceLabel] = useState("none");
@@ -293,6 +304,38 @@ export default function HomePage() {
     const id = window.setInterval(() => {
       void poll();
     }, Boolean(room) ? 1000 : 10000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [roomName, room]);
+
+  useEffect(() => {
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) {
+      setNativeRuntimeLogs([]);
+      return;
+    }
+    let active = true;
+    const poll = async () => {
+      try {
+        const res = await apiFetch(`${API_BASE}/native/runtime/${roomKey}/logs`, {
+          headers: NATIVE_CONTROL_SECRET ? { "x-native-control-secret": NATIVE_CONTROL_SECRET } : undefined
+        });
+        if (!res.ok) return;
+        const contentType = res.headers.get("content-type") ?? "";
+        if (!contentType.includes("application/json")) return;
+        const payload = (await res.json()) as NativeRuntimeLogsResponse;
+        if (!active) return;
+        setNativeRuntimeLogs(payload.logs.slice(-6));
+      } catch {
+        // best-effort polling
+      }
+    };
+    void poll();
+    const id = window.setInterval(() => {
+      void poll();
+    }, Boolean(room) ? 1000 : 5000);
     return () => {
       active = false;
       window.clearInterval(id);
@@ -742,7 +785,7 @@ export default function HomePage() {
         })
       });
       if (!res.ok) {
-        showToast("Failed to start native runtime. Check API logs.", "error");
+        showToast("Failed to start native runtime. Check runtime logs section.", "error");
         return;
       }
       showToast("Native runtime start requested.", "success");
@@ -769,7 +812,7 @@ export default function HomePage() {
         })
       });
       if (!res.ok) {
-        showToast("Failed to stop native runtime. Check API logs.", "error");
+        showToast("Failed to stop native runtime. Check runtime logs section.", "error");
         return;
       }
       showToast("Native runtime stop requested.", "success");
@@ -1082,6 +1125,22 @@ export default function HomePage() {
               <div className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-300">
                 {nativeRuntime?.lastError ? `Last runtime error: ${nativeRuntime.lastError}` : "Last runtime error: none"}
               </div>
+            </section>
+            <section className="rounded-2xl border border-slate-800/70 bg-slate-950/70 p-4 backdrop-blur">
+              <p className="mb-2 text-xs font-medium uppercase tracking-wide text-slate-400">Native runtime logs</p>
+              {nativeRuntimeLogs.length === 0 ? (
+                <p className="text-xs text-slate-500">No runtime logs yet.</p>
+              ) : (
+                <div className="space-y-1 text-xs">
+                  {nativeRuntimeLogs.map((log, idx) => (
+                    <p key={`${log.ts}-${idx}`} className="rounded bg-slate-900 px-2 py-1 text-slate-300">
+                      <span className="text-slate-500">{new Date(log.ts).toLocaleTimeString()} </span>
+                      <span className="text-slate-400">[{log.stream}] </span>
+                      {log.message}
+                    </p>
+                  ))}
+                </div>
+              )}
             </section>
           </>
         )}
