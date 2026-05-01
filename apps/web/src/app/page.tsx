@@ -27,6 +27,22 @@ type TokenResponse = {
   token: string;
   url: string;
 };
+type NativeSession = {
+  roomName: string;
+  identity: string;
+  backend: string;
+  achievedFps: number;
+  producedFrames: number;
+  droppedFrames: number;
+  avgIngestLatencyMs: number;
+  avgPayloadBytes: number;
+  updatedAt: string;
+};
+type NativeSessionResponse = {
+  roomName: string;
+  count: number;
+  sessions: NativeSession[];
+};
 
 type ToastTone = "neutral" | "success" | "warning" | "error";
 type UaInfo = {
@@ -82,6 +98,7 @@ export default function HomePage() {
   const [isRemoteFullscreen, setIsRemoteFullscreen] = useState(false);
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [screenCaptureStats, setScreenCaptureStats] = useState<ScreenCaptureStats | null>(null);
+  const [nativeSession, setNativeSession] = useState<NativeSession | null>(null);
   const [uaInfo, setUaInfo] = useState<UaInfo>({
     browser: "other",
     os: "other",
@@ -184,6 +201,40 @@ export default function HomePage() {
     return () => window.clearTimeout(t);
   }, [toastText]);
 
+  useEffect(() => {
+    const roomKey = roomName.trim().replace(/\s+/g, "_");
+    if (!roomKey) {
+      setNativeSession(null);
+      return;
+    }
+
+    let active = true;
+    const poll = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/native/sessions/${roomKey}`);
+        if (!res.ok) return;
+        const payload = (await res.json()) as NativeSessionResponse;
+        if (!active) return;
+        const preferred =
+          payload.sessions.find((s) => s.identity.toLowerCase().includes("native-sender")) ??
+          payload.sessions[0] ??
+          null;
+        setNativeSession(preferred);
+      } catch {
+        // best-effort polling, no user-facing toast needed
+      }
+    };
+
+    void poll();
+    const id = window.setInterval(() => {
+      void poll();
+    }, Boolean(room) ? 4000 : 10000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, [roomName, room]);
+
   async function requestToken(identity: string, roomToJoin: string): Promise<TokenResponse> {
     const res = await fetch(`${API_BASE}/token`, {
       method: "POST",
@@ -208,6 +259,28 @@ export default function HomePage() {
     if (track && remoteVideoRef.current) {
       track.attach(remoteVideoRef.current);
     }
+  }
+
+  function pickPreferredParticipant(roomInstance: Room): Participant | null {
+    const participants = Array.from(roomInstance.remoteParticipants.values());
+    if (participants.length === 0) return null;
+    const native = participants.find((p) => p.identity.toLowerCase().includes("native"));
+    return native ?? participants[0];
+  }
+
+  function refreshPreferredRemote(roomInstance: Room) {
+    const preferred = pickPreferredParticipant(roomInstance);
+    if (!preferred) {
+      setRemoteIdentity("Waiting for participant");
+      setRemoteIsSpeaking(false);
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+      if (remoteAudioContainerRef.current) remoteAudioContainerRef.current.innerHTML = "";
+      return;
+    }
+    setRemoteIdentity(preferred.identity);
+    setRemoteIsSpeaking(preferred.isSpeaking);
+    attachRemoteTrack(preferred);
+    attachRemoteAudio(preferred);
   }
 
   function attachRemoteAudio(participant: Participant) {
@@ -298,22 +371,14 @@ export default function HomePage() {
       roomInstance.on(RoomEvent.Reconnecting, () => setCallState("reconnecting"));
       roomInstance.on(RoomEvent.Reconnected, () => setCallState("connected"));
       roomInstance.on(RoomEvent.ParticipantConnected, (participant) => {
-        setRemoteIdentity(participant.identity);
         setRemoteIsSpeaking(participant.isSpeaking);
-        attachRemoteTrack(participant);
-        attachRemoteAudio(participant);
+        refreshPreferredRemote(roomInstance);
       });
       roomInstance.on(RoomEvent.ParticipantDisconnected, () => {
-        setRemoteIdentity("Waiting for participant");
-        setRemoteIsSpeaking(false);
-        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-        if (remoteAudioContainerRef.current) remoteAudioContainerRef.current.innerHTML = "";
+        refreshPreferredRemote(roomInstance);
       });
-      roomInstance.on(RoomEvent.TrackSubscribed, (_track, _publication, participant) => {
-        if (participant.identity === roomInstance.remoteParticipants.values().next().value?.identity) {
-          attachRemoteTrack(participant);
-          attachRemoteAudio(participant);
-        }
+      roomInstance.on(RoomEvent.TrackSubscribed, () => {
+        refreshPreferredRemote(roomInstance);
       });
       roomInstance.on(RoomEvent.LocalTrackPublished, () => {
         attachLocalScreen(roomInstance);
@@ -492,6 +557,11 @@ export default function HomePage() {
             <p className="text-xs text-slate-400">Clean 1:1 voice and screen collaboration</p>
           </div>
           <div className="flex items-center gap-2">
+            {nativeSession && (
+              <div className="rounded-lg border border-indigo-500/40 bg-indigo-500/10 px-3 py-1 text-xs text-indigo-200">
+                Native {nativeSession.backend} • {nativeSession.achievedFps.toFixed(1)}fps
+              </div>
+            )}
             <button
               onClick={copyInviteLink}
               className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200 transition hover:border-slate-500 hover:bg-slate-800"
@@ -564,6 +634,14 @@ export default function HomePage() {
                     {remoteIdentity} {remoteIsSpeaking ? "is speaking" : ""}
                   </p>
                   <div className="flex items-center gap-2 text-xs text-slate-400">
+                    {nativeSession && (
+                      <>
+                        <span>
+                          Native {nativeSession.backend} {nativeSession.achievedFps.toFixed(1)}fps
+                        </span>
+                        <span>•</span>
+                      </>
+                    )}
                     <span>{statusLabel}</span>
                     <span>•</span>
                     <span>{formatElapsed(elapsedMs)}</span>
