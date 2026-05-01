@@ -58,6 +58,7 @@ Defaults are configured for local LiveKit:
 See `docs/test-matrix.md` for browser/OS validation checklist and known limitations.
 For the high-fidelity native-capture roadmap, see `docs/native-capture-blueprint.md`.
 For the production web-first launch workflow, see `docs/public-launch-runbook.md`.
+For production validation after deploy, see `docs/production-e2e-qa.md`.
 For the post-launch native private-beta milestone, see `docs/native-private-beta-milestone.md`.
 
 ## Native Sender Scaffold
