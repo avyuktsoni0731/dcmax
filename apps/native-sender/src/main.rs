@@ -1,10 +1,12 @@
 mod api;
+mod capture;
 mod config;
 mod platform;
 mod publisher;
 
 use anyhow::Result;
 use clap::Parser;
+use capture::CaptureTuning;
 use config::{AppConfig, CliArgs, TargetPlatform};
 use platform::CaptureBackend;
 use reqwest::Client;
@@ -17,9 +19,18 @@ async fn main() -> Result<()> {
     let client = Client::new();
 
     println!(
-        "native-sender starting: room='{}' identity='{}' platform='{:?}' dry_run={}",
-        config.room_name, config.identity, config.platform, config.dry_run
+        "native-sender starting: room='{}' identity='{}' platform='{:?}' dry_run={} target_fps={} probe_seconds={}",
+        config.room_name,
+        config.identity,
+        config.platform,
+        config.dry_run,
+        config.target_fps,
+        config.probe_seconds
     );
+    let tuning = CaptureTuning {
+        target_fps: config.target_fps,
+        probe_seconds: config.probe_seconds,
+    };
 
     api::health_check(&client, &config.api_base_url).await?;
     println!("api health check: ok");
@@ -42,7 +53,7 @@ async fn main() -> Result<()> {
         }
         println!("selected backend: {}", backend.name());
         println!("hint: {}", backend.diagnostics_hint());
-        backend.bootstrap_capture_pipeline(config.dry_run)?;
+        backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
         publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await;
         return Ok(());
     }
@@ -55,7 +66,7 @@ async fn main() -> Result<()> {
         }
         println!("selected backend: {}", backend.name());
         println!("hint: {}", backend.diagnostics_hint());
-        backend.bootstrap_capture_pipeline(config.dry_run)?;
+        backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
         publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await;
         return Ok(());
     }

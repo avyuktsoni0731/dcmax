@@ -40,6 +40,8 @@ cargo run -- --dry-run
 - `--identity <id>` override sender identity
 - `--platform windows|macos|auto` choose platform backend
 - `--dry-run` skip media pipeline boot
+- `--target-fps <fps>` probe/pipeline target fps (default `60`)
+- `--probe-seconds <sec>` pacing probe duration when not dry-run (default `5`)
 
 ## Current status (M1)
 
@@ -47,4 +49,5 @@ cargo run -- --dry-run
 - Token fetch (`POST /token` with `clientType: native_sender`)
 - Platform backend selection (windows/macos)
 - Backend diagnostics hints and bootstrap placeholders
+- Capture pacing probe with measured achieved FPS (pre-DXGI/ScreenCaptureKit integration)
 

@@ -1,8 +1,10 @@
 use anyhow::Result;
 
+use crate::capture::CaptureTuning;
+
 pub trait CaptureBackend {
     fn name(&self) -> &'static str;
-    fn bootstrap_capture_pipeline(&self, dry_run: bool) -> Result<()>;
+    fn bootstrap_capture_pipeline(&self, dry_run: bool, tuning: CaptureTuning) -> Result<()>;
     fn diagnostics_hint(&self) -> &'static str;
 }
 

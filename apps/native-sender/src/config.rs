@@ -13,6 +13,10 @@ pub struct CliArgs {
     pub platform: String,
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+    #[arg(long, default_value_t = 60)]
+    pub target_fps: u32,
+    #[arg(long, default_value_t = 5)]
+    pub probe_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +45,8 @@ pub struct AppConfig {
     pub client_type: String,
     pub platform: TargetPlatform,
     pub dry_run: bool,
+    pub target_fps: u32,
+    pub probe_seconds: u64,
 }
 
 impl AppConfig {
@@ -73,6 +79,12 @@ impl AppConfig {
         if client_type != "native_sender" {
             bail!("CLIENT_TYPE must be native_sender for native capture publisher");
         }
+        if args.target_fps < 24 || args.target_fps > 240 {
+            bail!("--target-fps must be between 24 and 240");
+        }
+        if args.probe_seconds == 0 || args.probe_seconds > 60 {
+            bail!("--probe-seconds must be between 1 and 60");
+        }
 
         Ok(Self {
             api_base_url,
@@ -81,6 +93,8 @@ impl AppConfig {
             client_type,
             platform,
             dry_run: args.dry_run,
+            target_fps: args.target_fps,
+            probe_seconds: args.probe_seconds,
         })
     }
 }
