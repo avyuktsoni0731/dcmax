@@ -1,6 +1,8 @@
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -10,6 +12,7 @@ import { z } from "zod";
 dotenv.config();
 
 const envSchema = z.object({
+  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().default(4000),
   WEB_ORIGIN: z.string().optional(),
   WEB_ORIGINS: z.string().optional(),
@@ -22,6 +25,12 @@ const envSchema = z.object({
 });
 
 const env = envSchema.parse(process.env);
+if (env.NODE_ENV === "production" && !env.NATIVE_CONTROL_SECRET) {
+  throw new Error("NATIVE_CONTROL_SECRET is required in production.");
+}
+if (env.NODE_ENV === "production" && !(env.WEB_ORIGINS ?? env.WEB_ORIGIN)) {
+  throw new Error("WEB_ORIGINS or WEB_ORIGIN must be set in production.");
+}
 const app = express();
 type NativeSessionRecord = {
   roomName: string;
@@ -84,6 +93,19 @@ app.use(
       }
       callback(new Error("Origin not allowed by CORS"));
     }
+  })
+);
+app.use(
+  helmet({
+    crossOriginEmbedderPolicy: false
+  })
+);
+app.use(
+  rateLimit({
+    windowMs: 60_000,
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false
   })
 );
 app.use(express.json());
