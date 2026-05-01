@@ -30,6 +30,7 @@ pub struct CapturedFrame {
 #[derive(Debug, Clone, Copy)]
 pub enum PixelFormat {
     Bgra8,
+    #[allow(dead_code)]
     Rgba8,
 }
 
@@ -38,9 +39,20 @@ pub struct EncoderInputFrame {
     pub width: usize,
     pub height: usize,
     pub bytes: Vec<u8>,
+    #[allow(dead_code)]
     pub pixel_format: PixelFormat,
     pub capture_instant: Instant,
+    #[allow(dead_code)]
     pub converted_instant: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct EncodedFrame {
+    pub width: usize,
+    pub height: usize,
+    pub payload: Vec<u8>,
+    pub capture_instant: Instant,
+    pub encoded_instant: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +107,19 @@ pub fn adapt_to_encoder_input_bgra(frame: CapturedFrame, acc: &mut ConverterAcc)
     acc.converted_frames += 1;
     acc.total_conversion_latency_ms += start.elapsed().as_secs_f64() * 1000.0;
     out
+}
+
+pub fn encode_frame_fast(frame: EncoderInputFrame) -> EncodedFrame {
+    // Placeholder encoder stage for pipeline bring-up. Replace with NVENC/AMF/QuickSync later.
+    // Downsample bytes to emulate reduced encoded payload volume while preserving timing flow.
+    let payload: Vec<u8> = frame.bytes.iter().step_by(16).copied().collect();
+    EncodedFrame {
+        width: frame.width,
+        height: frame.height,
+        payload,
+        capture_instant: frame.capture_instant,
+        encoded_instant: Instant::now(),
+    }
 }
 
 #[cfg_attr(target_os = "windows", allow(dead_code))]

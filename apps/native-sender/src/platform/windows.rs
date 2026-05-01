@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use super::CaptureBackend;
 use crate::capture::{
-    adapt_to_encoder_input_bgra, CaptureTuning, CapturedFrame, ConverterAcc, PixelFormat,
+    adapt_to_encoder_input_bgra, encode_frame_fast, CaptureTuning, CapturedFrame, ConverterAcc,
+    EncodedFrame,
 };
 use crate::platform::windows_dxgi::probe_primary_adapter;
 
@@ -32,62 +33,94 @@ struct DesktopCaptureProbeStats {
     encoder_dropped_frames: u64,
     encoder_avg_conversion_latency_ms: f64,
     encoder_avg_end_to_end_latency_ms: f64,
+    publisher_avg_latency_ms: f64,
+    publisher_avg_payload_bytes: usize,
 }
 
 fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCaptureProbeStats> {
     let display = Display::primary().context("failed to resolve primary display")?;
-    let mut capturer = Capturer::new(display).context("failed to initialize desktop capturer")?;
-    let width = capturer.width();
-    let height = capturer.height();
+    let width = display.width();
+    let height = display.height();
 
     let start = Instant::now();
     let deadline = Duration::from_secs(tuning.probe_seconds);
+    let (tx, rx) = mpsc::sync_channel::<CapturedFrame>(32);
+    let (tx_enc_in, rx_enc_in) = mpsc::sync_channel::<crate::capture::EncoderInputFrame>(32);
+    let (tx_pub, rx_pub) = mpsc::sync_channel::<EncodedFrame>(32);
+
+    let adapter_worker = thread::spawn(move || {
+        let mut converter_acc = ConverterAcc::new();
+        let mut sent: u64 = 0;
+        let mut dropped: u64 = 0;
+        while let Ok(frame) = rx.recv() {
+            let adapted = adapt_to_encoder_input_bgra(frame, &mut converter_acc);
+            match tx_enc_in.try_send(adapted) {
+                Ok(()) => sent += 1,
+                Err(TrySendError::Full(_)) => dropped += 1,
+                Err(TrySendError::Disconnected(_)) => {
+                    dropped += 1;
+                    break;
+                }
+            }
+        }
+        (converter_acc.finalize(), sent, dropped)
+    });
+
+    let encoder_worker = thread::spawn(move || {
+        let mut encoded_frames: u64 = 0;
+        let mut dropped: u64 = 0;
+        let mut total_encode_latency_ms: f64 = 0.0;
+        while let Ok(frame) = rx_enc_in.recv() {
+            let encoded = encode_frame_fast(frame);
+            total_encode_latency_ms += encoded.encoded_instant.elapsed().as_secs_f64() * 1000.0;
+            match tx_pub.try_send(encoded) {
+                Ok(()) => encoded_frames += 1,
+                Err(TrySendError::Full(_)) => dropped += 1,
+                Err(TrySendError::Disconnected(_)) => {
+                    dropped += 1;
+                    break;
+                }
+            }
+        }
+        let avg_encode_latency_ms = if encoded_frames > 0 {
+            total_encode_latency_ms / encoded_frames as f64
+        } else {
+            0.0
+        };
+        (encoded_frames, dropped, avg_encode_latency_ms)
+    });
+
+    let publisher_worker = thread::spawn(move || {
+        let mut consumed_frames: u64 = 0;
+        let mut consumed_bytes: usize = 0;
+        let mut total_latency_ms: f64 = 0.0;
+        let mut total_payload_bytes: usize = 0;
+        while let Ok(frame) = rx_pub.recv() {
+            consumed_frames += 1;
+            consumed_bytes += frame.width * frame.height * 4;
+            total_payload_bytes += frame.payload.len();
+            total_latency_ms += frame.capture_instant.elapsed().as_secs_f64() * 1000.0;
+        }
+        let avg_latency_ms = if consumed_frames > 0 {
+            total_latency_ms / consumed_frames as f64
+        } else {
+            0.0
+        };
+        let avg_payload_bytes = if consumed_frames > 0 {
+            total_payload_bytes / consumed_frames as usize
+        } else {
+            0
+        };
+        (consumed_frames, consumed_bytes, avg_latency_ms, avg_payload_bytes)
+    });
+    let mut capturer = Capturer::new(display).context("failed to initialize desktop capturer")?;
     let mut frames: u64 = 0;
     let mut would_block_events: u64 = 0;
     let mut poll_attempts: u64 = 0;
     let mut total_bytes: usize = 0;
-    let (tx, rx) = mpsc::sync_channel::<CapturedFrame>(32);
-    let consumer = thread::spawn(move || {
-        let mut consumed_frames: u64 = 0;
-        let mut consumed_bytes: usize = 0;
-        let mut total_ingest_latency_ms: f64 = 0.0;
-        let mut converter_acc = ConverterAcc::new();
-        let mut total_end_to_end_latency_ms: f64 = 0.0;
-        while let Ok(frame) = rx.recv() {
-            let adapted = adapt_to_encoder_input_bgra(frame, &mut converter_acc);
-            consumed_frames += 1;
-            let _frame_dimensions = (adapted.width, adapted.height);
-            let _format = match adapted.pixel_format {
-                PixelFormat::Bgra8 => "bgra8",
-                PixelFormat::Rgba8 => "rgba8",
-            };
-            consumed_bytes += adapted.bytes.len();
-            total_ingest_latency_ms += adapted.capture_instant.elapsed().as_secs_f64() * 1000.0;
-            total_end_to_end_latency_ms += adapted.converted_instant.elapsed().as_secs_f64() * 1000.0;
-        }
-        let avg_ingest_latency_ms = if consumed_frames > 0 {
-            total_ingest_latency_ms / consumed_frames as f64
-        } else {
-            0.0
-        };
-        let avg_end_to_end_latency_ms = if consumed_frames > 0 {
-            total_end_to_end_latency_ms / consumed_frames as f64
-        } else {
-            0.0
-        };
-        let metrics = converter_acc.finalize();
-        (
-            consumed_frames,
-            consumed_bytes,
-            avg_ingest_latency_ms,
-            avg_end_to_end_latency_ms,
-            metrics.converted_frames,
-            metrics.dropped_frames,
-            metrics.avg_conversion_latency_ms,
-        )
-    });
     let mut pipeline_sent_frames: u64 = 0;
     let mut pipeline_dropped_frames: u64 = 0;
+    let frame_interval = Duration::from_micros(1_000_000 / tuning.target_fps as u64);
 
     while start.elapsed() < deadline {
         poll_attempts += 1;
@@ -113,7 +146,7 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
                     }
                 }
                 // Target pacing after successful frame capture.
-                thread::sleep(Duration::from_micros(1_000_000 / tuning.target_fps as u64));
+                thread::sleep(frame_interval);
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 would_block_events += 1;
@@ -135,17 +168,22 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
         0
     };
     drop(tx);
+    let (converter_metrics, _adapter_sent, adapter_dropped) = adapter_worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("adapter worker panicked"))?;
+    let (_encoder_stage_converted_frames, encoder_dropped_frames, _encoder_internal_latency_ms) =
+        encoder_worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("encoder worker panicked"))?;
     let (
         pipeline_consumed_frames,
         pipeline_consumed_bytes,
         pipeline_avg_ingest_latency_ms,
-        encoder_avg_end_to_end_latency_ms,
-        encoder_converted_frames,
-        encoder_dropped_frames,
-        encoder_avg_conversion_latency_ms,
-    ) = consumer
+        publisher_avg_payload_bytes,
+    ) = publisher_worker
         .join()
-        .map_err(|_| anyhow::anyhow!("capture pipeline consumer thread panicked"))?;
+        .map_err(|_| anyhow::anyhow!("publisher worker panicked"))?;
+    let pipeline_avg_end_to_end_latency_ms = pipeline_avg_ingest_latency_ms;
 
     Ok(DesktopCaptureProbeStats {
         width,
@@ -161,10 +199,12 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
         pipeline_consumed_frames,
         pipeline_consumed_bytes,
         pipeline_avg_ingest_latency_ms,
-        encoder_converted_frames,
-        encoder_dropped_frames,
-        encoder_avg_conversion_latency_ms,
-        encoder_avg_end_to_end_latency_ms,
+        encoder_converted_frames: converter_metrics.converted_frames,
+        encoder_dropped_frames: converter_metrics.dropped_frames + adapter_dropped + encoder_dropped_frames,
+        encoder_avg_conversion_latency_ms: converter_metrics.avg_conversion_latency_ms,
+        encoder_avg_end_to_end_latency_ms: pipeline_avg_end_to_end_latency_ms,
+        publisher_avg_latency_ms: pipeline_avg_end_to_end_latency_ms,
+        publisher_avg_payload_bytes,
     })
 }
 
@@ -194,7 +234,7 @@ impl CaptureBackend for WindowsCaptureBackend {
         );
         let stats = run_windows_desktop_capture_probe(tuning)?;
         println!(
-            "[windows] probe done: frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={} pipeline_avg_ingest_latency_ms={:.2} encoder_converted={} encoder_dropped={} encoder_avg_conversion_latency_ms={:.3} encoder_avg_end_to_end_latency_ms={:.2}",
+            "[windows] probe done: frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={} pipeline_avg_ingest_latency_ms={:.2} encoder_converted={} encoder_dropped={} encoder_avg_conversion_latency_ms={:.3} encoder_avg_end_to_end_latency_ms={:.2} publisher_avg_latency_ms={:.2} publisher_avg_payload_bytes={}",
             stats.produced_frames,
             stats.elapsed_ms,
             stats.achieved_fps,
@@ -211,7 +251,9 @@ impl CaptureBackend for WindowsCaptureBackend {
             stats.encoder_converted_frames,
             stats.encoder_dropped_frames,
             stats.encoder_avg_conversion_latency_ms,
-            stats.encoder_avg_end_to_end_latency_ms
+            stats.encoder_avg_end_to_end_latency_ms,
+            stats.publisher_avg_latency_ms,
+            stats.publisher_avg_payload_bytes
         );
         if stats.achieved_fps < (tuning.target_fps as f64 * 0.5) {
             println!(
