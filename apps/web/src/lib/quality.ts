@@ -14,19 +14,19 @@ export const QUALITY_PROFILES: Record<QualityMode, QualityConfig> = {
     width: 1280,
     height: 720,
     frameRate: 60,
-    maxBitrate: 3_000_000
+    maxBitrate: 6_000_000
   },
   balanced: {
     width: 1920,
     height: 1080,
     frameRate: 60,
-    maxBitrate: 8_000_000
+    maxBitrate: 12_000_000
   },
   sharp: {
     width: 2560,
     height: 1440,
     frameRate: 60,
-    maxBitrate: 12_000_000
+    maxBitrate: 20_000_000
   }
 };
 

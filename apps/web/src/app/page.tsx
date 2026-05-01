@@ -34,6 +34,11 @@ type UaInfo = {
   os: OsName;
   message: string;
 };
+type ScreenCaptureStats = {
+  width: number;
+  height: number;
+  frameRate: number;
+};
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:4000";
 
@@ -76,6 +81,7 @@ export default function HomePage() {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [isRemoteFullscreen, setIsRemoteFullscreen] = useState(false);
   const [copiedInvite, setCopiedInvite] = useState(false);
+  const [screenCaptureStats, setScreenCaptureStats] = useState<ScreenCaptureStats | null>(null);
   const [uaInfo, setUaInfo] = useState<UaInfo>({
     browser: "other",
     os: "other",
@@ -232,8 +238,15 @@ export default function HomePage() {
     );
     if (screenPub?.videoTrack && localVideoRef.current) {
       screenPub.videoTrack.attach(localVideoRef.current);
+      const settings = screenPub.videoTrack.mediaStreamTrack.getSettings();
+      setScreenCaptureStats({
+        width: settings.width ?? 0,
+        height: settings.height ?? 0,
+        frameRate: Math.round(settings.frameRate ?? 0)
+      });
     } else if (localVideoRef.current) {
       localVideoRef.current.srcObject = null;
+      setScreenCaptureStats(null);
     }
   }
 
@@ -379,6 +392,7 @@ export default function HomePage() {
         await room.localParticipant.setScreenShareEnabled(false);
         setIsSharingScreen(false);
         if (localVideoRef.current) localVideoRef.current.srcObject = null;
+        setScreenCaptureStats(null);
         return;
       }
 
@@ -400,6 +414,13 @@ export default function HomePage() {
         true,
         {
           audio: audioConstraints as unknown as DisplayMediaStreamOptions["audio"],
+          video: true,
+          resolution: {
+            width: quality.width,
+            height: quality.height,
+            frameRate: quality.frameRate
+          },
+          contentHint: "motion",
           selfBrowserSurface: "include",
           systemAudio: "include"
         },
@@ -407,7 +428,10 @@ export default function HomePage() {
       );
       setIsSharingScreen(true);
       attachLocalScreen(room);
-      showToast("Screen share started.", "success");
+      showToast(
+        `Screen share started. Target ${quality.width}x${quality.height} @ ${quality.frameRate}fps.`,
+        "success"
+      );
     } catch (err) {
       showToast(
         err instanceof Error
@@ -577,6 +601,12 @@ export default function HomePage() {
                 <p className="mt-2 px-1 text-xs text-slate-400">
                   {isSharingScreen ? "Screen share active" : "Not sharing your screen"}
                 </p>
+                {screenCaptureStats && (
+                  <p className="mt-1 px-1 text-xs text-slate-500">
+                    Capturing: {screenCaptureStats.width}x{screenCaptureStats.height} @{" "}
+                    {screenCaptureStats.frameRate}fps
+                  </p>
+                )}
               </div>
             </section>
 
