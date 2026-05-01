@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use windows::core::Interface;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ADAPTER_DESC1,
 };

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use scrap::{Capturer, Display};
 use std::io::ErrorKind;
+use std::sync::mpsc::{self, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,10 @@ struct DesktopCaptureProbeStats {
     elapsed_ms: u128,
     achieved_fps: f64,
     avg_frame_bytes: usize,
+    pipeline_sent_frames: u64,
+    pipeline_dropped_frames: u64,
+    pipeline_consumed_frames: u64,
+    pipeline_consumed_bytes: usize,
 }
 
 fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCaptureProbeStats> {
@@ -34,6 +39,18 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
     let mut would_block_events: u64 = 0;
     let mut poll_attempts: u64 = 0;
     let mut total_bytes: usize = 0;
+    let (tx, rx) = mpsc::sync_channel::<usize>(32);
+    let consumer = thread::spawn(move || {
+        let mut consumed_frames: u64 = 0;
+        let mut consumed_bytes: usize = 0;
+        while let Ok(frame_bytes) = rx.recv() {
+            consumed_frames += 1;
+            consumed_bytes += frame_bytes;
+        }
+        (consumed_frames, consumed_bytes)
+    });
+    let mut pipeline_sent_frames: u64 = 0;
+    let mut pipeline_dropped_frames: u64 = 0;
 
     while start.elapsed() < deadline {
         poll_attempts += 1;
@@ -41,6 +58,17 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
             Ok(frame) => {
                 frames += 1;
                 total_bytes += frame.len();
+                match tx.try_send(frame.len()) {
+                    Ok(()) => {
+                        pipeline_sent_frames += 1;
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        pipeline_dropped_frames += 1;
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        pipeline_dropped_frames += 1;
+                    }
+                }
                 // Target pacing after successful frame capture.
                 thread::sleep(Duration::from_micros(1_000_000 / tuning.target_fps as u64));
             }
@@ -63,6 +91,10 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
     } else {
         0
     };
+    drop(tx);
+    let (pipeline_consumed_frames, pipeline_consumed_bytes) = consumer
+        .join()
+        .map_err(|_| anyhow::anyhow!("capture pipeline consumer thread panicked"))?;
 
     Ok(DesktopCaptureProbeStats {
         width,
@@ -73,6 +105,10 @@ fn run_windows_desktop_capture_probe(tuning: CaptureTuning) -> Result<DesktopCap
         elapsed_ms,
         achieved_fps,
         avg_frame_bytes,
+        pipeline_sent_frames,
+        pipeline_dropped_frames,
+        pipeline_consumed_frames,
+        pipeline_consumed_bytes,
     })
 }
 
@@ -102,7 +138,7 @@ impl CaptureBackend for WindowsCaptureBackend {
         );
         let stats = run_windows_desktop_capture_probe(tuning)?;
         println!(
-            "[windows] probe done: frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={}",
+            "[windows] probe done: frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={}",
             stats.produced_frames,
             stats.elapsed_ms,
             stats.achieved_fps,
@@ -110,7 +146,11 @@ impl CaptureBackend for WindowsCaptureBackend {
             stats.height,
             stats.avg_frame_bytes,
             stats.poll_attempts,
-            stats.would_block_events
+            stats.would_block_events,
+            stats.pipeline_sent_frames,
+            stats.pipeline_dropped_frames,
+            stats.pipeline_consumed_frames,
+            stats.pipeline_consumed_bytes
         );
         if stats.achieved_fps < (tuning.target_fps as f64 * 0.5) {
             println!(

@@ -50,5 +50,6 @@ cargo run -- --dry-run
 - Platform backend selection (windows/macos)
 - Backend diagnostics hints and bootstrap placeholders
 - Windows desktop frame capture probe via `scrap` with measured achieved FPS/resolution
+- Windows DXGI adapter probe (primary GPU introspection) to prepare migration to Desktop Duplication
 - Cross-platform pacing probe scaffolding remains for future macOS ScreenCaptureKit integration
 
