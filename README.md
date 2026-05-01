@@ -60,6 +60,7 @@ For the high-fidelity native-capture roadmap, see `docs/native-capture-blueprint
 For the production web-first launch workflow, see `docs/public-launch-runbook.md`.
 For production validation after deploy, see `docs/production-e2e-qa.md`.
 For the post-launch native private-beta milestone, see `docs/native-private-beta-milestone.md`.
+For the complete all-in-one technical/project document, see `docs/project-master-documentation.md`.
 
 ## Native Sender Scaffold
 
