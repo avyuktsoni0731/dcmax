@@ -38,6 +38,7 @@ struct DesktopCaptureProbeStats {
     publisher_avg_latency_ms: f64,
     publisher_avg_payload_bytes: usize,
     capture_backend: &'static str,
+    encoder_backend: &'static str,
 }
 
 fn run_pipeline_with_frame_pump<F>(
@@ -78,6 +79,13 @@ where
         let mut encoded_frames: u64 = 0;
         let mut dropped: u64 = 0;
         let mut total_encode_latency_ms: f64 = 0.0;
+        let mut active_encoder_backend: &'static str = match tuning.encoder_backend {
+            EncoderBackend::Fast => "fast",
+            EncoderBackend::FfmpegLibx264 => "ffmpeg-libx264",
+            EncoderBackend::FfmpegH264Nvenc => "ffmpeg-h264-nvenc",
+        };
+        let mut nvenc_consecutive_failures: u32 = 0;
+        let mut nvenc_fallback_enabled = false;
         while let Ok(frame) = rx_enc_in.recv() {
             let encode_start = Instant::now();
             let encoded = match tuning.encoder_backend {
@@ -103,12 +111,40 @@ where
                         capture_instant: frame.capture_instant,
                         encoded_instant: Instant::now(),
                     },
-                    Err(_) => {
-                        dropped += 1;
-                        continue;
+                    Err(err) => {
+                        nvenc_consecutive_failures += 1;
+                        if nvenc_consecutive_failures >= 3 {
+                            nvenc_fallback_enabled = true;
+                            active_encoder_backend = "ffmpeg-libx264-fallback";
+                            eprintln!(
+                                "[windows] nvenc encode failing repeatedly ({} consecutive): {}. Falling back to libx264.",
+                                nvenc_consecutive_failures, err
+                            );
+                        }
+                        if nvenc_fallback_enabled {
+                            match encode_frame_ffmpeg_single(&frame, "libx264") {
+                                Ok(payload) => EncodedFrame {
+                                    width: frame.width,
+                                    height: frame.height,
+                                    payload,
+                                    capture_instant: frame.capture_instant,
+                                    encoded_instant: Instant::now(),
+                                },
+                                Err(_) => {
+                                    dropped += 1;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            dropped += 1;
+                            continue;
+                        }
                     }
                 },
             };
+            if matches!(tuning.encoder_backend, EncoderBackend::FfmpegH264Nvenc) && !nvenc_fallback_enabled {
+                nvenc_consecutive_failures = 0;
+            }
             total_encode_latency_ms += encoded.encoded_instant.elapsed().as_secs_f64() * 1000.0;
             total_encode_latency_ms += encode_start.elapsed().as_secs_f64() * 1000.0;
             match tx_pub.try_send(encoded) {
@@ -125,7 +161,7 @@ where
         } else {
             0.0
         };
-        (encoded_frames, dropped, avg_encode_latency_ms)
+        (encoded_frames, dropped, avg_encode_latency_ms, active_encoder_backend)
     });
 
     let publisher_worker = thread::spawn(move || {
@@ -198,7 +234,12 @@ where
     let (converter_metrics, _adapter_sent, adapter_dropped) = adapter_worker
         .join()
         .map_err(|_| anyhow::anyhow!("adapter worker panicked"))?;
-    let (_encoder_stage_converted_frames, encoder_dropped_frames, _encoder_internal_latency_ms) =
+    let (
+        _encoder_stage_converted_frames,
+        encoder_dropped_frames,
+        _encoder_internal_latency_ms,
+        active_encoder_backend,
+    ) =
         encoder_worker
             .join()
             .map_err(|_| anyhow::anyhow!("encoder worker panicked"))?;
@@ -233,6 +274,7 @@ where
         publisher_avg_latency_ms: pipeline_avg_end_to_end_latency_ms,
         publisher_avg_payload_bytes,
         capture_backend,
+        encoder_backend: active_encoder_backend,
     })
 }
 
@@ -402,7 +444,31 @@ impl CaptureBackend for WindowsCaptureBackend {
             CaptureBackendMode::Scrap => run_windows_desktop_capture_probe_scrap(tuning)?,
             CaptureBackendMode::FfmpegDdagrab => run_windows_desktop_capture_probe_ffmpeg(tuning)?,
             CaptureBackendMode::Auto => match run_windows_desktop_capture_probe_ffmpeg(tuning) {
-                Ok(stats) => stats,
+                Ok(stats) => {
+                    let target_floor = tuning.target_fps as f64 * 0.7;
+                    if stats.achieved_fps < target_floor {
+                        println!(
+                            "[windows] ffmpeg-ddagrab under target floor ({:.2} < {:.2}). Probing scrap backend and selecting better result.",
+                            stats.achieved_fps, target_floor
+                        );
+                        let scrap_stats = run_windows_desktop_capture_probe_scrap(tuning)?;
+                        if scrap_stats.achieved_fps > stats.achieved_fps * 1.15 {
+                            println!(
+                                "[windows] auto backend selected scrap (ffmpeg-ddagrab {:.2}fps vs scrap {:.2}fps).",
+                                stats.achieved_fps, scrap_stats.achieved_fps
+                            );
+                            scrap_stats
+                        } else {
+                            println!(
+                                "[windows] auto backend kept ffmpeg-ddagrab (ffmpeg-ddagrab {:.2}fps vs scrap {:.2}fps).",
+                                stats.achieved_fps, scrap_stats.achieved_fps
+                            );
+                            stats
+                        }
+                    } else {
+                        stats
+                    }
+                }
                 Err(err) => {
                     println!(
                         "[windows] ffmpeg-ddagrab capture probe failed: {}. Falling back to scrap backend.",
@@ -413,8 +479,9 @@ impl CaptureBackend for WindowsCaptureBackend {
             },
         };
         println!(
-            "[windows] probe done: backend={} frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={} pipeline_avg_ingest_latency_ms={:.2} encoder_converted={} encoder_dropped={} encoder_avg_conversion_latency_ms={:.3} encoder_avg_end_to_end_latency_ms={:.2} publisher_avg_latency_ms={:.2} publisher_avg_payload_bytes={}",
+            "[windows] probe done: backend={} encoder={} frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={} pipeline_avg_ingest_latency_ms={:.2} encoder_converted={} encoder_dropped={} encoder_avg_conversion_latency_ms={:.3} encoder_avg_end_to_end_latency_ms={:.2} publisher_avg_latency_ms={:.2} publisher_avg_payload_bytes={}",
             stats.capture_backend,
+            stats.encoder_backend,
             stats.produced_frames,
             stats.elapsed_ms,
             stats.achieved_fps,
@@ -442,7 +509,7 @@ impl CaptureBackend for WindowsCaptureBackend {
         }
         println!("[windows] next milestone: route captured frames into encoder/publisher pipeline");
         Ok(Some(PipelineReport {
-            backend: stats.capture_backend.to_string(),
+            backend: format!("{}+{}", stats.capture_backend, stats.encoder_backend),
             achieved_fps: stats.achieved_fps,
             produced_frames: stats.produced_frames,
             dropped_frames: stats.pipeline_dropped_frames + stats.encoder_dropped_frames,

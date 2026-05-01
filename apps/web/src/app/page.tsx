@@ -173,7 +173,7 @@ export default function HomePage() {
   const [nativeTargetFps, setNativeTargetFps] = useState(60);
   const [nativeProbeSeconds, setNativeProbeSeconds] = useState(3);
   const [nativeHeartbeatSeconds, setNativeHeartbeatSeconds] = useState(1);
-  const [nativeCaptureMode, setNativeCaptureMode] = useState<NativeCaptureMode>("scrap");
+  const [nativeCaptureMode, setNativeCaptureMode] = useState<NativeCaptureMode>("auto");
   const [nativeEncoderMode, setNativeEncoderMode] = useState<NativeEncoderMode>("ffmpeg-h264-nvenc");
   const [nativeDryRun, setNativeDryRun] = useState(false);
   const [preferNativeSource, setPreferNativeSource] = useState(true);
@@ -1115,9 +1115,9 @@ export default function HomePage() {
                 onChange={(e) => setNativeCaptureMode(e.target.value as NativeCaptureMode)}
                 className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 outline-none transition focus:border-indigo-400"
               >
+                <option value="auto">Capture: auto (DXGI to scrap fallback)</option>
                 <option value="scrap">Capture: scrap (stable)</option>
                 <option value="ffmpeg-ddagrab">Capture: ffmpeg-ddagrab (DXGI)</option>
-                <option value="auto">Capture: auto</option>
               </select>
               <select
                 value={nativeEncoderMode}
