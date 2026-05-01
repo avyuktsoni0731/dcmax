@@ -282,6 +282,7 @@ app.post("/native/runtime/start", async (req, res) => {
   if (payload.dryRun) args.push("--dry-run");
 
   let livekitWhipUrlFromIngress: string | undefined;
+  let livekitRtmpUrlFromIngress: string | undefined;
   if (payload.autoEnsureIngress && !payload.dryRun) {
     try {
       const ingressClient = new IngressClient(resolveLiveKitHttpUrl(), env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET);
@@ -289,12 +290,12 @@ app.post("/native/runtime/start", async (req, res) => {
         roomName: payload.roomName
       });
       const byIdentity = existing.find(
-        (ingress) => ingress.inputType === IngressInput.WHIP_INPUT && ingress.participantIdentity === payload.identity
+        (ingress) => ingress.inputType === IngressInput.RTMP_INPUT && ingress.participantIdentity === payload.identity
       );
       const ingress =
         byIdentity ??
-        (await ingressClient.createIngress(IngressInput.WHIP_INPUT, {
-          name: `native-whip-${payload.roomName}`,
+        (await ingressClient.createIngress(IngressInput.RTMP_INPUT, {
+          name: `native-rtmp-${payload.roomName}`,
           roomName: payload.roomName,
           participantIdentity: payload.identity,
           participantName: payload.identity,
@@ -302,7 +303,7 @@ app.post("/native/runtime/start", async (req, res) => {
           bypassTranscoding: false
         }));
       if (ingress.url && ingress.streamKey) {
-        livekitWhipUrlFromIngress = `${ingress.url.replace(/\/$/, "")}/${ingress.streamKey}`;
+        livekitRtmpUrlFromIngress = `${ingress.url.replace(/\/$/, "")}/${ingress.streamKey}`;
       }
     } catch (err) {
       res.status(500).json({
@@ -321,7 +322,8 @@ app.post("/native/runtime/start", async (req, res) => {
       ROOM_NAME: payload.roomName,
       IDENTITY: payload.identity,
       CLIENT_TYPE: "native_sender",
-      ...(livekitWhipUrlFromIngress ? { LIVEKIT_WHIP_URL: livekitWhipUrlFromIngress } : {})
+      ...(livekitWhipUrlFromIngress ? { LIVEKIT_WHIP_URL: livekitWhipUrlFromIngress } : {}),
+      ...(livekitRtmpUrlFromIngress ? { LIVEKIT_RTMP_URL: livekitRtmpUrlFromIngress } : {})
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -388,7 +390,8 @@ app.post("/native/runtime/start", async (req, res) => {
   res.json({
     ok: true,
     runtime: record,
-    whipUrl: livekitWhipUrlFromIngress ?? null
+    whipUrl: livekitWhipUrlFromIngress ?? null,
+    rtmpUrl: livekitRtmpUrlFromIngress ?? null
   });
 });
 
@@ -453,13 +456,13 @@ app.post("/native/ingress/ensure", async (req, res) => {
       roomName: payload.roomName
     });
     const byIdentity = existing.find(
-      (ingress) => ingress.inputType === IngressInput.WHIP_INPUT && ingress.participantIdentity === payload.identity
+      (ingress) => ingress.inputType === IngressInput.RTMP_INPUT && ingress.participantIdentity === payload.identity
     );
 
     const ingress =
       byIdentity ??
-      (await ingressClient.createIngress(IngressInput.WHIP_INPUT, {
-        name: `${payload.name}-${payload.roomName}`,
+      (await ingressClient.createIngress(IngressInput.RTMP_INPUT, {
+        name: `${payload.name}-rtmp-${payload.roomName}`,
         roomName: payload.roomName,
         participantIdentity: payload.identity,
         participantName: payload.identity,
@@ -469,17 +472,18 @@ app.post("/native/ingress/ensure", async (req, res) => {
 
     const base = ingress.url ?? "";
     const streamKey = ingress.streamKey ?? "";
-    const whipUrl = base && streamKey ? `${base.replace(/\/$/, "")}/${streamKey}` : base;
+    const ingestUrl = base && streamKey ? `${base.replace(/\/$/, "")}/${streamKey}` : base;
     res.json({
       ok: true,
       roomName: payload.roomName,
       identity: payload.identity,
       ingressId: ingress.ingressId,
       inputType: ingress.inputType,
-      whipBaseUrl: ingress.url,
+      ingestBaseUrl: ingress.url,
       streamKey: ingress.streamKey,
-      whipUrl,
-      note: "Set native-sender LIVEKIT_WHIP_URL to whipUrl. LIVEKIT_WHIP_BEARER_TOKEN is not required for this mode."
+      ingestUrl,
+      ingestType: "rtmp",
+      note: "Set native-sender LIVEKIT_RTMP_URL to ingestUrl for reliable FFmpeg publishing."
     });
   } catch (err) {
     res.status(500).json({

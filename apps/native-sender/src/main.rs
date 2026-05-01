@@ -11,8 +11,10 @@ use config::{AppConfig, CliArgs, TargetPlatform};
 use platform::CaptureBackend;
 use publisher::PublisherState;
 use reqwest::Client;
-use std::io::Read;
+use std::io::{BufRead, BufReader};
 use std::process::Child;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use tokio::time::{interval, Duration};
 
 async fn post_native_report(client: &Client, config: &AppConfig, report: &capture::PipelineReport) -> Result<()> {
@@ -148,6 +150,32 @@ async fn main() -> Result<()> {
                 }
             }
         };
+        let ffmpeg_stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        if let Some(proc) = ffmpeg_publisher.as_mut() {
+            if let Some(stderr) = proc.stderr.take() {
+                let stderr_tail = Arc::clone(&ffmpeg_stderr_tail);
+                thread::spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines() {
+                        let line = match line {
+                            Ok(value) => value,
+                            Err(_) => break,
+                        };
+                        eprintln!("[ffmpeg-whip] {}", line);
+                        if let Ok(mut guard) = stderr_tail.lock() {
+                            if !guard.is_empty() {
+                                guard.push('\n');
+                            }
+                            guard.push_str(&line);
+                            if guard.len() > 4000 {
+                                let keep_from = guard.len().saturating_sub(3000);
+                                *guard = guard[keep_from..].to_string();
+                            }
+                        }
+                    }
+                });
+            }
+        }
         let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
         if let Some(report) = report {
             let last_report = report;
@@ -180,17 +208,17 @@ async fn main() -> Result<()> {
                                 match proc.try_wait() {
                                     Ok(Some(status)) => {
                                         let mut msg = format!("ffmpeg WHIP publisher exited: {}", status);
-                                        if let Some(stderr) = proc.stderr.as_mut() {
-                                            let mut buf = String::new();
-                                            let _ = stderr.read_to_string(&mut buf);
-                                            if !buf.trim().is_empty() {
-                                                msg = format!("{} :: {}", msg, buf.trim());
-                                                if buf.contains("Invalid answer: OK") {
-                                                    msg = format!(
-                                                        "{} :: hint: LiveKit signaling URL is not a WHIP ingest endpoint. Set LIVEKIT_WHIP_URL (and optionally LIVEKIT_WHIP_BEARER_TOKEN) for a valid ingest target.",
-                                                        msg
-                                                    );
-                                                }
+                                        let stderr_tail = ffmpeg_stderr_tail
+                                            .lock()
+                                            .map(|s| s.clone())
+                                            .unwrap_or_default();
+                                        if !stderr_tail.trim().is_empty() {
+                                            msg = format!("{} :: {}", msg, stderr_tail.trim());
+                                            if stderr_tail.contains("Invalid answer: OK") {
+                                                msg = format!(
+                                                    "{} :: hint: LiveKit signaling URL is not a WHIP ingest endpoint. Set LIVEKIT_WHIP_URL (and optionally LIVEKIT_WHIP_BEARER_TOKEN) for a valid ingest target.",
+                                                    msg
+                                                );
                                             }
                                         }
                                         let _ = post_publisher_event(

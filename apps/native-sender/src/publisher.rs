@@ -142,6 +142,10 @@ fn resolve_whip_target(token: &TokenResponse) -> Result<(String, Option<String>)
     Ok((format!("{}?access_token={}", whip_base, token.token), None))
 }
 
+fn resolve_rtmp_target() -> Option<String> {
+    std::env::var("LIVEKIT_RTMP_URL").ok().filter(|v| !v.trim().is_empty())
+}
+
 pub fn start_ffmpeg_whip_publisher(
     platform_name: &str,
     token: &TokenResponse,
@@ -153,7 +157,13 @@ pub fn start_ffmpeg_whip_publisher(
         anyhow::bail!("ffmpeg WHIP publisher is currently wired for windows only");
     }
 
-    let (whip_url, whip_bearer_token) = resolve_whip_target(token)?;
+    let rtmp_target = resolve_rtmp_target();
+    let (whip_url, whip_bearer_token) = if rtmp_target.is_none() {
+        let (u, b) = resolve_whip_target(token)?;
+        (Some(u), b)
+    } else {
+        (None, None)
+    };
     let use_ddagrab = matches!(capture_backend, CaptureBackend::FfmpegDdagrab);
     let encoder_codec = match encoder_backend {
         EncoderBackend::Fast | EncoderBackend::FfmpegLibx264 => "libx264",
@@ -169,11 +179,15 @@ pub fn start_ffmpeg_whip_publisher(
     };
     let encoder_filter = match (use_ddagrab, encoder_backend) {
         (true, EncoderBackend::Fast | EncoderBackend::FfmpegLibx264) => {
-            "hwdownload,format=bgra,format=yuv420p"
+            format!("hwdownload,format=bgra,fps={},format=yuv420p", target_fps)
         }
-        (true, EncoderBackend::FfmpegH264Nvenc) => "hwdownload,format=bgra,format=nv12",
-        (false, EncoderBackend::Fast | EncoderBackend::FfmpegLibx264) => "format=yuv420p",
-        (false, EncoderBackend::FfmpegH264Nvenc) => "format=nv12",
+        (true, EncoderBackend::FfmpegH264Nvenc) => {
+            format!("hwdownload,format=bgra,fps={},format=nv12", target_fps)
+        }
+        (false, EncoderBackend::Fast | EncoderBackend::FfmpegLibx264) => {
+            format!("fps={},format=yuv420p", target_fps)
+        }
+        (false, EncoderBackend::FfmpegH264Nvenc) => format!("fps={},format=nv12", target_fps),
     };
     let output_pix_fmt = match encoder_backend {
         EncoderBackend::Fast | EncoderBackend::FfmpegLibx264 => "yuv420p",
@@ -185,6 +199,10 @@ pub fn start_ffmpeg_whip_publisher(
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("warning")
+        .arg("-fflags")
+        .arg("+genpts")
+        .arg("-use_wallclock_as_timestamps")
+        .arg("1")
         .args(if use_ddagrab {
             vec![
                 "-f".to_string(),
@@ -203,7 +221,7 @@ pub fn start_ffmpeg_whip_publisher(
             ]
         })
         .arg("-vf")
-        .arg(encoder_filter)
+        .arg(&encoder_filter)
         .arg("-pix_fmt")
         .arg(output_pix_fmt)
         .arg("-c:v")
@@ -225,21 +243,25 @@ pub fn start_ffmpeg_whip_publisher(
         .arg("0")
         .arg("-r")
         .arg(target_fps.to_string())
+        .arg("-fps_mode")
+        .arg("cfr")
+        .arg("-vsync")
+        .arg("cfr")
         .arg("-b:v")
-        .arg("12M")
+        .arg("4M")
         .arg("-maxrate")
-        .arg("16M")
+        .arg("6M")
         .arg("-bufsize")
-        .arg("24M")
-        .args(if matches!(encoder_backend, EncoderBackend::Fast | EncoderBackend::FfmpegLibx264) {
-            vec!["-profile:v", "baseline", "-level:v", "3.1"]
-        } else {
-            Vec::new()
-        })
+        .arg("8M")
         .arg("-an")
         .arg("-f")
-        .arg("whip")
-        .arg(whip_url)
+        .arg(if rtmp_target.is_some() { "flv" } else { "whip" })
+        .arg(
+            rtmp_target
+                .as_deref()
+                .or(whip_url.as_deref())
+                .unwrap_or_default(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
