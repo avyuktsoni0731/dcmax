@@ -790,7 +790,8 @@ export default function HomePage() {
           probeSeconds: nativeProbeSeconds,
           heartbeatSeconds: nativeHeartbeatSeconds,
           capture: nativeCaptureMode,
-          encoder: nativeEncoderMode
+          encoder: nativeEncoderMode,
+          autoEnsureIngress: true
         })
       });
       if (!res.ok) {

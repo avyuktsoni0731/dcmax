@@ -232,14 +232,15 @@ const nativeRuntimeStartSchema = z.object({
   probeSeconds: z.number().int().min(1).max(60).optional().default(3),
   heartbeatSeconds: z.number().int().min(1).max(60).optional().default(1),
   capture: z.enum(["auto", "scrap", "ffmpeg-ddagrab"]).optional().default("scrap"),
-  encoder: z.enum(["fast", "ffmpeg-libx264", "ffmpeg-h264-nvenc"]).optional().default("ffmpeg-h264-nvenc")
+  encoder: z.enum(["fast", "ffmpeg-libx264", "ffmpeg-h264-nvenc"]).optional().default("ffmpeg-h264-nvenc"),
+  autoEnsureIngress: z.boolean().optional().default(true)
 });
 
 const nativeRuntimeStopSchema = z.object({
   roomName: z.string().min(2).max(64).regex(/^[a-zA-Z0-9_-]+$/)
 });
 
-app.post("/native/runtime/start", (req, res) => {
+app.post("/native/runtime/start", async (req, res) => {
   if (!requireNativeControl(req, res)) return;
   const parsed = nativeRuntimeStartSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -280,6 +281,38 @@ app.post("/native/runtime/start", (req, res) => {
   ];
   if (payload.dryRun) args.push("--dry-run");
 
+  let livekitWhipUrlFromIngress: string | undefined;
+  if (payload.autoEnsureIngress && !payload.dryRun) {
+    try {
+      const ingressClient = new IngressClient(resolveLiveKitHttpUrl(), env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET);
+      const existing = await ingressClient.listIngress({
+        roomName: payload.roomName
+      });
+      const byIdentity = existing.find(
+        (ingress) => ingress.inputType === IngressInput.WHIP_INPUT && ingress.participantIdentity === payload.identity
+      );
+      const ingress =
+        byIdentity ??
+        (await ingressClient.createIngress(IngressInput.WHIP_INPUT, {
+          name: `native-whip-${payload.roomName}`,
+          roomName: payload.roomName,
+          participantIdentity: payload.identity,
+          participantName: payload.identity,
+          enableTranscoding: true,
+          bypassTranscoding: false
+        }));
+      if (ingress.url && ingress.streamKey) {
+        livekitWhipUrlFromIngress = `${ingress.url.replace(/\/$/, "")}/${ingress.streamKey}`;
+      }
+    } catch (err) {
+      res.status(500).json({
+        error: "Failed to ensure WHIP ingress before runtime start",
+        message: err instanceof Error ? err.message : "unknown error"
+      });
+      return;
+    }
+  }
+
   const child = spawn(env.NATIVE_SENDER_BIN, args, {
     cwd: workdir,
     env: {
@@ -287,7 +320,8 @@ app.post("/native/runtime/start", (req, res) => {
       API_BASE_URL: `http://localhost:${env.PORT}`,
       ROOM_NAME: payload.roomName,
       IDENTITY: payload.identity,
-      CLIENT_TYPE: "native_sender"
+      CLIENT_TYPE: "native_sender",
+      ...(livekitWhipUrlFromIngress ? { LIVEKIT_WHIP_URL: livekitWhipUrlFromIngress } : {})
     },
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -351,7 +385,11 @@ app.post("/native/runtime/start", (req, res) => {
     });
   });
 
-  res.json({ ok: true, runtime: record });
+  res.json({
+    ok: true,
+    runtime: record,
+    whipUrl: livekitWhipUrlFromIngress ?? null
+  });
 });
 
 app.post("/native/runtime/stop", (req, res) => {
