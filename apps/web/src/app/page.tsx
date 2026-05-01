@@ -57,6 +57,7 @@ type ScreenCaptureStats = {
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:4000";
+const IS_NGROK_API = API_BASE.includes("ngrok-free.app");
 
 function classNames(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
@@ -75,6 +76,17 @@ function formatElapsed(ms: number): string {
   const ss = total % 60;
   if (hh > 0) return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
   return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+}
+
+async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+  const headers = new Headers(init?.headers ?? {});
+  if (IS_NGROK_API) {
+    headers.set("ngrok-skip-browser-warning", "true");
+  }
+  return fetch(input, {
+    ...init,
+    headers
+  });
 }
 
 export default function HomePage() {
@@ -211,8 +223,13 @@ export default function HomePage() {
     let active = true;
     const poll = async () => {
       try {
-        const res = await fetch(`${API_BASE}/native/sessions/${roomKey}`);
+        const res = await apiFetch(`${API_BASE}/native/sessions/${roomKey}`);
         if (!res.ok) return;
+        const contentType = res.headers.get("content-type") ?? "";
+        if (!contentType.includes("application/json")) {
+          showToast("Native session API returned non-JSON response. Check ngrok tunnel/warning page.", "warning");
+          return;
+        }
         const payload = (await res.json()) as NativeSessionResponse;
         if (!active) return;
         const preferred =
@@ -236,7 +253,7 @@ export default function HomePage() {
   }, [roomName, room]);
 
   async function requestToken(identity: string, roomToJoin: string): Promise<TokenResponse> {
-    const res = await fetch(`${API_BASE}/token`, {
+    const res = await apiFetch(`${API_BASE}/token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ identity, roomName: roomToJoin })
@@ -244,6 +261,10 @@ export default function HomePage() {
 
     if (!res.ok) {
       throw new Error("Token request failed");
+    }
+    const contentType = res.headers.get("content-type") ?? "";
+    if (!contentType.includes("application/json")) {
+      throw new Error("Token API returned non-JSON response. Check ngrok tunnel/warning page.");
     }
     return (await res.json()) as TokenResponse;
   }
