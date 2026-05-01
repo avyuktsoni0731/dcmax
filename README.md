@@ -57,6 +57,8 @@ Defaults are configured for local LiveKit:
 
 See `docs/test-matrix.md` for browser/OS validation checklist and known limitations.
 For the high-fidelity native-capture roadmap, see `docs/native-capture-blueprint.md`.
+For the production web-first launch workflow, see `docs/public-launch-runbook.md`.
+For the post-launch native private-beta milestone, see `docs/native-private-beta-milestone.md`.
 
 ## Native Sender Scaffold
 
@@ -108,3 +110,13 @@ LIVEKIT_API_SECRET=YOUR_LIVEKIT_CLOUD_SECRET
 Notes:
 - Do not tunnel LiveKit media plane with `ngrok http 7880`; signaling can connect but peer/media transport will fail.
 - If Next.js warns about dev origins, add your ngrok hostname to `allowedDevOrigins` in `apps/web/next.config.mjs`.
+
+## Production Deployment
+
+Public launch should run web-first:
+
+- Deploy API with `NODE_ENV=production`, strict `WEB_ORIGINS`, and `NATIVE_CONTROL_SECRET` set.
+- Deploy web with `NEXT_PUBLIC_ENABLE_NATIVE_EXPERIMENTAL=false`.
+- Keep `NEXT_PUBLIC_NATIVE_CONTROL_SECRET` unset/empty in public web environments.
+
+See `docs/public-launch-runbook.md` for exact commands and verification steps.

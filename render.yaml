@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: dcmax-api
+    runtime: node
+    rootDir: .
+    buildCommand: npm ci && npm run build --workspace api
+    startCommand: npm run start --workspace api
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 4000
+      - key: WEB_ORIGINS
+        sync: false
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: NATIVE_CONTROL_SECRET
+        sync: false
