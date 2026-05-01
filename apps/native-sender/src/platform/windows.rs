@@ -10,7 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_
 use super::CaptureBackend;
 use crate::capture::{
     adapt_to_encoder_input_bgra, encode_frame_fast, CaptureTuning, CapturedFrame, ConverterAcc,
-    EncodedFrame, EncoderBackend, PipelineReport,
+    EncodedFrame, EncoderBackend, PipelineReport, CaptureBackend as CaptureBackendMode,
 };
 use crate::platform::windows_dxgi::probe_primary_adapter;
 
@@ -398,15 +398,19 @@ impl CaptureBackend for WindowsCaptureBackend {
             "[windows] running desktop capture probe at {} fps for {}s",
             tuning.target_fps, tuning.probe_seconds
         );
-        let stats = match run_windows_desktop_capture_probe_ffmpeg(tuning) {
-            Ok(stats) => stats,
-            Err(err) => {
-                println!(
-                    "[windows] ffmpeg-ddagrab capture probe failed: {}. Falling back to scrap backend.",
-                    err
-                );
-                run_windows_desktop_capture_probe_scrap(tuning)?
-            }
+        let stats = match tuning.capture_backend {
+            CaptureBackendMode::Scrap => run_windows_desktop_capture_probe_scrap(tuning)?,
+            CaptureBackendMode::FfmpegDdagrab => run_windows_desktop_capture_probe_ffmpeg(tuning)?,
+            CaptureBackendMode::Auto => match run_windows_desktop_capture_probe_ffmpeg(tuning) {
+                Ok(stats) => stats,
+                Err(err) => {
+                    println!(
+                        "[windows] ffmpeg-ddagrab capture probe failed: {}. Falling back to scrap backend.",
+                        err
+                    );
+                    run_windows_desktop_capture_probe_scrap(tuning)?
+                }
+            },
         };
         println!(
             "[windows] probe done: backend={} frames={} elapsed={}ms achieved_fps={:.2} resolution={}x{} avg_frame_bytes={} polls={} would_block={} pipeline_sent={} pipeline_dropped={} pipeline_consumed={} pipeline_consumed_bytes={} pipeline_avg_ingest_latency_ms={:.2} encoder_converted={} encoder_dropped={} encoder_avg_conversion_latency_ms={:.3} encoder_avg_end_to_end_latency_ms={:.2} publisher_avg_latency_ms={:.2} publisher_avg_payload_bytes={}",

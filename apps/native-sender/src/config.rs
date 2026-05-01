@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use clap::Parser;
-use crate::capture::EncoderBackend;
+use crate::capture::{CaptureBackend, EncoderBackend};
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "native-sender")]
@@ -22,6 +22,8 @@ pub struct CliArgs {
     pub heartbeat_seconds: u64,
     #[arg(long, default_value = "fast")]
     pub encoder: String,
+    #[arg(long, default_value = "scrap")]
+    pub capture: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +56,7 @@ pub struct AppConfig {
     pub probe_seconds: u64,
     pub heartbeat_seconds: u64,
     pub encoder_backend: EncoderBackend,
+    pub capture_backend: CaptureBackend,
 }
 
 impl AppConfig {
@@ -104,6 +107,15 @@ impl AppConfig {
                 other
             ),
         };
+        let capture_backend = match args.capture.to_ascii_lowercase().as_str() {
+            "auto" => CaptureBackend::Auto,
+            "scrap" => CaptureBackend::Scrap,
+            "ffmpeg-ddagrab" => CaptureBackend::FfmpegDdagrab,
+            other => bail!(
+                "invalid --capture value '{}'; expected auto|scrap|ffmpeg-ddagrab",
+                other
+            ),
+        };
 
         Ok(Self {
             api_base_url,
@@ -116,6 +128,7 @@ impl AppConfig {
             probe_seconds: args.probe_seconds,
             heartbeat_seconds: args.heartbeat_seconds,
             encoder_backend,
+            capture_backend,
         })
     }
 }
