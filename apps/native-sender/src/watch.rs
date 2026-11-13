@@ -24,7 +24,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 const FRAME_GAP: Duration = Duration::from_millis(34);
 const PLAYBACK_LIMIT: usize = 12;
-const MIRROR_DELAY: Duration = Duration::from_millis(50);
+const MIRROR_DELAY: Duration = Duration::from_millis(33);
 const MIRROR_LIMIT: Duration = Duration::from_millis(100);
 
 enum WatchEvent {
@@ -86,7 +86,8 @@ impl MirrorClock {
         let elapsed = Duration::from_micros(sender_us.saturating_sub(self.origin_sender).max(0) as u64);
         let scheduled = self.origin_local + elapsed;
         let late = arrived.saturating_duration_since(scheduled);
-        if late > MIRROR_LIMIT + MIRROR_DELAY {
+        let early = scheduled.saturating_duration_since(arrived);
+        if late > MIRROR_LIMIT + MIRROR_DELAY || early > MIRROR_LIMIT {
             self.origin_sender = sender_us;
             self.origin_local = arrived;
             self.delay = MIRROR_DELAY;
@@ -163,6 +164,9 @@ struct WatchApp {
     drawn_height: u32,
     frame_interval: Duration,
     vsync: bool,
+    #[cfg(target_os = "macos")]
+    metal_misses: u32,
+    showed: bool,
 }
 
 pub fn run(config: &AppConfig) -> Result<()> {
@@ -181,10 +185,10 @@ pub fn run(config: &AppConfig) -> Result<()> {
     let _runtime;
     let picture_thread;
     if let Some(addr) = config.picture_listen {
-        println!("watch picture: direct udp {addr}");
+        println!("watch picture: direct tcp {addr}");
         picture_thread = Some(
             std::thread::Builder::new()
-                .name("picture-udp".to_string())
+                .name("picture-tcp".to_string())
                 .spawn(move || {
                     if let Err(err) = picture_watch(addr, task_queue, task_proxy, task_stop, task_cursor)
                     {
@@ -226,6 +230,9 @@ pub fn run(config: &AppConfig) -> Result<()> {
         drawn_height: 0,
         frame_interval: Duration::from_millis(16),
         vsync: false,
+        #[cfg(target_os = "macos")]
+        metal_misses: 0,
+        showed: false,
     };
     let result = event_loop.run_app(&mut app);
     #[cfg(target_os = "macos")]
@@ -247,7 +254,7 @@ fn picture_watch(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (queue, proxy, stop, cursor);
-        anyhow::bail!("UDP picture playback is available on macOS ({addr})");
+        anyhow::bail!("TCP picture playback is available on macOS ({addr})");
     }
     #[cfg(target_os = "macos")]
     {
@@ -263,132 +270,105 @@ fn picture_watch_macos(
     stop: Arc<AtomicBool>,
     cursor: Arc<CursorState>,
 ) -> Result<()> {
+    use std::io::ErrorKind;
+    use std::thread;
+    use std::time::Duration as Wait;
+
     use crate::decode_macos::Decoder;
-    use crate::picture::{listen, recv_packet};
-    let (socket, mut assembler) = listen(addr)?;
-    let mut decoder = Decoder::new();
-    let mut buffer = [0u8; 2048];
+    use crate::picture::{accept_picture, listen, request_keyframe, FrameReader};
+    let listener = listen(addr)?;
     let started = Instant::now();
     let mut received: u64 = 0;
     let mut gaps: u64 = 0;
+    let mut skipped: u64 = 0;
     let mut window_received: u64 = 0;
     let mut window_gaps: u64 = 0;
     let mut last_arrival = Instant::now();
     let mut last_log = Instant::now();
-    let mut saw_packet = false;
-    let mut next_frame: Option<u32> = None;
-    let mut pending = VecDeque::new();
-    let mut remote = None;
-    let mut asked_for_keyframe: Option<Instant> = None;
-    let mut window_datagrams: u64 = 0;
-    let mut clock = MirrorClock::new();
-    let mut last_nak: Option<(u32, Instant)> = None;
     loop {
         if stop.load(Ordering::Acquire) {
             break;
         }
-        if last_log.elapsed() >= Duration::from_secs(1) {
-            let held = queue.lock().map(|slot| slot.len()).unwrap_or(0);
-            println!(
-                "watch: fps={window_received:.0} gaps_this_second={window_gaps} held={held} frames={received} gaps={gaps} lost={} datagrams={window_datagrams} uptime={:.0}s",
-                assembler.lost(),
-                started.elapsed().as_secs_f64()
-            );
-            window_received = 0;
-            window_gaps = 0;
-            window_datagrams = 0;
-            last_log = Instant::now();
-        }
-        if pending.is_empty() {
-            let (size, addr) = match recv_packet(&socket, &mut buffer) {
-                Ok(Some(packet)) => packet,
-                Ok(None) => continue,
-                Err(err) => return Err(err.into()),
-            };
-            remote = Some(addr);
-            window_datagrams += 1;
-            if !saw_packet {
-                saw_packet = true;
-                println!("watch picture: udp packet");
+        let stream = match accept_picture(&listener) {
+            Ok(Some(stream)) => stream,
+            Ok(None) => {
+                thread::sleep(Wait::from_millis(20));
+                continue;
             }
-            pending.extend(assembler.push(&buffer[..size]));
-        }
-        // Take every datagram already waiting before decoding, so a decode
-        // does not let the kernel throw the rest of the frame away.
-        socket.set_nonblocking(true).ok();
+            Err(err) => return Err(err.into()),
+        };
+        let mut ask = stream.try_clone().ok();
+        let mut reader = FrameReader::new(stream);
+        let mut decoder = Decoder::new();
+        let mut next_frame: Option<u32> = None;
+        let mut clock = MirrorClock::new();
         loop {
-            match recv_packet(&socket, &mut buffer) {
-                Ok(Some((size, addr))) => {
-                    remote = Some(addr);
-                    window_datagrams += 1;
-                    pending.extend(assembler.push(&buffer[..size]));
-                }
+            if stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if last_log.elapsed() >= Duration::from_secs(1) {
+                let held = queue.lock().map(|slot| slot.len()).unwrap_or(0);
+                println!(
+                    "watch: fps={window_received:.0} gaps_this_second={window_gaps} held={held} frames={received} gaps={gaps} skipped={skipped} uptime={:.0}s",
+                    started.elapsed().as_secs_f64()
+                );
+                window_received = 0;
+                window_gaps = 0;
+                last_log = Instant::now();
+            }
+            let frame = match reader.read_frame() {
+                Ok(Some(frame)) => frame,
                 Ok(None) => break,
-                Err(err) => return Err(err.into()),
-            }
-        }
-        socket.set_nonblocking(false).ok();
-        let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
-        if let Some(gap) = assembler.missing() {
-            let retry = last_nak
-                .is_none_or(|(id, asked)| id != gap.frame_id || asked.elapsed() >= Duration::from_millis(15));
-            if retry {
-                if let Some(addr) = remote {
-                    let _ = socket.send_to(&gap.to_bytes(), addr);
+                Err(err) if err.kind() == ErrorKind::TimedOut || err.kind() == ErrorKind::WouldBlock => {
+                    continue;
                 }
-                last_nak = Some((gap.frame_id, Instant::now()));
-            }
-        }
-        let Some(frame) = pending.pop_front() else {
-            continue;
-        };
-        // A delta after a missing frame is predicted from the wrong picture.
-        // Hold the last clean frame until the next keyframe.
-        let follows = next_frame.is_some_and(|expected| frame.frame_id == expected);
-        if !frame.keyframe && !follows {
-            let due = asked_for_keyframe
-                .is_none_or(|asked| asked.elapsed() >= Duration::from_millis(100));
-            if due {
-                if let Some(addr) = remote {
-                    let _ = socket.send_to(b"IDR", addr);
+                Err(err) => {
+                    eprintln!("picture tcp: {err}");
+                    break;
                 }
-                asked_for_keyframe = Some(Instant::now());
+            };
+            let follows = match next_frame {
+                Some(expected) => frame.frame_id == expected,
+                None => frame.keyframe,
+            };
+            if !frame.keyframe && !follows {
+                skipped += 1;
+                if let Some(socket) = ask.as_mut() {
+                    request_keyframe(socket);
+                }
+                continue;
             }
-            continue;
-        }
-        cursor.set(frame.cursor);
-        let Some(decoded) = decoder.decode(&frame.payload) else {
-            next_frame = None;
-            if let Some(addr) = remote {
-                let _ = socket.send_to(b"IDR", addr);
+            cursor.set(frame.cursor);
+            let Some(decoded) = decoder.decode(&frame.payload) else {
+                next_frame = None;
+                skipped += 1;
+                if let Some(socket) = ask.as_mut() {
+                    request_keyframe(socket);
+                }
+                continue;
+            };
+            next_frame = Some(frame.frame_id.wrapping_add(1));
+            let arrival = Instant::now();
+            if received > 0 && arrival.duration_since(last_arrival) > FRAME_GAP {
+                gaps += 1;
+                window_gaps += 1;
             }
-            asked_for_keyframe = Some(Instant::now());
-            continue;
-        };
-        if frame.keyframe {
-            asked_for_keyframe = None;
-        }
-        next_frame = Some(frame.frame_id.wrapping_add(1));
-        let arrival = Instant::now();
-        if received > 0 && arrival.duration_since(last_arrival) > FRAME_GAP {
-            gaps += 1;
-            window_gaps += 1;
-        }
-        last_arrival = arrival;
-        received += 1;
-        window_received += 1;
-        note_once(&format!(
-            "watch picture: udp nv12 {}x{}",
-            decoded.buffer.width(),
-            decoded.buffer.height()
-        ));
-        let picture = Picture::Gpu {
-            buffer: decoded.buffer,
-            full_range: decoded.full_range,
-        };
-        let due = clock.due(frame.timestamp_us, arrival);
-        if push_picture(&queue, picture, due) {
-            let _ = proxy.send_event(WatchEvent::Frame);
+            last_arrival = arrival;
+            received += 1;
+            window_received += 1;
+            note_once(&format!(
+                "watch picture: tcp nv12 {}x{}",
+                decoded.buffer.width(),
+                decoded.buffer.height()
+            ));
+            let picture = Picture::Gpu {
+                buffer: decoded.buffer,
+                full_range: decoded.full_range,
+            };
+            let due = clock.due(frame.timestamp_us, arrival);
+            if push_picture(&queue, picture, due) {
+                let _ = proxy.send_event(WatchEvent::Frame);
+            }
         }
     }
     Ok(())
@@ -877,21 +857,15 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WatchEvent) {
         match event {
             WatchEvent::Quit => event_loop.exit(),
-            WatchEvent::Vsync => self.present_due(),
-            WatchEvent::Frame => {
-                if !self.vsync {
-                    self.schedule(event_loop);
-                }
-            }
+            WatchEvent::Vsync | WatchEvent::Frame => self.present_due(),
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.vsync {
-            event_loop.set_control_flow(ControlFlow::Wait);
-        } else {
-            self.schedule(event_loop);
+        if self.window.is_some() {
+            self.present_due();
         }
+        self.schedule(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -900,7 +874,7 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
                 self.stop.store(true, Ordering::Release);
                 event_loop.exit();
             }
-            WindowEvent::RedrawRequested if !self.vsync => {
+            WindowEvent::RedrawRequested => {
                 self.present_due();
                 self.schedule(event_loop);
             }
@@ -966,10 +940,7 @@ impl WatchApp {
             return;
         };
         if Instant::now() >= due {
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
-            event_loop.set_control_flow(ControlFlow::Wait);
+            event_loop.set_control_flow(ControlFlow::Poll);
             return;
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(due));
@@ -988,6 +959,12 @@ impl WatchApp {
                     chosen = Some(item.picture);
                 }
             }
+            if chosen.is_none() && queue.len() >= PLAYBACK_LIMIT {
+                while queue.len() > 1 {
+                    queue.pop_front();
+                }
+                chosen = queue.pop_front().map(|item| item.picture);
+            }
             chosen
         };
         let Some(frame) = frame else {
@@ -1003,6 +980,10 @@ impl WatchApp {
         match self.paint(&frame) {
             Ok(true) => {
                 self.cursor_drawn = cursor_seq;
+                if !self.showed {
+                    self.showed = true;
+                    eprintln!("watch present: frame on screen");
+                }
                 self.shown = Some(frame.clone());
                 self.hold(frame);
             }
@@ -1010,7 +991,7 @@ impl WatchApp {
                 if let Ok(mut queue) = self.queue.lock() {
                     queue.push_front(Queued {
                         picture: frame,
-                        due: now,
+                        due: now + Duration::from_millis(16),
                     });
                 }
             }
@@ -1059,17 +1040,47 @@ impl WatchApp {
             }
         };
         match status {
-            0 => Ok(true),
-            -2 => Ok(false),
+            0 => {
+                self.metal_misses = 0;
+                Ok(true)
+            }
             -3 => {
                 let Picture::Gpu { buffer, full_range } = picture else {
                     return Err(anyhow!("the hardware frame has no Metal texture"));
                 };
                 let image = gpu_to_cpu(buffer, *full_range)
                     .ok_or_else(|| anyhow!("could not read the hardware frame"))?;
-                Ok(presenter.draw_bgra(&image.pixels, image.width, image.height, pointer) == 0)
+                if presenter.draw_bgra(&image.pixels, image.width, image.height, pointer) == 0 {
+                    self.metal_misses = 0;
+                    return Ok(true);
+                }
+                self.note_metal_miss(picture)
             }
+            -2 => self.note_metal_miss(picture),
             status => Err(anyhow!("failed to present the watch frame ({status})")),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn note_metal_miss(&mut self, picture: &Picture) -> Result<bool> {
+        self.metal_misses = self.metal_misses.saturating_add(1);
+        if self.metal_misses < 30 {
+            return Ok(false);
+        }
+        self.use_window_surface();
+        self.paint_softbuffer(picture)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn use_window_surface(&mut self) {
+        if self.surface.is_some() {
+            self.presenter.take();
+            return;
+        }
+        note_once("watch present: metal had no drawable, drawing on the window surface");
+        self.presenter.take();
+        if let Some(window) = self.window.clone() {
+            self.attach_softbuffer(&window);
         }
     }
 

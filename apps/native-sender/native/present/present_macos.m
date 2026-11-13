@@ -117,6 +117,10 @@ static NSString *const kShader = @
 }
 
 - (void)syncLayerSize {
+    if (self.view.layer != self.metalLayer) {
+        self.view.wantsLayer = YES;
+        self.view.layer = self.metalLayer;
+    }
     CGFloat scale = self.view.window.backingScaleFactor;
     if (scale < 1.0) {
         scale = NSScreen.mainScreen.backingScaleFactor;
@@ -125,9 +129,12 @@ static NSString *const kShader = @
         scale = 2.0;
     }
     NSSize size = self.view.bounds.size;
+    if ((size.width < 2.0 || size.height < 2.0) && self.view.window) {
+        size = self.view.window.contentLayoutRect.size;
+    }
     self.metalLayer.contentsScale = scale;
-    self.metalLayer.frame = self.view.bounds;
-    self.metalLayer.drawableSize = CGSizeMake(MAX(size.width * scale, 1.0), MAX(size.height * scale, 1.0));
+    self.metalLayer.frame = CGRectMake(0.0, 0.0, MAX(size.width, 1.0), MAX(size.height, 1.0));
+    self.metalLayer.drawableSize = CGSizeMake(MAX(size.width * scale, 2.0), MAX(size.height * scale, 2.0));
 }
 
 @end
