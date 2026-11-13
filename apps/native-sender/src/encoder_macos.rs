@@ -99,6 +99,7 @@ pub struct ScreenEncoder {
     encode_thread: Option<JoinHandle<()>>,
     fatal: Arc<Mutex<Option<String>>>,
     controls: Arc<Controls>,
+    queue_drops: Arc<AtomicU64>,
     pub units: mpsc::Receiver<AccessUnit>,
     pub capture_backend: String,
     pub encoder_backend: String,
@@ -109,7 +110,8 @@ pub struct ScreenEncoder {
 impl ScreenEncoder {
     pub fn start(config: &AppConfig) -> Result<Self> {
         let (width, height, display_width, display_height) = output_size(config)?;
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, rx) = mpsc::channel(32);
+        let queue_drops = Arc::new(AtomicU64::new(0));
         let bitrate_bps = u64::from(config.bitrate_kbps) * 1000;
         let session = VtSession::create(
             width,
@@ -118,6 +120,7 @@ impl ScreenEncoder {
             bitrate_bps,
             config.gop_frames(),
             tx,
+            Arc::clone(&queue_drops),
         )?;
         let session = Arc::new(Mutex::new(session));
         let controls = Arc::new(Controls {
@@ -163,6 +166,7 @@ impl ScreenEncoder {
             encode_thread: Some(encode_thread),
             fatal,
             controls,
+            queue_drops,
             units: rx,
             capture_backend: "screencapturekit".to_string(),
             encoder_backend: "videotoolbox".to_string(),
@@ -198,6 +202,10 @@ impl ScreenEncoder {
 
     pub fn set_bitrate_bps(&self, bps: u64) {
         self.controls.bitrate_bps.store(bps, Ordering::Relaxed);
+    }
+
+    pub fn queue_drops(&self) -> u64 {
+        self.queue_drops.load(Ordering::Relaxed)
     }
 
     pub fn stop(&mut self) {

@@ -7,6 +7,8 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[repr(C)]
@@ -104,6 +106,7 @@ extern "C" {
 
 struct OutputState {
     tx: mpsc::Sender<AccessUnit>,
+    dropped: Arc<AtomicU64>,
 }
 
 pub struct VtSession {
@@ -124,8 +127,9 @@ impl VtSession {
         bitrate_bps: u64,
         gop: u32,
         tx: mpsc::Sender<AccessUnit>,
+        dropped: Arc<AtomicU64>,
     ) -> Result<Self> {
-        let output = Box::new(OutputState { tx });
+        let output = Box::new(OutputState { tx, dropped });
         let refcon = Box::into_raw(output);
         let spec = cf_dict(&[(
             "EnableHardwareAcceleratedVideoEncoder",
@@ -239,7 +243,9 @@ impl VtSession {
 
     fn apply_bitrate(&mut self, bitrate_bps: u64) {
         self.set_i32("AverageBitRate", bitrate_bps.min(i32::MAX as u64) as i32);
-        let window_seconds = 0.5_f64;
+        // A half-second cap makes VideoToolbox delay or crush a keyframe to stay
+        // inside the window. One second is the same interval the rate governor uses.
+        let window_seconds = 1.0_f64;
         let bytes = ((bitrate_bps as f64 / 8.0) * window_seconds)
             .round()
             .max(1.0) as i64;
@@ -351,7 +357,11 @@ unsafe extern "C" fn on_encoded_frame(
         return;
     };
     let state = unsafe { &*refcon.cast::<OutputState>() };
-    let _ = state.tx.blocking_send(unit);
+    // Blocking here stalls the hardware encoder, and the encode thread then
+    // produces nothing until the publish side catches up.
+    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = state.tx.try_send(unit) {
+        state.dropped.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn access_unit_from_sample(sample: *mut c_void) -> Option<AccessUnit> {

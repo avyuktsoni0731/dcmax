@@ -88,6 +88,10 @@ impl ScreenEncoder {
     pub fn request_keyframe(&self) {}
 
     pub fn set_bitrate_bps(&self, _bps: u64) {}
+
+    pub fn queue_drops(&self) -> u64 {
+        0
+    }
 }
 
 impl Drop for ScreenEncoder {
