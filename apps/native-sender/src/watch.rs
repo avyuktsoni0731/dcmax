@@ -5,6 +5,8 @@ use futures_util::StreamExt;
 use livekit::prelude::*;
 use livekit::webrtc::prelude::VideoBuffer;
 use livekit::webrtc::video_stream::native::{NativeVideoStream, NativeVideoStreamOptions};
+#[cfg(target_os = "macos")]
+use screencapturekit::cv::CVPixelBuffer;
 use reqwest::Client;
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -16,33 +18,50 @@ use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
+#[cfg(target_os = "macos")]
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 const FRAME_GAP: Duration = Duration::from_millis(34);
-const PLAYBACK_QUEUE: usize = 2;
-const DEFAULT_REFRESH: Duration = Duration::from_nanos(16_666_667);
+const CONTENT_FRAME: Duration = Duration::from_nanos(16_666_667);
+const PLAYBACK_LIMIT: usize = 5;
+const DEFAULT_REFRESH: Duration = CONTENT_FRAME;
 
 enum WatchEvent {
     Frame,
+    Vsync,
     Quit,
 }
 
-#[derive(Clone)]
 struct Presented {
     width: u32,
     height: u32,
     pixels: Vec<u32>,
 }
 
+enum Picture {
+    Cpu(Presented),
+    #[cfg(target_os = "macos")]
+    Gpu {
+        buffer: CVPixelBuffer,
+        full_range: bool,
+    },
+}
+
 struct WatchApp {
+    proxy: EventLoopProxy<WatchEvent>,
     window: Option<Arc<Window>>,
     context: Option<softbuffer::Context<Arc<Window>>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
-    queue: Arc<Mutex<VecDeque<Arc<Presented>>>>,
+    #[cfg(target_os = "macos")]
+    presenter: Option<crate::present_macos::Presenter>,
+    queue: Arc<Mutex<VecDeque<Picture>>>,
+    inflight: VecDeque<Picture>,
     stop: Arc<AtomicBool>,
     drawn_width: u32,
     drawn_height: u32,
     next_present: Instant,
-    refresh: Duration,
+    frame_interval: Duration,
+    vsync: bool,
 }
 
 pub fn run(config: &AppConfig) -> Result<()> {
@@ -60,32 +79,39 @@ pub fn run(config: &AppConfig) -> Result<()> {
     let task_config = config.clone();
     let task_queue = Arc::clone(&queue);
     let task_stop = Arc::clone(&stop);
+    let task_proxy = proxy.clone();
     runtime.spawn(async move {
-        if let Err(err) = session(task_config, task_queue, proxy, task_stop).await {
+        if let Err(err) = session(task_config, task_queue, task_proxy, task_stop).await {
             eprintln!("watch failed: {err:#}");
         }
     });
 
     let mut app = WatchApp {
+        proxy,
         window: None,
         context: None,
         surface: None,
+        #[cfg(target_os = "macos")]
+        presenter: None,
         queue,
+        inflight: VecDeque::new(),
         stop,
         drawn_width: 0,
         drawn_height: 0,
         next_present: Instant::now(),
-        refresh: DEFAULT_REFRESH,
+        frame_interval: DEFAULT_REFRESH,
+        vsync: false,
     };
-    event_loop
-        .run_app(&mut app)
-        .context("watch window stopped")?;
+    let result = event_loop.run_app(&mut app);
+    #[cfg(target_os = "macos")]
+    crate::present_macos::stop_vsync();
+    result.context("watch window stopped")?;
     Ok(())
 }
 
 async fn session(
     config: AppConfig,
-    queue: Arc<Mutex<VecDeque<Arc<Presented>>>>,
+    queue: Arc<Mutex<VecDeque<Picture>>>,
     proxy: EventLoopProxy<WatchEvent>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -139,8 +165,9 @@ async fn session(
             }
             _ = ticker.tick() => {
                 let fps = window_received as f64;
+                let held = queue.lock().map(|slot| slot.len()).unwrap_or(0);
                 println!(
-                    "watch: fps={fps:.0} gaps_this_second={window_gaps} frames={received} gaps={gaps} uptime={:.0}s",
+                    "watch: fps={fps:.0} gaps_this_second={window_gaps} held={held} frames={received} gaps={gaps} uptime={:.0}s",
                     started.elapsed().as_secs_f64()
                 );
                 window_received = 0;
@@ -165,8 +192,8 @@ async fn session(
                 window_received += 1;
                 if let Some(image) = presentable(&frame) {
                     let queued = queue.lock().map(|mut slot| {
-                        slot.push_back(Arc::new(image));
-                        while slot.len() > PLAYBACK_QUEUE {
+                        slot.push_back(image);
+                        while slot.len() > PLAYBACK_LIMIT {
                             slot.pop_front();
                         }
                     });
@@ -217,21 +244,192 @@ async fn wait_for_screen(
     }
 }
 
-fn presentable(frame: &livekit::webrtc::video_frame::BoxVideoFrame) -> Option<Presented> {
+fn presentable(frame: &livekit::webrtc::video_frame::BoxVideoFrame) -> Option<Picture> {
     let buffer = frame.buffer.as_ref();
-    let i420 = buffer.as_i420()?;
-    let (stride_y, stride_u, stride_v) = i420.strides();
-    let (y, u, v) = i420.data();
-    let width = i420.width();
-    let height = i420.height();
-    if width == 0 || height == 0 {
+    #[cfg(target_os = "macos")]
+    if let Some(picture) = gpu_picture(buffer) {
+        return Some(picture);
+    }
+    let image = if let Some(i420) = buffer.as_i420() {
+        let (stride_y, stride_u, stride_v) = i420.strides();
+        let (y, u, v) = i420.data();
+        presented(
+            i420.width(),
+            i420.height(),
+            i420_to_xrgb(y, u, v, i420.width(), i420.height(), stride_y, stride_u, stride_v),
+        )
+    } else if let Some(nv12) = buffer.as_nv12() {
+        let (stride_y, stride_uv) = nv12.strides();
+        let (y, uv) = nv12.data();
+        presented(
+            nv12.width(),
+            nv12.height(),
+            nv12_to_xrgb(
+                y,
+                uv,
+                nv12.width(),
+                nv12.height(),
+                stride_y,
+                stride_uv,
+                ColorRange::Limited,
+            ),
+        )
+    } else {
+        presented_native(buffer)
+    };
+    let image = image.map(Picture::Cpu);
+    match &image {
+        Some(Picture::Cpu(image)) => note_once(&format!(
+            "watch picture: cpu {:?} {}x{}",
+            buffer.buffer_type(),
+            image.width,
+            image.height
+        )),
+        #[cfg(target_os = "macos")]
+        Some(Picture::Gpu { .. }) => {}
+        None => note_once(&format!(
+            "watch dropped a {}x{} {:?} frame before it could be drawn",
+            buffer.width(),
+            buffer.height(),
+            buffer.buffer_type()
+        )),
+    }
+    image
+}
+
+#[cfg(target_os = "macos")]
+fn gpu_picture(buffer: &dyn VideoBuffer) -> Option<Picture> {
+    let native = buffer.as_native()?;
+    let pixel = unsafe { CVPixelBuffer::from_raw_borrowed(native.get_cv_pixel_buffer()) }?;
+    let format = pixel.pixel_format();
+    let video = u32::from_be_bytes(*b"420v");
+    let full = u32::from_be_bytes(*b"420f");
+    if format != video && format != full {
+        return None;
+    }
+    if !pixel.is_planar() || pixel.plane_count() < 2 {
+        return None;
+    }
+    note_once(&format!(
+        "watch picture: gpu nv12 {}x{}",
+        pixel.width(),
+        pixel.height()
+    ));
+    Some(Picture::Gpu {
+        buffer: pixel,
+        full_range: format == full,
+    })
+}
+
+fn presented(width: u32, height: u32, pixels: Vec<u32>) -> Option<Presented> {
+    if width == 0 || height == 0 || pixels.len() != (width as usize) * (height as usize) {
         return None;
     }
     Some(Presented {
         width,
         height,
-        pixels: i420_to_xrgb(y, u, v, width, height, stride_y, stride_u, stride_v),
+        pixels,
     })
+}
+
+fn note_once(message: &str) {
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if !SEEN.swap(true, Ordering::Relaxed) {
+        eprintln!("{message}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn presented_native(buffer: &dyn VideoBuffer) -> Option<Presented> {
+    let native = buffer.as_native()?;
+    let pixel = unsafe { CVPixelBuffer::from_raw_borrowed(native.get_cv_pixel_buffer()) }?;
+    let width = u32::try_from(pixel.width()).ok()?;
+    let height = u32::try_from(pixel.height()).ok()?;
+    let format = pixel.pixel_format();
+    let guard = match pixel.lock_read_only() {
+        Ok(guard) => guard,
+        Err(err) => {
+            note_once(&format!("watch could not lock the decoded frame: {err}"));
+            return None;
+        }
+    };
+    let nv12_video = u32::from_be_bytes(*b"420v");
+    let nv12_full = u32::from_be_bytes(*b"420f");
+    let i420_planar = u32::from_be_bytes(*b"y420");
+    let bgra = u32::from_be_bytes(*b"BGRA");
+    if format == nv12_video || format == nv12_full {
+        let y = plane_bytes(&guard, 0, height as usize)?;
+        let uv = plane_bytes(&guard, 1, ((height as usize) + 1) / 2)?;
+        let stride_y = u32::try_from(guard.bytes_per_row_of_plane(0)).ok()?;
+        let stride_uv = u32::try_from(guard.bytes_per_row_of_plane(1)).ok()?;
+        return presented(
+            width,
+            height,
+            nv12_to_xrgb(
+                y,
+                uv,
+                width,
+                height,
+                stride_y,
+                stride_uv,
+                if format == nv12_full {
+                    ColorRange::Full
+                } else {
+                    ColorRange::Limited
+                },
+            ),
+        );
+    }
+    if format == i420_planar {
+        let y = plane_bytes(&guard, 0, height as usize)?;
+        let chroma_height = ((height as usize) + 1) / 2;
+        let u = plane_bytes(&guard, 1, chroma_height)?;
+        let v = plane_bytes(&guard, 2, chroma_height)?;
+        let stride_y = u32::try_from(guard.bytes_per_row_of_plane(0)).ok()?;
+        let stride_u = u32::try_from(guard.bytes_per_row_of_plane(1)).ok()?;
+        let stride_v = u32::try_from(guard.bytes_per_row_of_plane(2)).ok()?;
+        return presented(
+            width,
+            height,
+            i420_to_xrgb(y, u, v, width, height, stride_y, stride_u, stride_v),
+        );
+    }
+    if format == bgra {
+        let stride = guard.bytes_per_row();
+        let ptr = guard.base_address();
+        if ptr.is_null() || stride == 0 {
+            return None;
+        }
+        let len = stride.checked_mul(height as usize)?;
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let stride = u32::try_from(stride).ok()?;
+        return presented(width, height, bgra_to_xrgb(bytes, width, height, stride));
+    }
+    note_once(&format!(
+        "watch decoded a native frame in pixel format {:08x}, which is not drawn yet",
+        format
+    ));
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn presented_native(_buffer: &dyn VideoBuffer) -> Option<Presented> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn plane_bytes<'a>(
+    guard: &'a screencapturekit::cv::CVPixelBufferLockGuard<'a>,
+    plane: usize,
+    rows: usize,
+) -> Option<&'a [u8]> {
+    let ptr = guard.base_address_of_plane(plane)?;
+    if ptr.is_null() {
+        return None;
+    }
+    let stride = guard.bytes_per_row_of_plane(plane);
+    let len = stride.checked_mul(rows)?;
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
 fn i420_to_xrgb(
@@ -261,7 +459,7 @@ fn i420_to_xrgb(
                 .get((chroma_y * stride_v + chroma_x) as usize)
                 .copied()
                 .unwrap_or(128);
-            let (r, g, b) = yuv_to_rgb(luma, chroma_u, chroma_v);
+            let (r, g, b) = yuv_to_rgb(luma, chroma_u, chroma_v, ColorRange::Limited);
             pixels[(y * width + x) as usize] =
                 (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
         }
@@ -269,13 +467,71 @@ fn i420_to_xrgb(
     pixels
 }
 
-fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
-    let c = i32::from(y) - 16;
-    let d = i32::from(u) - 128;
-    let e = i32::from(v) - 128;
-    let r = (298 * c + 409 * e + 128) >> 8;
-    let g = (298 * c - 100 * d - 208 * e + 128) >> 8;
-    let b = (298 * c + 516 * d + 128) >> 8;
+fn nv12_to_xrgb(
+    y_plane: &[u8],
+    uv_plane: &[u8],
+    width: u32,
+    height: u32,
+    stride_y: u32,
+    stride_uv: u32,
+    range: ColorRange,
+) -> Vec<u32> {
+    let mut pixels = vec![0u32; (width as usize) * (height as usize)];
+    for y in 0..height {
+        for x in 0..width {
+            let luma = y_plane
+                .get((y * stride_y + x) as usize)
+                .copied()
+                .unwrap_or(16);
+            let chroma = ((y / 2) * stride_uv + (x / 2) * 2) as usize;
+            let chroma_u = uv_plane.get(chroma).copied().unwrap_or(128);
+            let chroma_v = uv_plane.get(chroma + 1).copied().unwrap_or(128);
+            let (r, g, b) = yuv_to_rgb(luma, chroma_u, chroma_v, range);
+            pixels[(y * width + x) as usize] =
+                (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        }
+    }
+    pixels
+}
+
+fn bgra_to_xrgb(bytes: &[u8], width: u32, height: u32, stride: u32) -> Vec<u32> {
+    let mut pixels = vec![0u32; (width as usize) * (height as usize)];
+    for y in 0..height {
+        for x in 0..width {
+            let index = (y * stride + x * 4) as usize;
+            let blue = bytes.get(index).copied().unwrap_or(0);
+            let green = bytes.get(index + 1).copied().unwrap_or(0);
+            let red = bytes.get(index + 2).copied().unwrap_or(0);
+            pixels[(y * width + x) as usize] =
+                (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue);
+        }
+    }
+    pixels
+}
+
+#[derive(Clone, Copy)]
+enum ColorRange {
+    Limited,
+    Full,
+}
+
+fn yuv_to_rgb(y: u8, u: u8, v: u8, range: ColorRange) -> (u8, u8, u8) {
+    let (c, d, e) = match range {
+        ColorRange::Limited => (i32::from(y) - 16, i32::from(u) - 128, i32::from(v) - 128),
+        ColorRange::Full => (i32::from(y), i32::from(u) - 128, i32::from(v) - 128),
+    };
+    let (r, g, b) = match range {
+        ColorRange::Limited => (
+            (298 * c + 409 * e + 128) >> 8,
+            (298 * c - 100 * d - 208 * e + 128) >> 8,
+            (298 * c + 516 * d + 128) >> 8,
+        ),
+        ColorRange::Full => (
+            ((c << 8) + 359 * e + 128) >> 8,
+            ((c << 8) - 88 * d - 183 * e + 128) >> 8,
+            ((c << 8) + 454 * d + 128) >> 8,
+        ),
+    };
     (clamp_u8(r), clamp_u8(g), clamp_u8(b))
 }
 
@@ -300,36 +556,49 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
                 return;
             }
         };
-        let context = match softbuffer::Context::new(Arc::clone(&window)) {
-            Ok(context) => context,
-            Err(err) => {
-                eprintln!("failed to create the watch surface: {err}");
-                event_loop.exit();
-                return;
-            }
-        };
-        match softbuffer::Surface::new(&context, Arc::clone(&window)) {
-            Ok(surface) => self.surface = Some(surface),
-            Err(err) => {
-                eprintln!("failed to attach the watch surface: {err}");
+        self.frame_interval = frame_interval(&window);
+        #[cfg(target_os = "macos")]
+        if let Err(err) = self.attach_metal(&window) {
+            eprintln!("watch metal presenter unavailable: {err:#}");
+            if !self.attach_softbuffer(&window) {
                 event_loop.exit();
                 return;
             }
         }
-        self.refresh = refresh_interval(&window);
-        self.context = Some(context);
+        #[cfg(not(target_os = "macos"))]
+        if !self.attach_softbuffer(&window) {
+            event_loop.exit();
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if self.start_display_link() {
+            self.vsync = true;
+            eprintln!(
+                "watch vsync: one frame every {} ms",
+                self.frame_interval.as_millis()
+            );
+        }
         self.window = Some(window);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WatchEvent) {
         match event {
             WatchEvent::Quit => event_loop.exit(),
-            WatchEvent::Frame => self.schedule(event_loop),
+            WatchEvent::Vsync => self.present_due(),
+            WatchEvent::Frame => {
+                if !self.vsync {
+                    self.schedule(event_loop);
+                }
+            }
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.schedule(event_loop);
+        if self.vsync {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        } else {
+            self.schedule(event_loop);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -338,16 +607,12 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
                 self.stop.store(true, Ordering::Release);
                 event_loop.exit();
             }
-            WindowEvent::RedrawRequested => {
+            WindowEvent::RedrawRequested if !self.vsync => {
                 if Instant::now() < self.next_present {
                     self.schedule(event_loop);
                     return;
                 }
-                match self.draw() {
-                    Ok(true) => self.next_present = Instant::now() + self.refresh,
-                    Ok(false) => {}
-                    Err(err) => eprintln!("watch draw failed: {err}"),
-                }
+                self.present_due();
                 self.schedule(event_loop);
             }
             _ => {}
@@ -356,6 +621,51 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
 }
 
 impl WatchApp {
+    fn attach_softbuffer(&mut self, window: &Arc<Window>) -> bool {
+        let context = match softbuffer::Context::new(Arc::clone(window)) {
+            Ok(context) => context,
+            Err(err) => {
+                eprintln!("failed to create the watch surface: {err}");
+                return false;
+            }
+        };
+        match softbuffer::Surface::new(&context, Arc::clone(window)) {
+            Ok(surface) => self.surface = Some(surface),
+            Err(err) => {
+                eprintln!("failed to attach the watch surface: {err}");
+                return false;
+            }
+        }
+        self.context = Some(context);
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    fn attach_metal(&mut self, window: &Window) -> Result<()> {
+        let handle = window
+            .window_handle()
+            .map_err(|err| anyhow!("failed to read the watch window: {err}"))?;
+        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+            anyhow::bail!("the watch window is not an AppKit view");
+        };
+        self.presenter = Some(crate::present_macos::Presenter::attach(appkit.ns_view.as_ptr())?);
+        eprintln!("watch present: metal");
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_display_link(&self) -> bool {
+        let leaked = Box::leak(Box::new(self.proxy.clone()));
+        match crate::present_macos::start_vsync(on_vsync, leaked as *mut EventLoopProxy<WatchEvent> as *mut std::ffi::c_void)
+        {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("watch display link unavailable: {err:#}");
+                false
+            }
+        }
+    }
+
     fn schedule(&mut self, event_loop: &ActiveEventLoop) {
         let pending = self
             .queue
@@ -377,24 +687,94 @@ impl WatchApp {
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_present));
     }
 
-    fn draw(&mut self) -> Result<bool> {
+    fn present_due(&mut self) {
+        if Instant::now() < self.next_present {
+            return;
+        }
+        let frame = {
+            let Ok(mut queue) = self.queue.lock() else {
+                return;
+            };
+            queue.pop_front()
+        };
+        let Some(frame) = frame else {
+            return;
+        };
+        match self.paint(&frame) {
+            Ok(true) => {
+                self.next_present = Instant::now() + self.frame_interval;
+                self.hold(frame);
+            }
+            Ok(false) => {
+                if let Ok(mut queue) = self.queue.lock() {
+                    queue.push_front(frame);
+                }
+            }
+            Err(err) => eprintln!("watch draw failed: {err}"),
+        }
+    }
+
+    fn hold(&mut self, frame: Picture) {
+        #[cfg(target_os = "macos")]
+        if matches!(frame, Picture::Gpu { .. }) {
+            self.inflight.push_back(frame);
+            while self.inflight.len() > 3 {
+                self.inflight.pop_front();
+            }
+            return;
+        }
+        let _ = frame;
+    }
+
+    fn paint(&mut self, picture: &Picture) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        if self.presenter.is_some() {
+            return self.paint_metal(picture);
+        }
+        self.paint_softbuffer(picture)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn paint_metal(&mut self, picture: &Picture) -> Result<bool> {
+        let Some(presenter) = self.presenter.as_ref() else {
+            return Ok(false);
+        };
+        let status = match picture {
+            Picture::Gpu { buffer, full_range } => presenter.draw_nv12(buffer.as_ptr(), *full_range),
+            Picture::Cpu(image) => presenter.draw_bgra(&image.pixels, image.width, image.height),
+        };
+        match status {
+            0 => Ok(true),
+            -2 => Ok(false),
+            -3 => {
+                let Picture::Gpu { buffer, full_range } = picture else {
+                    return Err(anyhow!("the hardware frame has no Metal texture"));
+                };
+                let image = gpu_to_cpu(buffer, *full_range)
+                    .ok_or_else(|| anyhow!("could not read the hardware frame"))?;
+                Ok(presenter.draw_bgra(&image.pixels, image.width, image.height) == 0)
+            }
+            status => Err(anyhow!("failed to present the watch frame ({status})")),
+        }
+    }
+
+    fn paint_softbuffer(&mut self, picture: &Picture) -> Result<bool> {
+        let image = match picture {
+            Picture::Cpu(image) => image,
+            #[cfg(target_os = "macos")]
+            Picture::Gpu { buffer, full_range } => {
+                let image = gpu_to_cpu(buffer, *full_range)
+                    .ok_or_else(|| anyhow!("could not read the hardware frame"))?;
+                return self.paint_softbuffer(&Picture::Cpu(image));
+            }
+        };
         let Some(window) = self.window.as_ref() else {
             return Ok(false);
         };
         let Some(surface) = self.surface.as_mut() else {
             return Ok(false);
         };
-        let image = self
-            .queue
-            .lock()
-            .map_err(|_| anyhow!("watch frame lock poisoned"))?
-            .pop_front();
-        let Some(image) = image else {
-            return Ok(false);
-        };
         if image.width != self.drawn_width || image.height != self.drawn_height {
-            let _ =
-                window.request_inner_size(winit::dpi::PhysicalSize::new(image.width, image.height));
             surface
                 .resize(
                     NonZeroU32::new(image.width).context("frame width is zero")?,
@@ -417,18 +797,58 @@ impl WatchApp {
     }
 }
 
-fn refresh_interval(window: &Window) -> Duration {
+#[cfg(target_os = "macos")]
+extern "C" fn on_vsync(context: *mut std::ffi::c_void) {
+    let proxy = unsafe { &*(context as *const EventLoopProxy<WatchEvent>) };
+    let _ = proxy.send_event(WatchEvent::Vsync);
+}
+
+#[cfg(target_os = "macos")]
+fn gpu_to_cpu(buffer: &CVPixelBuffer, full_range: bool) -> Option<Presented> {
+    let width = u32::try_from(buffer.width()).ok()?;
+    let height = u32::try_from(buffer.height()).ok()?;
+    let guard = buffer.lock_read_only().ok()?;
+    let y = plane_bytes(&guard, 0, height as usize)?;
+    let uv = plane_bytes(&guard, 1, (height as usize + 1) / 2)?;
+    let stride_y = u32::try_from(guard.bytes_per_row_of_plane(0)).ok()?;
+    let stride_uv = u32::try_from(guard.bytes_per_row_of_plane(1)).ok()?;
+    presented(
+        width,
+        height,
+        nv12_to_xrgb(
+            y,
+            uv,
+            width,
+            height,
+            stride_y,
+            stride_uv,
+            if full_range {
+                ColorRange::Full
+            } else {
+                ColorRange::Limited
+            },
+        ),
+    )
+}
+
+fn frame_interval(window: &Window) -> Duration {
     let millihertz = window
         .current_monitor()
         .and_then(|monitor| monitor.refresh_rate_millihertz())
         .filter(|rate| *rate > 0)
         .unwrap_or(60_000);
-    Duration::from_nanos(1_000_000_000_000 / u64::from(millihertz))
+    let display = Duration::from_nanos(1_000_000_000_000 / u64::from(millihertz))
+        .clamp(Duration::from_millis(8), Duration::from_millis(20));
+    if display < CONTENT_FRAME {
+        CONTENT_FRAME
+    } else {
+        display
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::i420_to_xrgb;
+    use super::{i420_to_xrgb, nv12_to_xrgb, ColorRange};
 
     #[test]
     fn limited_range_gray_maps_near_white_and_black() {
@@ -438,5 +858,20 @@ mod tests {
         let black = i420_to_xrgb(&[16, 16, 16, 16], &[128], &[128], 2, 2, 2, 1, 1);
         let dark = (black[0] >> 16) & 0xff;
         assert!(dark < 8, "{dark}");
+    }
+
+    #[test]
+    fn limited_range_nv12_gray_maps_near_white() {
+        let white = nv12_to_xrgb(
+            &[235, 235, 235, 235],
+            &[128, 128],
+            2,
+            2,
+            2,
+            2,
+            ColorRange::Limited,
+        );
+        let red = (white[0] >> 16) & 0xff;
+        assert!(red > 240, "{red}");
     }
 }

@@ -22,6 +22,16 @@ fn main() {
     if target_os != "macos" {
         return;
     }
+    cc::Build::new()
+        .file("native/present/present_macos.m")
+        .flag("-fobjc-arc")
+        .compile("present_macos");
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=QuartzCore");
+    println!("cargo:rustc-link-lib=framework=CoreVideo");
+    println!("cargo:rustc-link-lib=framework=AppKit");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rerun-if-changed=native/present/present_macos.m");
     // LiveKit's WebRTC static library registers NSString categories. Without
     // this flag the linker drops them and room connect aborts on macOS.
     println!("cargo:rustc-link-arg=-ObjC");

@@ -2,6 +2,8 @@ mod api;
 mod config;
 mod encoder;
 mod h264;
+#[cfg(target_os = "macos")]
+mod present_macos;
 mod publish;
 mod watch;
 
