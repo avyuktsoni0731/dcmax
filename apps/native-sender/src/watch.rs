@@ -64,6 +64,10 @@ struct MirrorClock {
     origin_local: Instant,
     delay: Duration,
     started: bool,
+    /// How far frames sit behind the first frame's mapping. A constant offset
+    /// here is pipeline delay, not jitter, so it must not stay in the hold.
+    recent_late: Duration,
+    steady: u32,
 }
 
 impl MirrorClock {
@@ -73,6 +77,8 @@ impl MirrorClock {
             origin_local: Instant::now(),
             delay: MIRROR_DELAY,
             started: false,
+            recent_late: Duration::ZERO,
+            steady: 0,
         }
     }
 
@@ -88,15 +94,47 @@ impl MirrorClock {
         let late = arrived.saturating_duration_since(scheduled);
         let early = scheduled.saturating_duration_since(arrived);
         if late > MIRROR_LIMIT + MIRROR_DELAY || early > MIRROR_LIMIT {
-            self.origin_sender = sender_us;
-            self.origin_local = arrived;
-            self.delay = MIRROR_DELAY;
+            self.reanchor(sender_us, arrived);
             return arrived + self.delay;
         }
-        if late + Duration::from_millis(8) > self.delay {
-            self.delay = (late + Duration::from_millis(8)).min(MIRROR_LIMIT);
+        let drift = if late > self.recent_late {
+            late - self.recent_late
+        } else {
+            self.recent_late - late
+        };
+        self.steady = if drift < Duration::from_millis(12) {
+            self.steady.saturating_add(1)
+        } else {
+            0
+        };
+        self.recent_late = self.recent_late / 2 + late / 2;
+        if self.steady >= 20 && self.recent_late > Duration::from_millis(24) {
+            self.origin_local += self.recent_late;
+            self.recent_late = Duration::ZERO;
+            self.delay = MIRROR_DELAY;
+            self.steady = 0;
+            return arrived + self.delay;
+        }
+        let cushion = late.saturating_sub(self.recent_late) + Duration::from_millis(16);
+        if cushion > self.delay {
+            self.delay = cushion.min(MIRROR_LIMIT);
+        } else if self.delay > MIRROR_DELAY {
+            let step = Duration::from_millis(2);
+            self.delay = if self.delay - MIRROR_DELAY > step {
+                self.delay - step
+            } else {
+                MIRROR_DELAY
+            };
         }
         scheduled + self.delay
+    }
+
+    fn reanchor(&mut self, sender_us: i64, arrived: Instant) {
+        self.origin_sender = sender_us;
+        self.origin_local = arrived;
+        self.delay = MIRROR_DELAY;
+        self.recent_late = Duration::ZERO;
+        self.steady = 0;
     }
 }
 
@@ -271,12 +309,76 @@ fn picture_watch_macos(
     cursor: Arc<CursorState>,
 ) -> Result<()> {
     use std::io::ErrorKind;
+    use std::net::TcpStream;
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
     use std::thread;
     use std::time::Duration as Wait;
 
     use crate::decode_macos::Decoder;
-    use crate::picture::{accept_picture, listen, request_keyframe, FrameReader};
+    use crate::picture::{accept_picture, listen, request_keyframe, FrameReader, PictureFrame};
+
+    enum Piped {
+        Connected(TcpStream),
+        Frame(PictureFrame, Instant),
+    }
+
     let listener = listen(addr)?;
+    let (tx, rx) = sync_channel(8);
+    let stop_read = Arc::clone(&stop);
+    let reader = thread::Builder::new()
+        .name("picture-tcp-read".to_string())
+        .spawn(move || {
+            while !stop_read.load(Ordering::Acquire) {
+                let stream = match accept_picture(&listener) {
+                    Ok(Some(stream)) => stream,
+                    Ok(None) => {
+                        thread::sleep(Wait::from_millis(20));
+                        continue;
+                    }
+                    Err(err) => {
+                        eprintln!("picture tcp: {err}");
+                        break;
+                    }
+                };
+                let ask = match stream.try_clone() {
+                    Ok(ask) => ask,
+                    Err(err) => {
+                        eprintln!("picture tcp: {err}");
+                        continue;
+                    }
+                };
+                if tx.send(Piped::Connected(ask)).is_err() {
+                    break;
+                }
+                let mut reader = FrameReader::new(stream);
+                loop {
+                    if stop_read.load(Ordering::Acquire) {
+                        return;
+                    }
+                    match reader.read_frame() {
+                        Ok(Some(frame)) => {
+                            let arrived = Instant::now();
+                            if tx.send(Piped::Frame(frame, arrived)).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err)
+                            if err.kind() == ErrorKind::TimedOut
+                                || err.kind() == ErrorKind::WouldBlock =>
+                        {
+                            continue;
+                        }
+                        Err(err) => {
+                            eprintln!("picture tcp: {err}");
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .context("failed to read the picture stream")?;
+
     let started = Instant::now();
     let mut received: u64 = 0;
     let mut gaps: u64 = 0;
@@ -285,92 +387,83 @@ fn picture_watch_macos(
     let mut window_gaps: u64 = 0;
     let mut last_arrival = Instant::now();
     let mut last_log = Instant::now();
+    let mut ask: Option<TcpStream> = None;
+    let mut decoder = Decoder::new();
+    let mut next_frame: Option<u32> = None;
+    let mut clock = MirrorClock::new();
     loop {
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let stream = match accept_picture(&listener) {
-            Ok(Some(stream)) => stream,
-            Ok(None) => {
-                thread::sleep(Wait::from_millis(20));
-                continue;
-            }
-            Err(err) => return Err(err.into()),
+        if last_log.elapsed() >= Duration::from_secs(1) {
+            let held = queue.lock().map(|slot| slot.len()).unwrap_or(0);
+            println!(
+                "watch: fps={window_received:.0} gaps_this_second={window_gaps} held={held} frames={received} gaps={gaps} skipped={skipped} uptime={:.0}s",
+                started.elapsed().as_secs_f64()
+            );
+            window_received = 0;
+            window_gaps = 0;
+            last_log = Instant::now();
+        }
+        let message = match rx.recv_timeout(Wait::from_millis(200)) {
+            Ok(message) => message,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
         };
-        let mut ask = stream.try_clone().ok();
-        let mut reader = FrameReader::new(stream);
-        let mut decoder = Decoder::new();
-        let mut next_frame: Option<u32> = None;
-        let mut clock = MirrorClock::new();
-        loop {
-            if stop.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            if last_log.elapsed() >= Duration::from_secs(1) {
-                let held = queue.lock().map(|slot| slot.len()).unwrap_or(0);
-                println!(
-                    "watch: fps={window_received:.0} gaps_this_second={window_gaps} held={held} frames={received} gaps={gaps} skipped={skipped} uptime={:.0}s",
-                    started.elapsed().as_secs_f64()
-                );
-                window_received = 0;
-                window_gaps = 0;
-                last_log = Instant::now();
-            }
-            let frame = match reader.read_frame() {
-                Ok(Some(frame)) => frame,
-                Ok(None) => break,
-                Err(err) if err.kind() == ErrorKind::TimedOut || err.kind() == ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(err) => {
-                    eprintln!("picture tcp: {err}");
-                    break;
-                }
-            };
-            let follows = match next_frame {
-                Some(expected) => frame.frame_id == expected,
-                None => frame.keyframe,
-            };
-            if !frame.keyframe && !follows {
-                skipped += 1;
-                if let Some(socket) = ask.as_mut() {
-                    request_keyframe(socket);
-                }
-                continue;
-            }
-            cursor.set(frame.cursor);
-            let Some(decoded) = decoder.decode(&frame.payload) else {
+        let (frame, arrival) = match message {
+            Piped::Connected(socket) => {
+                ask = Some(socket);
+                decoder = Decoder::new();
                 next_frame = None;
-                skipped += 1;
-                if let Some(socket) = ask.as_mut() {
-                    request_keyframe(socket);
-                }
+                clock = MirrorClock::new();
                 continue;
-            };
-            next_frame = Some(frame.frame_id.wrapping_add(1));
-            let arrival = Instant::now();
-            if received > 0 && arrival.duration_since(last_arrival) > FRAME_GAP {
-                gaps += 1;
-                window_gaps += 1;
             }
-            last_arrival = arrival;
-            received += 1;
-            window_received += 1;
-            note_once(&format!(
-                "watch picture: tcp nv12 {}x{}",
-                decoded.buffer.width(),
-                decoded.buffer.height()
-            ));
-            let picture = Picture::Gpu {
-                buffer: decoded.buffer,
-                full_range: decoded.full_range,
-            };
-            let due = clock.due(frame.timestamp_us, arrival);
-            if push_picture(&queue, picture, due) {
-                let _ = proxy.send_event(WatchEvent::Frame);
+            Piped::Frame(frame, arrival) => (frame, arrival),
+        };
+        let follows = match next_frame {
+            Some(expected) => frame.frame_id == expected,
+            None => frame.keyframe,
+        };
+        if !frame.keyframe && !follows {
+            skipped += 1;
+            if let Some(socket) = ask.as_mut() {
+                request_keyframe(socket);
             }
+            continue;
+        }
+        cursor.set(frame.cursor);
+        let Some(decoded) = decoder.decode(&frame.payload) else {
+            next_frame = None;
+            skipped += 1;
+            if let Some(socket) = ask.as_mut() {
+                request_keyframe(socket);
+            }
+            continue;
+        };
+        next_frame = Some(frame.frame_id.wrapping_add(1));
+        if received > 0 && arrival.duration_since(last_arrival) > FRAME_GAP {
+            gaps += 1;
+            window_gaps += 1;
+        }
+        last_arrival = arrival;
+        received += 1;
+        window_received += 1;
+        note_once(&format!(
+            "watch picture: tcp nv12 {}x{}",
+            decoded.buffer.width(),
+            decoded.buffer.height()
+        ));
+        let picture = Picture::Gpu {
+            buffer: decoded.buffer,
+            full_range: decoded.full_range,
+        };
+        let due = clock.due(frame.timestamp_us, arrival);
+        if push_picture(&queue, picture, due) {
+            let _ = proxy.send_event(WatchEvent::Frame);
         }
     }
+    drop(rx);
+    let _ = reader.join();
     Ok(())
 }
 
@@ -940,7 +1033,7 @@ impl WatchApp {
             return;
         };
         if Instant::now() >= due {
-            event_loop.set_control_flow(ControlFlow::Poll);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(2)));
             return;
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(due));
@@ -1169,7 +1262,36 @@ fn frame_interval(window: &Window) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{i420_to_xrgb, nv12_to_xrgb, ColorRange};
+    use super::{i420_to_xrgb, nv12_to_xrgb, ColorRange, MirrorClock};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn playback_hold_shrinks_once_frames_are_on_time() {
+        let mut clock = MirrorClock::new();
+        let start = Instant::now();
+        let origin = 1_000_000_i64;
+        clock.due(origin, start);
+        let late_arrival = start + Duration::from_millis(96);
+        clock.due(origin + 16_000, late_arrival);
+        assert!(
+            clock.delay > Duration::from_millis(40),
+            "a late frame opens the hold, got {:?}",
+            clock.delay
+        );
+        let mut sender = origin + 32_000;
+        let mut arrived = late_arrival;
+        for _ in 0..40 {
+            arrived += Duration::from_millis(16);
+            clock.due(sender, arrived);
+            sender += 16_000;
+        }
+        assert!(
+            clock.delay <= Duration::from_millis(40),
+            "on-time frames bring the hold back down, got {:?}",
+            clock.delay
+        );
+    }
+
 
     #[test]
     fn limited_range_gray_maps_near_white_and_black() {
