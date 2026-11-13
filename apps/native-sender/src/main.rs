@@ -45,7 +45,10 @@ async fn main() -> Result<()> {
     )
     .await?;
     println!("token fetch: ok ({})", token.url);
-    post_state(&client, &config, "starting", "screen", "pending", "pending", None).await;
+    post_state(
+        &client, &config, "starting", "screen", "pending", "pending", None,
+    )
+    .await;
 
     if config.dry_run {
         println!("dry-run: token ok, skipping capture and publish");

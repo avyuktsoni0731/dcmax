@@ -5,6 +5,10 @@ pub struct AccessUnit {
     pub payload: Vec<u8>,
     pub keyframe: bool,
     pub read_at: Instant,
+    /// Capture time in microseconds, relative to the first frame.
+    /// Empty when the producer has no capture clock and the publisher should
+    /// stamp frames from their index.
+    pub timestamp_us: Option<i64>,
 }
 
 /// Splits an Annex-B byte stream into access units.
@@ -12,6 +16,7 @@ pub struct AccessUnit {
 /// A unit is one displayed frame. Parameter sets in front of an IDR stay with
 /// that keyframe. If a later keyframe omits SPS/PPS, the last seen sets are
 /// prepended so a subscriber can start on it.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 pub struct AnnexBSplitter {
     buf: Vec<u8>,
     au: Vec<u8>,
@@ -38,6 +43,7 @@ impl Default for AnnexBSplitter {
     }
 }
 
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 impl AnnexBSplitter {
     pub fn push(&mut self, data: &[u8]) -> Vec<AccessUnit> {
         self.buf.extend_from_slice(data);
@@ -132,6 +138,7 @@ impl AnnexBSplitter {
             payload,
             keyframe: self.au_is_key,
             read_at: Instant::now(),
+            timestamp_us: None,
         };
         self.reset_au();
         Some(unit)
@@ -146,11 +153,13 @@ impl AnnexBSplitter {
     }
 }
 
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 fn nal_type(nal: &[u8]) -> Option<u8> {
     let offset = start_code_len(nal)?;
     nal.get(offset).map(|byte| byte & 0x1f)
 }
 
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 fn start_code_len(data: &[u8]) -> Option<usize> {
     if data.len() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1 {
         Some(4)
@@ -161,6 +170,74 @@ fn start_code_len(data: &[u8]) -> Option<usize> {
     }
 }
 
+/// Converts length-prefixed NALs into one Annex-B access unit.
+///
+/// `parameter_sets` are the SPS and PPS from the format description. They are
+/// written in front of a keyframe and any SPS/PPS already inside the payload
+/// are skipped so the unit does not carry them twice.
+pub fn length_prefixed_to_annexb(
+    data: &[u8],
+    nal_length_size: usize,
+    parameter_sets: &[impl AsRef<[u8]>],
+    keyframe: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 64);
+    if keyframe {
+        for set in parameter_sets {
+            let set = set.as_ref();
+            if set.is_empty() {
+                continue;
+            }
+            out.extend_from_slice(&[0, 0, 0, 1]);
+            out.extend_from_slice(set);
+        }
+    }
+    if !(1..=4).contains(&nal_length_size) {
+        return out;
+    }
+    let mut offset = 0;
+    while offset + nal_length_size <= data.len() {
+        let mut raw = [0u8; 4];
+        raw[4 - nal_length_size..].copy_from_slice(&data[offset..offset + nal_length_size]);
+        let nal_len = u32::from_be_bytes(raw) as usize;
+        offset += nal_length_size;
+        if nal_len == 0 || offset + nal_len > data.len() {
+            break;
+        }
+        let nal = &data[offset..offset + nal_len];
+        offset += nal_len;
+        let kind = nal.first().copied().unwrap_or(0) & 0x1f;
+        if keyframe && (kind == 7 || kind == 8) {
+            continue;
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(nal);
+    }
+    out
+}
+
+pub fn length_prefixed_contains_idr(data: &[u8], nal_length_size: usize) -> bool {
+    if !(1..=4).contains(&nal_length_size) {
+        return false;
+    }
+    let mut offset = 0;
+    while offset + nal_length_size <= data.len() {
+        let mut raw = [0u8; 4];
+        raw[4 - nal_length_size..].copy_from_slice(&data[offset..offset + nal_length_size]);
+        let nal_len = u32::from_be_bytes(raw) as usize;
+        offset += nal_length_size;
+        if nal_len == 0 || offset + nal_len > data.len() {
+            break;
+        }
+        if data[offset] & 0x1f == 5 {
+            return true;
+        }
+        offset += nal_len;
+    }
+    false
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 fn find_start(buf: &[u8], from: usize) -> Option<(usize, usize)> {
     let mut index = from;
     while index + 3 <= buf.len() {
@@ -234,5 +311,22 @@ mod tests {
         assert!(bare.keyframe);
         assert!(bare.payload.windows(b"sps".len()).any(|win| win == b"sps"));
         assert!(bare.payload.windows(b"pps".len()).any(|win| win == b"pps"));
+    }
+
+    #[test]
+    fn converts_length_prefixed_idr_and_prepends_parameter_sets_once() {
+        let sps = [0x67, b's', b'p', b's'];
+        let pps = [0x68, b'p', b'p', b's'];
+        let mut payload = Vec::new();
+        for nal in [sps.as_slice(), pps.as_slice(), &[0x65, b'i', b'd', b'r']] {
+            payload.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            payload.extend_from_slice(nal);
+        }
+        let annexb =
+            length_prefixed_to_annexb(&payload, 4, &[sps.as_slice(), pps.as_slice()], true);
+        let starts = annexb.windows(4).filter(|win| *win == [0, 0, 0, 1]).count();
+        assert_eq!(starts, 3);
+        assert!(length_prefixed_contains_idr(&payload, 4));
+        assert!(!length_prefixed_contains_idr(&payload[..8], 4));
     }
 }
