@@ -1,4 +1,5 @@
 mod api;
+mod audio;
 mod config;
 #[cfg(target_os = "macos")]
 mod decode_macos;
@@ -8,9 +9,10 @@ mod picture;
 #[cfg(target_os = "macos")]
 mod present_macos;
 mod publish;
+mod relay;
 mod watch;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use config::{AppConfig, CliArgs, TargetPlatform};
 use reqwest::Client;
@@ -18,6 +20,13 @@ use reqwest::Client;
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let args = CliArgs::parse();
+    if args.relay {
+        let addr = args
+            .relay_listen
+            .parse()
+            .context("--relay-listen must be host:port, for example 0.0.0.0:46000")?;
+        return relay::run(addr);
+    }
     let config = AppConfig::from_env(&args)?;
     if config.watch {
         return watch::run(&config);
@@ -28,7 +37,7 @@ fn main() -> Result<()> {
     runtime.block_on(run_sender(config))
 }
 
-async fn run_sender(config: AppConfig) -> Result<()> {
+async fn run_sender(mut config: AppConfig) -> Result<()> {
     ensure_host_platform(&config)?;
 
     let client = Client::new();
@@ -57,8 +66,19 @@ async fn run_sender(config: AppConfig) -> Result<()> {
         &config.room_name,
         &config.identity,
         &config.client_type,
+        config.invite.as_deref(),
     )
     .await?;
+    if config.picture_to.is_none() && config.picture_relay.is_none() && config.invite.is_some() {
+        if let Some(relay) = token.relay.as_deref() {
+            config.picture_relay = Some(
+                relay
+                    .parse()
+                    .context("API relay address must be host:port")?,
+            );
+            println!("picture relay: {}", relay);
+        }
+    }
     println!("token fetch: ok ({})", token.url);
     post_state(
         &client, &config, "starting", "screen", "pending", "pending", None,

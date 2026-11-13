@@ -16,10 +16,15 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const MAGIC: u32 = 0x4443_4D58;
+const HELLO_MAGIC: u32 = 0x4443_4D52;
 const VERSION: u8 = 2;
+const HELLO_VERSION: u8 = 1;
 const HEADER: usize = 28;
 const FLAG_KEY: u8 = 0x01;
+const FLAG_AUDIO: u8 = 0x02;
 const MAX_PAYLOAD: usize = 8 * 1024 * 1024;
+pub const ROLE_PUBLISH: u8 = 1;
+pub const ROLE_WATCH: u8 = 2;
 
 #[allow(dead_code)]
 pub struct PictureFrame {
@@ -28,13 +33,31 @@ pub struct PictureFrame {
     pub timestamp_us: i64,
     pub cursor: CursorSample,
     pub frame_id: u32,
+    pub audio: bool,
 }
 
-struct Outgoing {
-    payload: Vec<u8>,
-    keyframe: bool,
-    timestamp_us: i64,
-    cursor: CursorSample,
+enum Outgoing {
+    Video {
+        payload: Vec<u8>,
+        keyframe: bool,
+        timestamp_us: i64,
+        cursor: CursorSample,
+    },
+    Audio {
+        payload: Vec<u8>,
+        timestamp_us: i64,
+    },
+}
+
+pub struct Hello {
+    pub role: u8,
+    pub room: String,
+    pub invite: String,
+}
+
+struct Dial {
+    addr: SocketAddr,
+    relay: Option<(String, String)>,
 }
 
 struct Shared {
@@ -54,6 +77,19 @@ pub struct PictureSender {
 
 impl PictureSender {
     pub fn connect(addr: SocketAddr) -> Result<Self> {
+        Self::spawn(Dial { addr, relay: None })
+    }
+
+    /// Dial the relay. The bytes after the hello are the same picture stream
+    /// a direct watcher reads.
+    pub fn connect_relay(addr: SocketAddr, room: &str, invite: &str) -> Result<Self> {
+        Self::spawn(Dial {
+            addr,
+            relay: Some((room.to_string(), invite.to_string())),
+        })
+    }
+
+    fn spawn(dial: Dial) -> Result<Self> {
         let (tx, rx) = sync_channel(8);
         let shared = Arc::new(Shared {
             sent: AtomicU64::new(0),
@@ -64,7 +100,7 @@ impl PictureSender {
         let counters = Arc::clone(&shared);
         let join = thread::Builder::new()
             .name("picture-tcp".to_string())
-            .spawn(move || send_loop(addr, rx, counters))
+            .spawn(move || send_loop(dial, rx, counters))
             .context("failed to start the picture sender")?;
         Ok(Self {
             tx,
@@ -80,7 +116,7 @@ impl PictureSender {
         timestamp_us: i64,
         cursor: Option<CursorSample>,
     ) {
-        let frame = Outgoing {
+        let frame = Outgoing::Video {
             payload: payload.to_vec(),
             keyframe,
             timestamp_us,
@@ -96,6 +132,14 @@ impl PictureSender {
             self.shared.need_key.store(true, Ordering::Release);
             self.shared.want_idr.store(true, Ordering::Release);
         }
+    }
+
+    pub fn offer_audio(&self, payload: &[u8], timestamp_us: i64) {
+        let frame = Outgoing::Audio {
+            payload: payload.to_vec(),
+            timestamp_us,
+        };
+        let _ = self.tx.try_send(frame);
     }
 
     pub fn sent(&self) -> u64 {
@@ -121,9 +165,10 @@ impl Drop for PictureSender {
     }
 }
 
-fn send_loop(addr: SocketAddr, rx: Receiver<Outgoing>, shared: Arc<Shared>) {
-    let mut stream = Some(connect_picture(addr, Arc::clone(&shared)));
+fn send_loop(dial: Dial, rx: Receiver<Outgoing>, shared: Arc<Shared>) {
+    let mut stream = Some(connect_picture(&dial, Arc::clone(&shared)));
     let mut frame_id = 0u32;
+    let mut audio_id = 0u32;
     let mut announced = false;
     let mut retry = None::<Outgoing>;
     loop {
@@ -135,49 +180,69 @@ fn send_loop(addr: SocketAddr, rx: Receiver<Outgoing>, shared: Arc<Shared>) {
                 Err(_) => return,
             }
         };
-        if shared.need_key.load(Ordering::Acquire) && !frame.keyframe {
+        let video_key = matches!(frame, Outgoing::Video { keyframe: true, .. });
+        let waiting_for_key = shared.need_key.load(Ordering::Acquire)
+            && matches!(frame, Outgoing::Video { keyframe: false, .. });
+        if waiting_for_key {
             continue;
         }
         if stream.is_none() {
-            stream = Some(connect_picture(addr, Arc::clone(&shared)));
+            stream = Some(connect_picture(&dial, Arc::clone(&shared)));
             frame_id = 0;
+            audio_id = 0;
             announced = false;
         }
         let socket = stream.as_mut().unwrap();
-        if write_frame(socket, frame_id, &frame).is_err() {
+        let id = if matches!(frame, Outgoing::Audio { .. }) {
+            audio_id
+        } else {
+            frame_id
+        };
+        if write_frame(socket, id, &frame).is_err() {
             shared.need_key.store(true, Ordering::Release);
             shared.want_idr.store(true, Ordering::Release);
             let _ = socket.shutdown(Shutdown::Both);
             stream = None;
-            if frame.keyframe {
+            if video_key {
                 retry = Some(frame);
             }
             thread::sleep(Duration::from_millis(200));
             continue;
         }
-        if frame.keyframe {
-            shared.need_key.store(false, Ordering::Release);
+        match &frame {
+            Outgoing::Video { keyframe, payload, .. } => {
+                if *keyframe {
+                    shared.need_key.store(false, Ordering::Release);
+                }
+                shared.sent.fetch_add(1, Ordering::Relaxed);
+                if !announced {
+                    announced = true;
+                    println!("picture tcp: first frame {} bytes", payload.len());
+                }
+                frame_id = frame_id.wrapping_add(1);
+            }
+            Outgoing::Audio { .. } => {
+                audio_id = audio_id.wrapping_add(1);
+            }
         }
-        shared.sent.fetch_add(1, Ordering::Relaxed);
-        if !announced {
-            announced = true;
-            println!(
-                "picture tcp: first frame {} bytes",
-                frame.payload.len()
-            );
-        }
-        frame_id = frame_id.wrapping_add(1);
     }
 }
 
-fn connect_picture(addr: SocketAddr, shared: Arc<Shared>) -> TcpStream {
+fn connect_picture(dial: &Dial, shared: Arc<Shared>) -> TcpStream {
     loop {
-        match TcpStream::connect(addr) {
+        match TcpStream::connect(dial.addr) {
             Ok(stream) => {
                 if let Err(err) = prepare(&stream) {
                     eprintln!("picture tcp: {err}");
                     thread::sleep(Duration::from_millis(300));
                     continue;
+                }
+                if let Some((room, invite)) = &dial.relay {
+                    if let Err(err) = write_hello(&stream, ROLE_PUBLISH, room, invite) {
+                        eprintln!("picture tcp: {err}");
+                        thread::sleep(Duration::from_millis(300));
+                        continue;
+                    }
                 }
                 let mut reader = match stream.try_clone() {
                     Ok(reader) => reader,
@@ -189,7 +254,7 @@ fn connect_picture(addr: SocketAddr, shared: Arc<Shared>) -> TcpStream {
                 };
                 // The cloned half only reads. A byte from the watcher means the
                 // picture it has can no longer continue, so the next frame is a keyframe.
-                let want = shared;
+                let want = Arc::clone(&shared);
                 thread::Builder::new()
                     .name("picture-tcp-read".to_string())
                     .spawn(move || {
@@ -209,11 +274,14 @@ fn connect_picture(addr: SocketAddr, shared: Arc<Shared>) -> TcpStream {
                         }
                     })
                     .ok();
-                println!("picture tcp: connected to {addr}");
+                println!("picture tcp: connected to {}", dial.addr);
                 return stream;
             }
             Err(err) => {
-                eprintln!("picture tcp: waiting for the watcher at {addr} ({err})");
+                eprintln!(
+                    "picture tcp: waiting for the watcher at {} ({err})",
+                    dial.addr
+                );
                 thread::sleep(Duration::from_millis(300));
             }
         }
@@ -229,20 +297,101 @@ fn prepare(stream: &TcpStream) -> std::io::Result<()> {
 }
 
 fn write_frame(stream: &mut TcpStream, frame_id: u32, frame: &Outgoing) -> std::io::Result<()> {
-    let mut bytes = Vec::with_capacity(HEADER + frame.payload.len());
+    let (payload, flags, visible, x, y, timestamp_us) = match frame {
+        Outgoing::Video {
+            payload,
+            keyframe,
+            timestamp_us,
+            cursor,
+        } => (
+            payload.as_slice(),
+            if *keyframe { FLAG_KEY } else { 0 },
+            u8::from(cursor.visible),
+            cursor.x,
+            cursor.y,
+            *timestamp_us,
+        ),
+        Outgoing::Audio {
+            payload,
+            timestamp_us,
+        } => (payload.as_slice(), FLAG_AUDIO, 0, 0, 0, *timestamp_us),
+    };
+    let mut bytes = Vec::with_capacity(HEADER + payload.len());
     bytes.extend_from_slice(&MAGIC.to_le_bytes());
     bytes.push(VERSION);
-    bytes.push(if frame.keyframe { FLAG_KEY } else { 0 });
-    bytes.push(u8::from(frame.cursor.visible));
+    bytes.push(flags);
+    bytes.push(visible);
     bytes.push(0);
-    bytes.extend_from_slice(&frame.cursor.x.to_le_bytes());
-    bytes.extend_from_slice(&frame.cursor.y.to_le_bytes());
-    bytes.extend_from_slice(&(frame.payload.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&x.to_le_bytes());
+    bytes.extend_from_slice(&y.to_le_bytes());
+    bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&frame_id.to_le_bytes());
-    bytes.extend_from_slice(&frame.timestamp_us.to_le_bytes());
-    bytes.extend_from_slice(&frame.payload);
+    bytes.extend_from_slice(&timestamp_us.to_le_bytes());
+    bytes.extend_from_slice(payload);
     stream.write_all(&bytes)?;
     Ok(())
+}
+
+pub fn write_hello(mut stream: &TcpStream, role: u8, room: &str, invite: &str) -> std::io::Result<()> {
+    let room_bytes = room.as_bytes();
+    let invite_bytes = invite.as_bytes();
+    if room_bytes.len() > 64 || invite_bytes.len() > 64 || room_bytes.is_empty() || invite_bytes.is_empty()
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "room and invite must be 1 to 64 bytes",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(9 + room_bytes.len() + invite_bytes.len());
+    bytes.extend_from_slice(&HELLO_MAGIC.to_le_bytes());
+    bytes.push(HELLO_VERSION);
+    bytes.push(role);
+    bytes.push(room_bytes.len() as u8);
+    bytes.extend_from_slice(&(invite_bytes.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(room_bytes);
+    bytes.extend_from_slice(invite_bytes);
+    stream.write_all(&bytes)
+}
+
+pub fn read_hello(mut stream: &TcpStream) -> std::io::Result<Hello> {
+    let mut prefix = [0u8; 9];
+    stream.read_exact(&mut prefix)?;
+    if prefix[0..4] != HELLO_MAGIC.to_le_bytes() || prefix[4] != HELLO_VERSION {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "picture relay hello was not a join",
+        ));
+    }
+    let room_len = prefix[6] as usize;
+    let invite_len = u16::from_le_bytes(prefix[7..9].try_into().unwrap()) as usize;
+    if room_len == 0 || room_len > 64 || invite_len == 0 || invite_len > 64 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "picture relay hello was the wrong size",
+        ));
+    }
+    let mut body = vec![0u8; room_len + invite_len];
+    stream.read_exact(&mut body)?;
+    let room = std::str::from_utf8(&body[..room_len])
+        .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err))?
+        .to_string();
+    let invite = std::str::from_utf8(&body[room_len..])
+        .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err))?
+        .to_string();
+    Ok(Hello {
+        role: prefix[5],
+        room,
+        invite,
+    })
+}
+
+pub fn connect_watch(addr: SocketAddr, room: &str, invite: &str) -> std::io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(addr)?;
+    prepare(&stream)?;
+    write_hello(&stream, ROLE_WATCH, room, invite)?;
+    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+    stream.write_all(&[1])?;
+    Ok(stream)
 }
 
 /// Reads length-prefixed frames without dropping bytes when a read times out.
@@ -294,6 +443,7 @@ impl FrameReader {
                     y: u16::from_le_bytes(header[10..12].try_into().unwrap()),
                 },
                 frame_id: u32::from_le_bytes(header[16..20].try_into().unwrap()),
+                audio: header[5] & FLAG_AUDIO != 0,
             }));
         }
     }
@@ -410,6 +560,7 @@ mod tests {
         assert_eq!(first.timestamp_us, 1000);
         assert_eq!(first.cursor, cursor);
         assert_eq!(first.frame_id, 0);
+        assert!(!first.audio);
         assert_eq!(second.payload, vec![9, 9, 9]);
         assert!(!second.keyframe);
         assert_eq!(second.timestamp_us, 2000);

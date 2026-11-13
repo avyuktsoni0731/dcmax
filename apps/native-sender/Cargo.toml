@@ -11,7 +11,9 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 livekit = { version = "0.10", features = ["rustls-tls-native-roots"] }
 softbuffer = "0.4"
 winit = "0.30"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+cpal = "0.15"
+opusic-sys = { version = "0.7", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.5"
@@ -26,6 +28,8 @@ windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }

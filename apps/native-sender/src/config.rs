@@ -42,6 +42,18 @@ pub struct CliArgs {
     /// Show the picture from this UDP address instead of the LiveKit video.
     #[arg(long, value_name = "HOST:PORT")]
     pub picture_listen: Option<String>,
+    /// Run the picture relay. Friends dial this address; nothing listens on their machines.
+    #[arg(long, default_value_t = false)]
+    pub relay: bool,
+    /// Address the relay binds. Used with --relay.
+    #[arg(long, default_value = "0.0.0.0:46000")]
+    pub relay_listen: String,
+    /// Send or watch the picture through the relay at this host:port.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub picture_relay: Option<String>,
+    /// Invite code from POST /invites. Required once the API has INVITE_REQUIRED=true.
+    #[arg(long)]
+    pub invite: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +107,8 @@ pub struct AppConfig {
     pub watch: bool,
     pub picture_to: Option<SocketAddr>,
     pub picture_listen: Option<SocketAddr>,
+    pub picture_relay: Option<SocketAddr>,
+    pub invite: Option<String>,
 }
 
 impl AppConfig {
@@ -164,6 +178,18 @@ impl AppConfig {
             "ffmpeg-ddagrab" => CaptureBackend::FfmpegDdagrab,
             other => bail!("invalid --capture value '{other}'; expected auto|scrap|ffmpeg-ddagrab"),
         };
+        if args.picture_to.is_some() && args.picture_relay.is_some() {
+            bail!("use either --picture-to or --picture-relay");
+        }
+        if args.picture_relay.is_some()
+            && args
+                .invite
+                .as_ref()
+                .map(|invite| invite.trim().is_empty())
+                .unwrap_or(true)
+        {
+            bail!("--picture-relay needs --invite");
+        }
 
         Ok(Self {
             api_base_url,
@@ -183,6 +209,8 @@ impl AppConfig {
             watch: args.watch,
             picture_to: parse_addr(args.picture_to.as_deref(), "--picture-to")?,
             picture_listen: parse_addr(args.picture_listen.as_deref(), "--picture-listen")?,
+            picture_relay: parse_addr(args.picture_relay.as_deref(), "--picture-relay")?,
+            invite: args.invite.clone().filter(|invite| !invite.trim().is_empty()),
         })
     }
 

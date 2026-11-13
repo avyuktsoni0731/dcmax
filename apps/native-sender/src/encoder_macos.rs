@@ -1,4 +1,5 @@
 use super::vt::{Flight, VtSession};
+use crate::audio::{EncodedAudio, SystemAudio};
 use crate::config::AppConfig;
 use crate::h264::{unix_us_now, AccessUnit, MAX_FRAME_AGE};
 use anyhow::{anyhow, Context, Result};
@@ -107,6 +108,7 @@ pub struct ScreenEncoder {
     queue_drops: Arc<AtomicU64>,
     stale_skips: Arc<AtomicU64>,
     pub units: mpsc::Receiver<AccessUnit>,
+    pub audio: mpsc::Receiver<EncodedAudio>,
     pub capture_backend: String,
     pub encoder_backend: String,
     pub width: u32,
@@ -151,7 +153,7 @@ impl ScreenEncoder {
             Arc::clone(&stale_skips),
             frame_interval(config.target_fps),
         );
-        let stream = match open_stream(
+        let (stream, audio) = match open_stream(
             config,
             width,
             height,
@@ -183,6 +185,7 @@ impl ScreenEncoder {
             queue_drops,
             stale_skips,
             units: rx,
+            audio,
             capture_backend: "screencapturekit".to_string(),
             encoder_backend: "videotoolbox".to_string(),
             width,
@@ -396,7 +399,7 @@ fn open_stream(
     display_height: u32,
     pending: Arc<Pending>,
     fatal: Arc<Mutex<Option<String>>>,
-) -> Result<SCStream> {
+) -> Result<(SCStream, mpsc::Receiver<EncodedAudio>)> {
     let content = SCShareableContent::get().map_err(|err| {
         anyhow!(
             "screen capture failed ({err}). Grant Screen Recording permission to the terminal running native-sender, then start it again."
@@ -432,7 +435,10 @@ fn open_stream(
         .with_shows_cursor(true)
         .with_scales_to_fit(true)
         .with_minimum_frame_interval(&interval)
-        .with_queue_depth(3);
+        .with_queue_depth(3)
+        .with_captures_audio(true)
+        .with_sample_rate(48_000)
+        .with_channel_count(2);
     if let Err(err) = stream_config.set_preserves_aspect_ratio(true) {
         eprintln!("keeping the display's aspect ratio is unavailable: {err}");
     }
@@ -449,10 +455,102 @@ fn open_stream(
     stream
         .add_output_handler(handler, SCStreamOutputType::Screen)
         .map_err(|err| anyhow!("failed to attach the screen handler: {err}"))?;
+    let (audio_tx, audio_rx) = mpsc::channel(32);
+    match SystemAudio::new() {
+        Ok(codec) => {
+            let audio = AudioHandler {
+                codec: Mutex::new(codec),
+                tx: audio_tx,
+            };
+            if let Err(err) = stream.add_output_handler(audio, SCStreamOutputType::Audio) {
+                eprintln!("system audio: {err}");
+            } else {
+                println!("system audio: screencapturekit 48 kHz");
+            }
+        }
+        Err(err) => eprintln!("system audio: {err:#}"),
+    }
     stream
         .start_capture()
         .map_err(|err| anyhow!("failed to start screen capture: {err}"))?;
-    Ok(stream)
+    Ok((stream, audio_rx))
+}
+
+struct AudioHandler {
+    codec: Mutex<SystemAudio>,
+    tx: mpsc::Sender<EncodedAudio>,
+}
+
+impl SCStreamOutputTrait for AudioHandler {
+    fn did_output_sample_buffer(&self, sample: CMSampleBuffer, of_type: SCStreamOutputType) {
+        if of_type != SCStreamOutputType::Audio {
+            return;
+        }
+        let Some((pcm, channels, rate)) = pcm_from_sample(&sample) else {
+            return;
+        };
+        let Ok(mut codec) = self.codec.lock() else {
+            return;
+        };
+        for payload in codec.push(&pcm, channels, rate) {
+            let _ = self.tx.try_send(EncodedAudio {
+                payload,
+                timestamp_us: unix_us_now(),
+            });
+        }
+    }
+}
+
+fn pcm_from_sample(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize, u32)> {
+    let format = sample.format_description()?;
+    let rate = format.audio_sample_rate().unwrap_or(48_000.0).round() as u32;
+    let float = format.audio_is_float();
+    let bits = format.audio_bits_per_channel().unwrap_or(if float { 32 } else { 16 });
+    let list = sample.audio_buffer_list().ok()?;
+    if list.num_buffers() == 0 {
+        return None;
+    }
+    let channels = if list.num_buffers() == 1 {
+        list.get(0)?.number_channels.max(1) as usize
+    } else {
+        list.num_buffers()
+    };
+    if list.num_buffers() == 1 {
+        let data = list.get(0)?.data();
+        let pcm = bytes_to_f32(data, float, bits);
+        if pcm.is_empty() {
+            return None;
+        }
+        return Some((pcm, channels, rate.max(1)));
+    }
+    let planes: Vec<Vec<f32>> = (0..list.num_buffers())
+        .filter_map(|index| list.get(index).map(|buffer| bytes_to_f32(buffer.data(), float, bits)))
+        .collect();
+    let frames = planes.first().map(Vec::len).unwrap_or(0);
+    if frames == 0 {
+        return None;
+    }
+    let mut interleaved = Vec::with_capacity(frames * planes.len());
+    for frame in 0..frames {
+        for plane in &planes {
+            interleaved.push(plane.get(frame).copied().unwrap_or(0.0));
+        }
+    }
+    Some((interleaved, planes.len().max(1), rate.max(1)))
+}
+
+fn bytes_to_f32(data: &[u8], float: bool, bits: u32) -> Vec<f32> {
+    if float && bits == 32 {
+        data.chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    } else if bits == 16 {
+        data.chunks_exact(2)
+            .map(|chunk| f32::from(i16::from_le_bytes(chunk.try_into().unwrap())) / 32768.0)
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 fn cmtime_to_us(time: CMTime) -> Option<i64> {

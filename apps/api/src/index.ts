@@ -4,6 +4,7 @@ import express from "express";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { AccessToken } from "livekit-server-sdk";
@@ -75,6 +76,19 @@ const nativePublishers = new Map<string, NativePublisherRecord>();
 const nativeRuntimes = new Map<string, NativeRuntimeRecord>();
 const nativeRuntimeProcs = new Map<string, ReturnType<typeof spawn>>();
 const nativeRuntimeLogs = new Map<string, NativeRuntimeLogEntry[]>();
+type InviteRecord = { code: string; roomName: string; createdAt: string };
+const invites = new Map<string, InviteRecord>();
+
+function findInvite(code: string): { roomName: string } | undefined {
+  const memory = invites.get(code);
+  if (memory) return memory;
+  const listed = process.env.DCMAX_INVITES ?? "";
+  for (const item of listed.split(",")) {
+    const [itemCode, roomName] = item.trim().split(":");
+    if (itemCode && roomName && itemCode === code) return { roomName };
+  }
+  return undefined;
+}
 const allowedOrigins = (
   env.WEB_ORIGINS ??
   env.WEB_ORIGIN ??
@@ -423,7 +437,62 @@ const tokenSchema = z.object({
     .min(2)
     .max(32)
     .regex(/^[a-zA-Z0-9_-]+$/),
-  clientType: z.enum(["web", "native_sender"]).default("web")
+  clientType: z.enum(["web", "native_sender"]).default("web"),
+  invite: z
+    .string()
+    .min(4)
+    .max(64)
+    .regex(/^[a-zA-Z0-9_-]+$/)
+    .optional()
+});
+
+const inviteSchema = z.object({
+  roomName: z
+    .string()
+    .min(2)
+    .max(64)
+    .regex(/^[a-zA-Z0-9_-]+$/)
+});
+
+app.post("/invites", (req, res) => {
+  if (!requireNativeControl(req, res)) return;
+  const parsed = inviteSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
+    return;
+  }
+  const code = randomBytes(9).toString("base64url");
+  const record: InviteRecord = {
+    code,
+    roomName: parsed.data.roomName,
+    createdAt: new Date().toISOString()
+  };
+  invites.set(code, record);
+  res.json({
+    invite: code,
+    roomName: record.roomName,
+    relay: process.env.RELAY_PUBLIC_ADDR ?? null
+  });
+});
+
+app.post("/invites/check", (req, res) => {
+  if (!requireNativeControl(req, res)) return;
+  const parsed = z
+    .object({
+      invite: z.string().min(4).max(64),
+      roomName: z.string().min(2).max(64)
+    })
+    .safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ ok: false });
+    return;
+  }
+  const found = findInvite(parsed.data.invite);
+  if (!found || found.roomName !== parsed.data.roomName) {
+    res.status(404).json({ ok: false });
+    return;
+  }
+  res.json({ ok: true, roomName: found.roomName });
 });
 
 app.post("/token", async (req, res) => {
@@ -433,7 +502,17 @@ app.post("/token", async (req, res) => {
     return;
   }
 
-  const { roomName, identity, clientType } = parsed.data;
+  const { roomName, identity, clientType, invite } = parsed.data;
+  if (invite) {
+    const found = findInvite(invite);
+    if (!found || found.roomName !== roomName) {
+      res.status(401).json({ error: "Invite is not valid for this room" });
+      return;
+    }
+  } else if (process.env.INVITE_REQUIRED === "true") {
+    res.status(401).json({ error: "Invite is required" });
+    return;
+  }
   const at = new AccessToken(env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET, {
     identity
   });
@@ -457,7 +536,9 @@ app.post("/token", async (req, res) => {
 
   res.json({
     token,
-    url: env.LIVEKIT_URL
+    url: env.LIVEKIT_URL,
+    relay: process.env.RELAY_PUBLIC_ADDR ?? null,
+    roomName
   });
 });
 

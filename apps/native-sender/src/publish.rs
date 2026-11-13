@@ -106,10 +106,21 @@ pub async fn run(
     let mut late_drops: u64 = 0;
     let mut need_key = true;
     let mut last_timestamp_us: i64 = 0;
-    let picture = match config.picture_to {
-        Some(addr) => Some(PictureSender::connect(addr)?),
-        None => None,
+    let picture = if let Some(addr) = config.picture_relay {
+        let invite = config
+            .invite
+            .as_deref()
+            .context("--picture-relay needs --invite")?;
+        println!("picture relay: publishing to {addr}");
+        Some(PictureSender::connect_relay(addr, &config.room_name, invite)?)
+    } else {
+        match config.picture_to {
+            Some(addr) => Some(PictureSender::connect(addr)?),
+            None => None,
+        }
     };
+    let mut audio_rx = std::mem::replace(&mut encoder.audio, tokio::sync::mpsc::channel(1).1);
+    let mut audio_park: Option<tokio::sync::mpsc::Sender<crate::audio::EncodedAudio>> = None;
     let (cursor_tx, mut cursor_rx) = tokio::sync::watch::channel(None::<CursorSample>);
     let cursor_participant = room.local_participant();
     tokio::spawn(async move {
@@ -281,9 +292,21 @@ pub async fn run(
                     governor.note_estimate(target.target_bitrate_bps);
                 }
             }
+            packet = audio_rx.recv() => {
+                let Some(packet) = packet else {
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    audio_park = Some(tx);
+                    audio_rx = rx;
+                    continue;
+                };
+                if let Some(picture) = &picture {
+                    picture.offer_audio(&packet.payload, packet.timestamp_us);
+                }
+            }
         }
     }
 
+    drop(audio_park);
     let _ = room.close().await;
     Ok(())
 }

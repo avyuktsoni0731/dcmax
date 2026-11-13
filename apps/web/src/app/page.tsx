@@ -147,6 +147,7 @@ async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
 export default function HomePage() {
   const [username, setUsername] = useState("");
   const [roomName, setRoomName] = useState("mycord-room");
+  const [invite, setInvite] = useState("");
   const [callState, setCallState] = useState<CallState>("idle");
   const [room, setRoom] = useState<Room | null>(null);
   const [isMuted, setIsMuted] = useState(false);
@@ -480,7 +481,11 @@ export default function HomePage() {
     const res = await apiFetch(`${API_BASE}/token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ identity, roomName: roomToJoin })
+      body: JSON.stringify({
+        identity,
+        roomName: roomToJoin,
+        ...(invite.trim() ? { invite: invite.trim() } : {})
+      })
     });
 
     if (!res.ok) {
@@ -940,6 +945,12 @@ export default function HomePage() {
 
           {!onCall && (
             <section className="grid gap-4 rounded-md border border-[#1C2129] bg-[#0B0E12] p-4 md:grid-cols-5 md:p-6">
+              <input
+                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out placeholder:text-[#667185] focus:border-[#22D3EE] md:col-span-5"
+                placeholder="Invite code"
+                value={invite}
+                onChange={(e) => setInvite(e.target.value)}
+              />
               <input
                 className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out placeholder:text-[#667185] focus:border-[#22D3EE]"
                 placeholder="Your name"

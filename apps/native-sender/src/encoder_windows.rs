@@ -1,4 +1,5 @@
 use super::ffmpeg;
+use crate::audio::{DesktopAudio, EncodedAudio};
 use crate::config::{AppConfig, EncoderBackend};
 use crate::h264::{monotonic_unix_us, unix_us_now, AccessUnit, CursorSample, MAX_FRAME_AGE};
 use anyhow::{anyhow, Result};
@@ -166,6 +167,8 @@ struct NvencEncoder {
 pub struct ScreenEncoder {
     inner: Inner,
     pub units: mpsc::Receiver<AccessUnit>,
+    pub audio: mpsc::Receiver<EncodedAudio>,
+    desktop_audio: DesktopAudio,
     pub capture_backend: String,
     pub encoder_backend: String,
     pub width: u32,
@@ -185,12 +188,15 @@ impl ScreenEncoder {
                 let (_tx, rx) = mpsc::channel(1);
                 std::mem::replace(&mut ffmpeg.units, rx)
             };
+            let (audio, desktop_audio) = desktop_sound();
             return Ok(Self {
                 capture_backend: ffmpeg.capture_backend.clone(),
                 encoder_backend: ffmpeg.encoder_backend.clone(),
                 width: ffmpeg.width,
                 height: ffmpeg.height,
                 units,
+                audio,
+                desktop_audio,
                 inner: Inner::Ffmpeg(ffmpeg),
             });
         }
@@ -209,6 +215,7 @@ impl ScreenEncoder {
     }
 
     pub fn stop(&mut self) {
+        self.desktop_audio.stop();
         match &mut self.inner {
             Inner::Nvenc(encoder) => encoder.stop(),
             Inner::Ffmpeg(encoder) => encoder.stop(),
@@ -343,6 +350,7 @@ fn start_nvenc(config: &AppConfig) -> Result<ScreenEncoder> {
 
     let (tx, rx) = mpsc::channel(4);
     let worker = spawn_encode_thread(Arc::clone(&shared), tx, frame_interval(config.target_fps));
+    let (audio, desktop_audio) = desktop_sound();
     Ok(ScreenEncoder {
         inner: Inner::Nvenc(NvencEncoder {
             shared,
@@ -350,6 +358,8 @@ fn start_nvenc(config: &AppConfig) -> Result<ScreenEncoder> {
             worker: Some(worker),
         }),
         units: rx,
+        audio,
+        desktop_audio,
         capture_backend: "windows-graphics-capture".to_string(),
         encoder_backend: "h264_nvenc".to_string(),
         width,
@@ -378,6 +388,11 @@ impl NvencEncoder {
             unsafe { nvenc_close(session) };
         }
     }
+}
+
+fn desktop_sound() -> (mpsc::Receiver<EncodedAudio>, DesktopAudio) {
+    let (tx, rx) = mpsc::channel(32);
+    (rx, DesktopAudio::start(tx))
 }
 
 fn spawn_encode_thread(

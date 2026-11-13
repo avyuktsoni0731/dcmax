@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::interval;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
+use winit::keyboard::Key;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 #[cfg(target_os = "macos")]
@@ -205,12 +206,15 @@ struct WatchApp {
     #[cfg(target_os = "macos")]
     metal_misses: u32,
     showed: bool,
+    room: String,
+    mute: Arc<AtomicBool>,
 }
 
 pub fn run(config: &AppConfig) -> Result<()> {
     let queue: Arc<Mutex<VecDeque<Queued>>> = Arc::new(Mutex::new(VecDeque::new()));
     let cursor = Arc::new(CursorState::new());
     let stop = Arc::new(AtomicBool::new(false));
+    let mute = Arc::new(AtomicBool::new(false));
     let event_loop = EventLoop::<WatchEvent>::with_user_event()
         .build()
         .context("failed to create the watch window")?;
@@ -220,16 +224,25 @@ pub fn run(config: &AppConfig) -> Result<()> {
     let task_stop = Arc::clone(&stop);
     let task_proxy = proxy.clone();
     let task_cursor = Arc::clone(&cursor);
+    let task_mute = Arc::clone(&mute);
     let _runtime;
     let picture_thread;
-    if let Some(addr) = config.picture_listen {
-        println!("watch picture: direct tcp {addr}");
+    let link = picture_link(config);
+    if let Some(link) = link {
+        match &link {
+            PictureLink::Listen(addr) => println!("watch picture: direct tcp {addr}"),
+            PictureLink::Relay { addr, .. } => {
+                println!("watch picture: relay {addr}");
+                println!("call: picture and system audio. Press m to mute.");
+            }
+        }
         picture_thread = Some(
             std::thread::Builder::new()
                 .name("picture-tcp".to_string())
                 .spawn(move || {
-                    if let Err(err) = picture_watch(addr, task_queue, task_proxy, task_stop, task_cursor)
-                    {
+                    if let Err(err) = picture_watch(
+                        link, task_queue, task_proxy, task_stop, task_cursor, task_mute,
+                    ) {
                         eprintln!("watch picture failed: {err:#}");
                     }
                 })
@@ -271,6 +284,8 @@ pub fn run(config: &AppConfig) -> Result<()> {
         #[cfg(target_os = "macos")]
         metal_misses: 0,
         showed: false,
+        room: config.room_name.clone(),
+        mute,
     };
     let result = event_loop.run_app(&mut app);
     #[cfg(target_os = "macos")]
@@ -282,31 +297,73 @@ pub fn run(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+enum PictureLink {
+    Listen(std::net::SocketAddr),
+    Relay {
+        addr: std::net::SocketAddr,
+        room: String,
+        invite: String,
+    },
+}
+
+fn picture_link(config: &AppConfig) -> Option<PictureLink> {
+    if let Some(addr) = config.picture_listen {
+        return Some(PictureLink::Listen(addr));
+    }
+    if let Some(addr) = config.picture_relay {
+        let invite = config.invite.clone()?;
+        return Some(PictureLink::Relay {
+            addr,
+            room: config.room_name.clone(),
+            invite,
+        });
+    }
+    if config.invite.is_some() {
+        let token = api::fetch_token_blocking(
+            &config.api_base_url,
+            &config.room_name,
+            &config.identity,
+            &config.client_type,
+            config.invite.as_deref(),
+        )
+        .ok()?;
+        let addr = token.relay?.parse().ok()?;
+        return Some(PictureLink::Relay {
+            addr,
+            room: config.room_name.clone(),
+            invite: config.invite.clone()?,
+        });
+    }
+    None
+}
+
 fn picture_watch(
-    addr: std::net::SocketAddr,
+    link: PictureLink,
     queue: Arc<Mutex<VecDeque<Queued>>>,
     proxy: EventLoopProxy<WatchEvent>,
     stop: Arc<AtomicBool>,
     cursor: Arc<CursorState>,
+    mute: Arc<AtomicBool>,
 ) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (queue, proxy, stop, cursor);
-        anyhow::bail!("TCP picture playback is available on macOS ({addr})");
+        let _ = (link, queue, proxy, stop, cursor, mute);
+        anyhow::bail!("TCP picture playback is available on macOS");
     }
     #[cfg(target_os = "macos")]
     {
-        picture_watch_macos(addr, queue, proxy, stop, cursor)
+        picture_watch_macos(link, queue, proxy, stop, cursor, mute)
     }
 }
 
 #[cfg(target_os = "macos")]
 fn picture_watch_macos(
-    addr: std::net::SocketAddr,
+    link: PictureLink,
     queue: Arc<Mutex<VecDeque<Queued>>>,
     proxy: EventLoopProxy<WatchEvent>,
     stop: Arc<AtomicBool>,
     cursor: Arc<CursorState>,
+    mute: Arc<AtomicBool>,
 ) -> Result<()> {
     use std::io::ErrorKind;
     use std::net::TcpStream;
@@ -314,31 +371,50 @@ fn picture_watch_macos(
     use std::thread;
     use std::time::Duration as Wait;
 
+    use crate::audio::{decode_packet, decoder as opus_decoder, AudioPlayer};
     use crate::decode_macos::Decoder;
-    use crate::picture::{accept_picture, listen, request_keyframe, FrameReader, PictureFrame};
+    use crate::picture::{
+        accept_picture, connect_watch, listen, request_keyframe, FrameReader, PictureFrame,
+    };
 
     enum Piped {
         Connected(TcpStream),
         Frame(PictureFrame, Instant),
     }
 
-    let listener = listen(addr)?;
+    let listener = match &link {
+        PictureLink::Listen(addr) => Some(listen(*addr)?),
+        PictureLink::Relay { .. } => None,
+    };
     let (tx, rx) = sync_channel(8);
     let stop_read = Arc::clone(&stop);
     let reader = thread::Builder::new()
         .name("picture-tcp-read".to_string())
         .spawn(move || {
             while !stop_read.load(Ordering::Acquire) {
-                let stream = match accept_picture(&listener) {
-                    Ok(Some(stream)) => stream,
-                    Ok(None) => {
-                        thread::sleep(Wait::from_millis(20));
-                        continue;
+                let stream = if let Some(listener) = &listener {
+                    match accept_picture(listener) {
+                        Ok(Some(stream)) => stream,
+                        Ok(None) => {
+                            thread::sleep(Wait::from_millis(20));
+                            continue;
+                        }
+                        Err(err) => {
+                            eprintln!("picture tcp: {err}");
+                            break;
+                        }
                     }
-                    Err(err) => {
-                        eprintln!("picture tcp: {err}");
-                        break;
+                } else if let PictureLink::Relay { addr, room, invite } = &link {
+                    match connect_watch(*addr, room, invite) {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            eprintln!("picture tcp: waiting for the relay at {addr} ({err})");
+                            thread::sleep(Wait::from_millis(300));
+                            continue;
+                        }
                     }
+                } else {
+                    break;
                 };
                 let ask = match stream.try_clone() {
                     Ok(ask) => ask,
@@ -385,8 +461,17 @@ fn picture_watch_macos(
     let mut skipped: u64 = 0;
     let mut window_received: u64 = 0;
     let mut window_gaps: u64 = 0;
+    let mut window_audio: u64 = 0;
     let mut last_arrival = Instant::now();
     let mut last_log = Instant::now();
+    let player = match AudioPlayer::start(mute) {
+        Ok(player) => Some(player),
+        Err(err) => {
+            eprintln!("watch audio: {err:#}");
+            None
+        }
+    };
+    let mut opus = opus_decoder().ok();
     let mut ask: Option<TcpStream> = None;
     let mut decoder = Decoder::new();
     let mut next_frame: Option<u32> = None;
@@ -398,11 +483,12 @@ fn picture_watch_macos(
         if last_log.elapsed() >= Duration::from_secs(1) {
             let held = queue.lock().map(|slot| slot.len()).unwrap_or(0);
             println!(
-                "watch: fps={window_received:.0} gaps_this_second={window_gaps} held={held} frames={received} gaps={gaps} skipped={skipped} uptime={:.0}s",
+                "watch: fps={window_received:.0} gaps_this_second={window_gaps} held={held} frames={received} gaps={gaps} skipped={skipped} sound={window_audio} uptime={:.0}s",
                 started.elapsed().as_secs_f64()
             );
             window_received = 0;
             window_gaps = 0;
+            window_audio = 0;
             last_log = Instant::now();
         }
         let message = match rx.recv_timeout(Wait::from_millis(200)) {
@@ -416,10 +502,20 @@ fn picture_watch_macos(
                 decoder = Decoder::new();
                 next_frame = None;
                 clock = MirrorClock::new();
+                opus = opus_decoder().ok();
                 continue;
             }
             Piped::Frame(frame, arrival) => (frame, arrival),
         };
+        if frame.audio {
+            if let (Some(player), Some(opus)) = (player.as_ref(), opus.as_mut()) {
+                if let Ok(pcm) = decode_packet(opus, &frame.payload) {
+                    player.push(&pcm);
+                    window_audio += 1;
+                }
+            }
+            continue;
+        }
         let follows = match next_frame {
             Some(expected) => frame.frame_id == expected,
             None => frame.keyframe,
@@ -482,6 +578,7 @@ async fn session(
         &config.room_name,
         &config.identity,
         &config.client_type,
+        config.invite.as_deref(),
     )
     .await?;
     println!(
@@ -905,6 +1002,14 @@ fn clamp_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
+fn call_title(room: &str, muted: bool) -> String {
+    if muted {
+        format!("dcmax · {room} · muted")
+    } else {
+        format!("dcmax · {room}")
+    }
+}
+
 impl ApplicationHandler<WatchEvent> for WatchApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -912,7 +1017,7 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
         }
         let window = match event_loop.create_window(
             winit::window::WindowAttributes::default()
-                .with_title("dcmax watch")
+                .with_title(call_title(&self.room, false))
                 .with_inner_size(winit::dpi::LogicalSize::new(1280, 720)),
         ) {
             Ok(window) => Arc::new(window),
@@ -966,6 +1071,18 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
             WindowEvent::CloseRequested => {
                 self.stop.store(true, Ordering::Release);
                 event_loop.exit();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                let mute_key = event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(event.logical_key, Key::Character(ref text) if text.eq_ignore_ascii_case("m"));
+                if mute_key {
+                    let muted = !self.mute.fetch_xor(true, Ordering::AcqRel);
+                    println!("watch audio: {}", if muted { "muted" } else { "on" });
+                    if let Some(window) = &self.window {
+                        window.set_title(&call_title(&self.room, muted));
+                    }
+                }
             }
             WindowEvent::RedrawRequested => {
                 self.present_due();

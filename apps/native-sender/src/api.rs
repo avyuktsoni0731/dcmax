@@ -9,12 +9,16 @@ struct TokenRequest<'a> {
     identity: &'a str,
     #[serde(rename = "clientType")]
     client_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invite: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TokenResponse {
     pub token: String,
     pub url: String,
+    #[serde(default)]
+    pub relay: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,12 +90,14 @@ pub async fn fetch_token(
     room_name: &str,
     identity: &str,
     client_type: &str,
+    invite: Option<&str>,
 ) -> Result<TokenResponse> {
     let endpoint = format!("{}/token", api_base_url.trim_end_matches('/'));
     let req = TokenRequest {
         room_name,
         identity,
         client_type,
+        invite,
     };
 
     let res = client
@@ -113,6 +119,38 @@ pub async fn fetch_token(
         .context("token response parse failed")?;
 
     Ok(payload)
+}
+
+pub fn fetch_token_blocking(
+    api_base_url: &str,
+    room_name: &str,
+    identity: &str,
+    client_type: &str,
+    invite: Option<&str>,
+) -> Result<TokenResponse> {
+    let endpoint = format!("{}/token", api_base_url.trim_end_matches('/'));
+    let req = TokenRequest {
+        room_name,
+        identity,
+        client_type,
+        invite,
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("token client")?;
+    let res = client
+        .post(endpoint)
+        .json(&req)
+        .send()
+        .context("token request failed")?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().unwrap_or_default();
+        anyhow::bail!("token request returned {}: {}", status, body);
+    }
+    res.json::<TokenResponse>()
+        .context("token response parse failed")
 }
 
 pub async fn report_native_session(
