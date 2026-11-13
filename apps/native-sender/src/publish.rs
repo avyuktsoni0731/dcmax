@@ -1,6 +1,7 @@
 use crate::api;
 use crate::config::AppConfig;
 use crate::encoder::ScreenEncoder;
+use crate::h264::MAX_FRAME_AGE;
 use anyhow::{Context, Result};
 use livekit::options::{TrackPublishOptions, VideoCodec, VideoEncoderBackend, VideoEncoding};
 use livekit::prelude::*;
@@ -95,6 +96,8 @@ pub async fn run(
     let mut governor = RateGovernor::new(u64::from(config.bitrate_kbps) * 1000, config.target_fps);
     let mut rate_frames: u64 = 0;
     let mut rate_send_drops: u64 = 0;
+    let mut late_drops: u64 = 0;
+    let mut need_key = true;
     let frame_duration_us = 1_000_000i64 / i64::from(config.target_fps.max(1));
     let mut frame_index: i64 = 0;
 
@@ -118,8 +121,9 @@ pub async fn run(
                 let avg_payload = if window_frames > 0 { window_bytes / window_frames as usize } else { 0 };
                 let avg_latency = if window_frames > 0 { window_latency_ms / window_frames as f64 } else { 0.0 };
                 println!(
-                    "heartbeat: fps={achieved_fps:.1} frames={produced} dropped={dropped} queue_drops={} keyframe_requests={keyframe_requests} rate_target_bps={} uptime={:.0}s",
+                    "heartbeat: fps={achieved_fps:.1} frames={produced} dropped={dropped} queue_drops={} late={late_drops} stale={} keyframe_requests={keyframe_requests} rate_target_bps={} uptime={:.0}s",
                     encoder.queue_drops(),
+                    encoder.stale_skips(),
                     governor.applied_bps(),
                     started.elapsed().as_secs_f64()
                 );
@@ -170,6 +174,20 @@ pub async fn run(
                     let tail = encoder.stderr_tail();
                     anyhow::bail!("ffmpeg stopped producing video. {}", tail.trim());
                 };
+                match admit(&mut need_key, unit.keyframe, unit.captured_at.elapsed()) {
+                    Admit::Send => {}
+                    Admit::TooLate => {
+                        // A delta dropped here breaks every frame after it.
+                        // Hold the picture until the next keyframe.
+                        late_drops += 1;
+                        encoder.request_keyframe();
+                        continue;
+                    }
+                    Admit::WaitForKey => {
+                        encoder.request_keyframe();
+                        continue;
+                    }
+                }
                 let timestamp_us = match unit.timestamp_us {
                     Some(timestamp) => timestamp,
                     None => {
@@ -214,6 +232,28 @@ pub async fn run(
 }
 
 const HOLD_BEFORE_CUT: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admit {
+    Send,
+    TooLate,
+    WaitForKey,
+}
+
+/// The first frame on the wire is a keyframe. A frame that has already missed
+/// the live window is dropped, and nothing after it is sent until the next
+/// keyframe, because a missing delta makes the rest of the group undecodable.
+fn admit(need_key: &mut bool, keyframe: bool, age: Duration) -> Admit {
+    if age > MAX_FRAME_AGE {
+        *need_key = true;
+        return Admit::TooLate;
+    }
+    if *need_key && !keyframe {
+        return Admit::WaitForKey;
+    }
+    *need_key = false;
+    Admit::Send
+}
 
 struct RateDecision {
     bps: u64,
@@ -331,7 +371,40 @@ fn ease_down(applied: u64, estimate: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::RateGovernor;
+    use super::{admit, Admit, RateGovernor};
+    use std::time::Duration;
+
+    #[test]
+    fn the_first_frame_sent_is_a_keyframe_and_a_late_one_waits_for_the_next() {
+        let mut need_key = true;
+        assert_eq!(
+            admit(&mut need_key, false, Duration::from_millis(10)),
+            Admit::WaitForKey
+        );
+        assert!(need_key);
+        assert_eq!(
+            admit(&mut need_key, true, Duration::from_millis(10)),
+            Admit::Send
+        );
+        assert!(!need_key);
+        assert_eq!(
+            admit(&mut need_key, false, Duration::from_millis(10)),
+            Admit::Send
+        );
+        assert_eq!(
+            admit(&mut need_key, false, Duration::from_millis(200)),
+            Admit::TooLate
+        );
+        assert!(need_key);
+        assert_eq!(
+            admit(&mut need_key, false, Duration::from_millis(10)),
+            Admit::WaitForKey
+        );
+        assert_eq!(
+            admit(&mut need_key, true, Duration::from_millis(10)),
+            Admit::Send
+        );
+    }
 
     #[test]
     fn a_startup_stall_does_not_cut_the_target() {

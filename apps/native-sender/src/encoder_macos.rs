@@ -1,6 +1,6 @@
-use super::vt::VtSession;
+use super::vt::{Flight, VtSession};
 use crate::config::AppConfig;
-use crate::h264::AccessUnit;
+use crate::h264::{AccessUnit, MAX_FRAME_AGE};
 use anyhow::{anyhow, Context, Result};
 use screencapturekit::cm::CMSampleBufferExt;
 use screencapturekit::cv::CVPixelBuffer;
@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 const KEYFRAME_GAP: Duration = Duration::from_secs(1);
 
 struct Controls {
-    force_keyframe: AtomicBool,
+    force_keyframe: Arc<AtomicBool>,
     bitrate_bps: AtomicU64,
 }
 
@@ -26,6 +26,7 @@ struct Clock {
 struct PendingFrame {
     pixel: CVPixelBuffer,
     timestamp_us: i64,
+    captured_at: Instant,
 }
 
 struct Pending {
@@ -59,6 +60,7 @@ impl SCStreamOutputTrait for Handler {
         let frame = PendingFrame {
             pixel,
             timestamp_us: self.capture_timestamp(sample.presentation_timestamp()),
+            captured_at: Instant::now(),
         };
         // Keep the newest frame only. Encoding stays on its own thread, so a
         // slow encoder cannot stall ScreenCaptureKit.
@@ -99,7 +101,9 @@ pub struct ScreenEncoder {
     encode_thread: Option<JoinHandle<()>>,
     fatal: Arc<Mutex<Option<String>>>,
     controls: Arc<Controls>,
+    flight: Arc<Flight>,
     queue_drops: Arc<AtomicU64>,
+    stale_skips: Arc<AtomicU64>,
     pub units: mpsc::Receiver<AccessUnit>,
     pub capture_backend: String,
     pub encoder_backend: String,
@@ -110,9 +114,15 @@ pub struct ScreenEncoder {
 impl ScreenEncoder {
     pub fn start(config: &AppConfig) -> Result<Self> {
         let (width, height, display_width, display_height) = output_size(config)?;
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(4);
         let queue_drops = Arc::new(AtomicU64::new(0));
+        let stale_skips = Arc::new(AtomicU64::new(0));
+        let flight = Arc::new(Flight::new());
         let bitrate_bps = u64::from(config.bitrate_kbps) * 1000;
+        let controls = Arc::new(Controls {
+            force_keyframe: Arc::new(AtomicBool::new(false)),
+            bitrate_bps: AtomicU64::new(bitrate_bps),
+        });
         let session = VtSession::create(
             width,
             height,
@@ -121,12 +131,9 @@ impl ScreenEncoder {
             config.gop_frames(),
             tx,
             Arc::clone(&queue_drops),
+            Arc::clone(&controls.force_keyframe),
         )?;
         let session = Arc::new(Mutex::new(session));
-        let controls = Arc::new(Controls {
-            force_keyframe: AtomicBool::new(false),
-            bitrate_bps: AtomicU64::new(bitrate_bps),
-        });
         let fatal = Arc::new(Mutex::new(None));
         let pending = Arc::new(Pending {
             slot: Mutex::new(None),
@@ -138,6 +145,9 @@ impl ScreenEncoder {
             Arc::clone(&session),
             Arc::clone(&controls),
             Arc::clone(&fatal),
+            Arc::clone(&flight),
+            Arc::clone(&stale_skips),
+            frame_interval(config.target_fps),
         );
         let stream = match open_stream(
             config,
@@ -152,6 +162,7 @@ impl ScreenEncoder {
             Err(err) => {
                 pending.stop.store(true, Ordering::Release);
                 pending.ready.notify_one();
+                flight.wake();
                 let _ = encode_thread.join();
                 if let Ok(mut session) = session.lock() {
                     session.finish();
@@ -166,7 +177,9 @@ impl ScreenEncoder {
             encode_thread: Some(encode_thread),
             fatal,
             controls,
+            flight,
             queue_drops,
+            stale_skips,
             units: rx,
             capture_backend: "screencapturekit".to_string(),
             encoder_backend: "videotoolbox".to_string(),
@@ -208,6 +221,10 @@ impl ScreenEncoder {
         self.queue_drops.load(Ordering::Relaxed)
     }
 
+    pub fn stale_skips(&self) -> u64 {
+        self.stale_skips.load(Ordering::Relaxed)
+    }
+
     pub fn stop(&mut self) {
         if let Some(stream) = self.stream.take() {
             if let Err(err) = stream.stop_capture() {
@@ -216,6 +233,7 @@ impl ScreenEncoder {
         }
         self.pending.stop.store(true, Ordering::Release);
         self.pending.ready.notify_one();
+        self.flight.wake();
         if let Some(thread) = self.encode_thread.take() {
             let _ = thread.join();
         }
@@ -236,44 +254,58 @@ fn spawn_encode_thread(
     session: Arc<Mutex<VtSession>>,
     controls: Arc<Controls>,
     fatal: Arc<Mutex<Option<String>>>,
+    flight: Arc<Flight>,
+    stale_skips: Arc<AtomicU64>,
+    interval: Duration,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("screen-encode".to_string())
         .spawn(move || {
+            set_encode_priority();
+            let mut next_at = Instant::now();
             let mut last_keyframe = Instant::now() - KEYFRAME_GAP;
+            let mut opened = false;
             loop {
-                let frame = {
-                    let Ok(mut slot) = pending.slot.lock() else {
-                        break;
-                    };
-                    while slot.is_none() && !pending.stop.load(Ordering::Acquire) {
-                        slot = pending
-                            .ready
-                            .wait(slot)
-                            .unwrap_or_else(|err| err.into_inner());
-                    }
-                    if slot.is_none() && pending.stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    slot.take()
+                if !flight.wait_until_idle(&pending.stop) {
+                    break;
+                }
+                let Some(frame) = wait_for_newest(&pending, next_at) else {
+                    break;
                 };
-                let Some(frame) = frame else { break };
                 if fatal.lock().map(|guard| guard.is_some()).unwrap_or(true) {
                     break;
                 }
-                let due = controls.force_keyframe.load(Ordering::Acquire)
-                    && last_keyframe.elapsed() >= KEYFRAME_GAP;
+                // The slot kept only the newest capture. If that one is already
+                // late, encoding it would publish a stale picture.
+                if frame.captured_at.elapsed() > MAX_FRAME_AGE {
+                    stale_skips.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let due = !opened
+                    || (controls.force_keyframe.load(Ordering::Acquire)
+                        && last_keyframe.elapsed() >= KEYFRAME_GAP);
                 if due {
                     controls.force_keyframe.store(false, Ordering::Release);
                     last_keyframe = Instant::now();
+                    opened = true;
                 }
                 let bitrate_bps = controls.bitrate_bps.load(Ordering::Relaxed);
+                let ticket = flight.begin();
                 let encoded = session.lock().map(|mut session| {
-                    session.encode(frame.pixel.as_ptr(), frame.timestamp_us, due, bitrate_bps)
+                    session.encode(
+                        frame.pixel.as_ptr(),
+                        frame.timestamp_us,
+                        due,
+                        bitrate_bps,
+                        frame.captured_at,
+                        &flight,
+                        ticket,
+                    )
                 });
                 if let Err(err) =
                     encoded.unwrap_or_else(|err| Err(anyhow!("encoder lock poisoned: {err}")))
                 {
+                    flight.finish(ticket);
                     if let Ok(mut fatal) = fatal.lock() {
                         if fatal.is_none() {
                             *fatal = Some(err.to_string());
@@ -281,9 +313,55 @@ fn spawn_encode_thread(
                     }
                     break;
                 }
+                next_at = Instant::now() + interval;
             }
         })
         .expect("failed to start the screen encode thread")
+}
+
+/// Blocks until the frame interval has elapsed, then takes the newest capture.
+/// Frames that arrive early stay in the slot and are replaced, so the opening
+/// second cannot dump a burst into the encoder.
+fn wait_for_newest(pending: &Pending, earliest: Instant) -> Option<PendingFrame> {
+    let Ok(mut slot) = pending.slot.lock() else {
+        return None;
+    };
+    loop {
+        if pending.stop.load(Ordering::Acquire) {
+            return None;
+        }
+        let now = Instant::now();
+        if now < earliest {
+            let (next, _) = pending
+                .ready
+                .wait_timeout(slot, earliest.saturating_duration_since(now))
+                .unwrap_or_else(|err| err.into_inner());
+            slot = next;
+            continue;
+        }
+        if let Some(frame) = slot.take() {
+            return Some(frame);
+        }
+        slot = pending
+            .ready
+            .wait(slot)
+            .unwrap_or_else(|err| err.into_inner());
+    }
+}
+
+fn frame_interval(fps: u32) -> Duration {
+    Duration::from_nanos(1_000_000_000 / u64::from(fps.max(1)))
+}
+
+fn set_encode_priority() {
+    extern "C" {
+        fn pthread_set_qos_class_self_np(class: u32, relative_priority: i32) -> i32;
+    }
+    // User-interactive keeps the encoder ahead of a game that is using the
+    // same media engine. 0x21 is QOS_CLASS_USER_INTERACTIVE.
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x21, 0);
+    }
 }
 
 fn output_size(config: &AppConfig) -> Result<(u32, u32, u32, u32)> {

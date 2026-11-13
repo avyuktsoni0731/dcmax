@@ -7,8 +7,9 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 #[repr(C)]
@@ -107,6 +108,22 @@ extern "C" {
 struct OutputState {
     tx: mpsc::Sender<AccessUnit>,
     dropped: Arc<AtomicU64>,
+    force_keyframe: Arc<AtomicBool>,
+}
+
+struct FrameMarker {
+    captured_at: Instant,
+    ticket: u64,
+    flight: Arc<Flight>,
+}
+
+/// One encode at a time. The ticket lets a late callback finish only the frame
+/// it actually encoded, so a stalled encoder cannot unblock the next one early.
+pub struct Flight {
+    inflight: AtomicU64,
+    tickets: AtomicU64,
+    lock: Mutex<()>,
+    done: Condvar,
 }
 
 pub struct VtSession {
@@ -119,6 +136,62 @@ pub struct VtSession {
 
 unsafe impl Send for VtSession {}
 
+impl Flight {
+    pub fn new() -> Self {
+        Self {
+            inflight: AtomicU64::new(0),
+            tickets: AtomicU64::new(0),
+            lock: Mutex::new(()),
+            done: Condvar::new(),
+        }
+    }
+
+    pub fn begin(&self) -> u64 {
+        let ticket = self.tickets.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inflight.store(ticket, Ordering::Release);
+        ticket
+    }
+
+    pub fn finish(&self, ticket: u64) {
+        if self
+            .inflight
+            .compare_exchange(ticket, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.done.notify_one();
+        }
+    }
+
+    pub fn wake(&self) {
+        self.done.notify_one();
+    }
+
+    /// Waits until the encode callback has finished the current frame.
+    /// A callback that never arrives is abandoned after two seconds so capture
+    /// can move on to a fresh frame.
+    pub fn wait_until_idle(&self, stop: &AtomicBool) -> bool {
+        let mut guard = self.lock.lock().unwrap_or_else(|err| err.into_inner());
+        let started = Instant::now();
+        while self.inflight.load(Ordering::Acquire) != 0 {
+            if stop.load(Ordering::Acquire) {
+                return false;
+            }
+            if started.elapsed() >= Duration::from_secs(2) {
+                let ticket = self.inflight.load(Ordering::Acquire);
+                drop(guard);
+                self.finish(ticket);
+                return !stop.load(Ordering::Acquire);
+            }
+            let (next, _) = self
+                .done
+                .wait_timeout(guard, Duration::from_millis(50))
+                .unwrap_or_else(|err| err.into_inner());
+            guard = next;
+        }
+        !stop.load(Ordering::Acquire)
+    }
+}
+
 impl VtSession {
     pub fn create(
         width: u32,
@@ -128,8 +201,13 @@ impl VtSession {
         gop: u32,
         tx: mpsc::Sender<AccessUnit>,
         dropped: Arc<AtomicU64>,
+        force_keyframe: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let output = Box::new(OutputState { tx, dropped });
+        let output = Box::new(OutputState {
+            tx,
+            dropped,
+            force_keyframe,
+        });
         let refcon = Box::into_raw(output);
         let spec = cf_dict(&[(
             "EnableHardwareAcceleratedVideoEncoder",
@@ -176,8 +254,12 @@ impl VtSession {
         timestamp_us: i64,
         force_keyframe: bool,
         bitrate_bps: u64,
+        captured_at: Instant,
+        flight: &Arc<Flight>,
+        ticket: u64,
     ) -> Result<()> {
         if !self.alive || pixel_buffer.is_null() {
+            flight.finish(ticket);
             return Ok(());
         }
         if bitrate_bps != 0 && bitrate_bps != self.applied_bitrate {
@@ -196,6 +278,11 @@ impl VtSession {
             .as_ref()
             .map(|dict| dict.as_concrete_TypeRef() as *const c_void)
             .unwrap_or(std::ptr::null());
+        let marker = Box::into_raw(Box::new(FrameMarker {
+            captured_at,
+            ticket,
+            flight: Arc::clone(flight),
+        }));
         let status = unsafe {
             VTCompressionSessionEncodeFrame(
                 self.raw,
@@ -203,11 +290,13 @@ impl VtSession {
                 us_time(timestamp_us),
                 TIME_INVALID,
                 properties_ref,
-                std::ptr::null_mut(),
+                marker.cast(),
                 std::ptr::null_mut(),
             )
         };
         if status != 0 {
+            drop(unsafe { Box::from_raw(marker) });
+            flight.finish(ticket);
             bail!("VideoToolbox encode failed ({status})");
         }
         self.log_hardware_once();
@@ -345,22 +434,32 @@ fn us_time(timestamp_us: i64) -> CmTime {
 
 unsafe extern "C" fn on_encoded_frame(
     refcon: *mut c_void,
-    _source: *mut c_void,
+    source: *mut c_void,
     status: i32,
     _flags: u32,
     sample: *mut c_void,
 ) {
+    let captured_at = if source.is_null() {
+        Instant::now()
+    } else {
+        let marker = unsafe { Box::from_raw(source.cast::<FrameMarker>()) };
+        marker.flight.finish(marker.ticket);
+        marker.captured_at
+    };
     if refcon.is_null() || status != 0 || sample.is_null() {
         return;
     }
-    let Some(unit) = access_unit_from_sample(sample) else {
+    let Some(mut unit) = access_unit_from_sample(sample) else {
         return;
     };
+    unit.captured_at = captured_at;
     let state = unsafe { &*refcon.cast::<OutputState>() };
     // Blocking here stalls the hardware encoder, and the encode thread then
-    // produces nothing until the publish side catches up.
+    // produces nothing until the publish side catches up. A dropped delta
+    // breaks the reference chain, so the next encode is a keyframe.
     if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = state.tx.try_send(unit) {
         state.dropped.fetch_add(1, Ordering::Relaxed);
+        state.force_keyframe.store(true, Ordering::Release);
     }
 }
 
@@ -400,7 +499,8 @@ fn access_unit_from_sample(sample: *mut c_void) -> Option<AccessUnit> {
     Some(AccessUnit {
         payload: annexb,
         keyframe,
-        read_at: std::time::Instant::now(),
+        read_at: Instant::now(),
+        captured_at: Instant::now(),
         timestamp_us,
     })
 }

@@ -1,10 +1,17 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// A frame older than this is already late for a live share. Sending it adds
+/// delay, and the viewer would rather get the next fresh one.
+pub const MAX_FRAME_AGE: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone)]
 pub struct AccessUnit {
     pub payload: Vec<u8>,
     pub keyframe: bool,
     pub read_at: Instant,
+    /// When ScreenCaptureKit handed us the pixels. The publisher uses this to
+    /// drop a frame that has already missed the live window.
+    pub captured_at: Instant,
     /// Capture time in microseconds, relative to the first frame.
     /// Empty when the producer has no capture clock and the publisher should
     /// stamp frames from their index.
@@ -138,6 +145,7 @@ impl AnnexBSplitter {
             payload,
             keyframe: self.au_is_key,
             read_at: Instant::now(),
+            captured_at: Instant::now(),
             timestamp_us: None,
         };
         self.reset_au();

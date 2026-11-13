@@ -92,6 +92,10 @@ impl ScreenEncoder {
     pub fn queue_drops(&self) -> u64 {
         0
     }
+
+    pub fn stale_skips(&self) -> u64 {
+        0
+    }
 }
 
 impl Drop for ScreenEncoder {
