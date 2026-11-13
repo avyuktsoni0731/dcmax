@@ -1,6 +1,6 @@
 use super::vt::{Flight, VtSession};
 use crate::config::AppConfig;
-use crate::h264::{AccessUnit, MAX_FRAME_AGE};
+use crate::h264::{unix_us_now, AccessUnit, MAX_FRAME_AGE};
 use anyhow::{anyhow, Context, Result};
 use screencapturekit::cm::CMSampleBufferExt;
 use screencapturekit::cv::CVPixelBuffer;
@@ -27,6 +27,7 @@ struct PendingFrame {
     pixel: CVPixelBuffer,
     timestamp_us: i64,
     captured_at: Instant,
+    livekit_us: i64,
 }
 
 struct Pending {
@@ -61,6 +62,7 @@ impl SCStreamOutputTrait for Handler {
             pixel,
             timestamp_us: self.capture_timestamp(sample.presentation_timestamp()),
             captured_at: Instant::now(),
+            livekit_us: unix_us_now(),
         };
         // Keep the newest frame only. Encoding stays on its own thread, so a
         // slow encoder cannot stall ScreenCaptureKit.
@@ -295,6 +297,7 @@ fn spawn_encode_thread(
                     session.encode(
                         frame.pixel.as_ptr(),
                         frame.timestamp_us,
+                        frame.livekit_us,
                         due,
                         bitrate_bps,
                         frame.captured_at,

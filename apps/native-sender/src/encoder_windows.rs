@@ -1,6 +1,6 @@
 use super::ffmpeg;
 use crate::config::{AppConfig, EncoderBackend};
-use crate::h264::{AccessUnit, MAX_FRAME_AGE};
+use crate::h264::{monotonic_unix_us, unix_us_now, AccessUnit, MAX_FRAME_AGE};
 use anyhow::{anyhow, Result};
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
@@ -60,10 +60,15 @@ enum Ready {
     Failed(String),
 }
 
+struct Captured {
+    at: Instant,
+    unix_us: i64,
+}
+
 struct Shared {
     stop: AtomicBool,
     session: AtomicPtr<NvencSession>,
-    pending: Mutex<Option<Instant>>,
+    pending: Mutex<Option<Captured>>,
     pending_cv: Condvar,
     ready: Mutex<Ready>,
     ready_cv: Condvar,
@@ -132,7 +137,10 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             return Err(anyhow!(message));
         }
         if let Ok(mut slot) = self.shared.pending.lock() {
-            *slot = Some(Instant::now());
+            *slot = Some(Captured {
+                at: Instant::now(),
+                unix_us: unix_us_now(),
+            });
             self.shared.pending_cv.notify_one();
         }
         Ok(())
@@ -374,6 +382,7 @@ fn spawn_encode_thread(
             let mut last_keyframe = Instant::now() - KEYFRAME_GAP;
             let mut opened = false;
             let mut applied_bitrate = shared.bitrate_bps.load(Ordering::Relaxed);
+            let mut last_unix_us = 0i64;
             loop {
                 if shared.stop.load(Ordering::Acquire) {
                     break;
@@ -386,11 +395,11 @@ fn spawn_encode_thread(
                 {
                     break;
                 }
-                let Some(captured_at) = wait_for_newest(&shared, next_at) else {
+                let Some(captured) = wait_for_newest(&shared, next_at) else {
                     break;
                 };
                 let frame_started = Instant::now();
-                if captured_at.elapsed() > MAX_FRAME_AGE {
+                if captured.at.elapsed() > MAX_FRAME_AGE {
                     shared.stale_skips.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -430,8 +439,8 @@ fn spawn_encode_thread(
                     payload: output[..out_len as usize].to_vec(),
                     keyframe: is_key != 0,
                     read_at: Instant::now(),
-                    captured_at,
-                    timestamp_us: None,
+                    captured_at: captured.at,
+                    timestamp_us: Some(monotonic_unix_us(&mut last_unix_us, captured.unix_us)),
                 };
                 match tx.try_send(unit) {
                     Ok(()) => {}
@@ -453,7 +462,7 @@ fn spawn_encode_thread(
         .expect("failed to start the screen encode thread")
 }
 
-fn wait_for_newest(shared: &Shared, earliest: Instant) -> Option<Instant> {
+fn wait_for_newest(shared: &Shared, earliest: Instant) -> Option<Captured> {
     let Ok(mut slot) = shared.pending.lock() else {
         return None;
     };
@@ -470,8 +479,8 @@ fn wait_for_newest(shared: &Shared, earliest: Instant) -> Option<Instant> {
             slot = next;
             continue;
         }
-        if let Some(captured_at) = slot.take() {
-            return Some(captured_at);
+        if let Some(captured) = slot.take() {
+            return Some(captured);
         }
         slot = shared
             .pending_cv

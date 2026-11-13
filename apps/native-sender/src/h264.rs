@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A frame older than this is already late for a live share. Sending it adds
 /// delay, and the viewer would rather get the next fresh one.
@@ -12,10 +12,28 @@ pub struct AccessUnit {
     /// When ScreenCaptureKit handed us the pixels. The publisher uses this to
     /// drop a frame that has already missed the live window.
     pub captured_at: Instant,
-    /// Capture time in microseconds, relative to the first frame.
+    /// When the pixels were captured, in microseconds since the Unix epoch.
     /// Empty when the producer has no capture clock and the publisher should
-    /// stamp frames from their index.
+    /// stamp the frame from the wall clock. Never a small value that starts at
+    /// zero: those are read as 1970 and the receiver drops the chain.
     pub timestamp_us: Option<i64>,
+}
+
+/// Microseconds since the Unix epoch. Never zero.
+pub fn unix_us_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as i64)
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Keeps capture timestamps strictly increasing without moving them off the
+/// clock they were stamped with.
+pub fn monotonic_unix_us(last: &mut i64, stamped: i64) -> i64 {
+    let timestamp = stamped.max(1).max(last.saturating_add(1));
+    *last = timestamp;
+    timestamp
 }
 
 /// Splits an Annex-B byte stream into access units.
@@ -336,5 +354,17 @@ mod tests {
         assert_eq!(starts, 3);
         assert!(length_prefixed_contains_idr(&payload, 4));
         assert!(!length_prefixed_contains_idr(&payload[..8], 4));
+    }
+
+    #[test]
+    fn capture_timestamps_stay_on_the_wall_clock_and_move_forward() {
+        use super::monotonic_unix_us;
+        let mut last = 0;
+        let first = monotonic_unix_us(&mut last, 1_700_000_000_000_000);
+        let same = monotonic_unix_us(&mut last, first);
+        let backwards = monotonic_unix_us(&mut last, first - 50);
+        assert!(first > 1_600_000_000_000_000);
+        assert_eq!(same, first + 1);
+        assert_eq!(backwards, same + 1);
     }
 }

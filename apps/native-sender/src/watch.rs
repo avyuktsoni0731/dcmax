@@ -1,11 +1,12 @@
 use crate::api;
 use crate::config::AppConfig;
 use anyhow::{anyhow, Context, Result};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::StreamExt;
 use livekit::prelude::*;
 use livekit::webrtc::prelude::VideoBuffer;
 use livekit::webrtc::video_stream::native::{NativeVideoStream, NativeVideoStreamOptions};
 use reqwest::Client;
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,10 +14,12 @@ use std::time::{Duration, Instant};
 use tokio::time::interval;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
 const FRAME_GAP: Duration = Duration::from_millis(34);
+const PLAYBACK_QUEUE: usize = 2;
+const DEFAULT_REFRESH: Duration = Duration::from_nanos(16_666_667);
 
 enum WatchEvent {
     Frame,
@@ -34,10 +37,12 @@ struct WatchApp {
     window: Option<Arc<Window>>,
     context: Option<softbuffer::Context<Arc<Window>>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
-    latest: Arc<Mutex<Option<Presented>>>,
+    queue: Arc<Mutex<VecDeque<Arc<Presented>>>>,
     stop: Arc<AtomicBool>,
     drawn_width: u32,
     drawn_height: u32,
+    next_present: Instant,
+    refresh: Duration,
 }
 
 pub fn run(config: &AppConfig) -> Result<()> {
@@ -45,7 +50,7 @@ pub fn run(config: &AppConfig) -> Result<()> {
         .enable_all()
         .build()
         .context("failed to start the watch runtime")?;
-    let latest = Arc::new(Mutex::new(None));
+    let queue = Arc::new(Mutex::new(VecDeque::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let event_loop = EventLoop::<WatchEvent>::with_user_event()
         .build()
@@ -53,10 +58,10 @@ pub fn run(config: &AppConfig) -> Result<()> {
     let proxy = event_loop.create_proxy();
 
     let task_config = config.clone();
-    let task_latest = Arc::clone(&latest);
+    let task_queue = Arc::clone(&queue);
     let task_stop = Arc::clone(&stop);
     runtime.spawn(async move {
-        if let Err(err) = session(task_config, task_latest, proxy, task_stop).await {
+        if let Err(err) = session(task_config, task_queue, proxy, task_stop).await {
             eprintln!("watch failed: {err:#}");
         }
     });
@@ -65,10 +70,12 @@ pub fn run(config: &AppConfig) -> Result<()> {
         window: None,
         context: None,
         surface: None,
-        latest,
+        queue,
         stop,
         drawn_width: 0,
         drawn_height: 0,
+        next_present: Instant::now(),
+        refresh: DEFAULT_REFRESH,
     };
     event_loop
         .run_app(&mut app)
@@ -78,7 +85,7 @@ pub fn run(config: &AppConfig) -> Result<()> {
 
 async fn session(
     config: AppConfig,
-    latest: Arc<Mutex<Option<Presented>>>,
+    queue: Arc<Mutex<VecDeque<Arc<Presented>>>>,
     proxy: EventLoopProxy<WatchEvent>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -147,12 +154,7 @@ async fn session(
                 }
             }
             frame = stream.next() => {
-                let Some(mut frame) = frame else { break };
-                let mut skipped = 0u32;
-                while let Some(Some(newer)) = stream.next().now_or_never() {
-                    frame = newer;
-                    skipped += 1;
-                }
+                let Some(frame) = frame else { break };
                 let arrival = Instant::now();
                 if received > 0 && arrival.duration_since(last_arrival) > FRAME_GAP {
                     gaps += 1;
@@ -162,8 +164,13 @@ async fn session(
                 received += 1;
                 window_received += 1;
                 if let Some(image) = presentable(&frame) {
-                    if latest.lock().map(|mut slot| *slot = Some(image)).is_ok() {
-                        let _ = skipped;
+                    let queued = queue.lock().map(|mut slot| {
+                        slot.push_back(Arc::new(image));
+                        while slot.len() > PLAYBACK_QUEUE {
+                            slot.pop_front();
+                        }
+                    });
+                    if queued.is_ok() {
                         let _ = proxy.send_event(WatchEvent::Frame);
                     }
                 }
@@ -309,6 +316,7 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
                 return;
             }
         }
+        self.refresh = refresh_interval(&window);
         self.context = Some(context);
         self.window = Some(window);
     }
@@ -316,12 +324,12 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WatchEvent) {
         match event {
             WatchEvent::Quit => event_loop.exit(),
-            WatchEvent::Frame => {
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
+            WatchEvent::Frame => self.schedule(event_loop),
         }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.schedule(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -331,9 +339,16 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                if let Err(err) = self.draw() {
-                    eprintln!("watch draw failed: {err}");
+                if Instant::now() < self.next_present {
+                    self.schedule(event_loop);
+                    return;
                 }
+                match self.draw() {
+                    Ok(true) => self.next_present = Instant::now() + self.refresh,
+                    Ok(false) => {}
+                    Err(err) => eprintln!("watch draw failed: {err}"),
+                }
+                self.schedule(event_loop);
             }
             _ => {}
         }
@@ -341,20 +356,41 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
 }
 
 impl WatchApp {
-    fn draw(&mut self) -> Result<()> {
+    fn schedule(&mut self, event_loop: &ActiveEventLoop) {
+        let pending = self
+            .queue
+            .lock()
+            .map(|slot| !slot.is_empty())
+            .unwrap_or(false);
+        if !pending {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let now = Instant::now();
+        if now >= self.next_present {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_present));
+    }
+
+    fn draw(&mut self) -> Result<bool> {
         let Some(window) = self.window.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(surface) = self.surface.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
         let image = self
-            .latest
+            .queue
             .lock()
             .map_err(|_| anyhow!("watch frame lock poisoned"))?
-            .clone();
+            .pop_front();
         let Some(image) = image else {
-            return Ok(());
+            return Ok(false);
         };
         if image.width != self.drawn_width || image.height != self.drawn_height {
             let _ =
@@ -373,11 +409,21 @@ impl WatchApp {
             .map_err(|err| anyhow!("failed to lock the watch surface: {err}"))?;
         let count = buffer.len().min(image.pixels.len());
         buffer[..count].copy_from_slice(&image.pixels[..count]);
+        window.pre_present_notify();
         buffer
             .present()
             .map_err(|err| anyhow!("failed to present the watch frame: {err}"))?;
-        Ok(())
+        Ok(true)
     }
+}
+
+fn refresh_interval(window: &Window) -> Duration {
+    let millihertz = window
+        .current_monitor()
+        .and_then(|monitor| monitor.refresh_rate_millihertz())
+        .filter(|rate| *rate > 0)
+        .unwrap_or(60_000);
+    Duration::from_nanos(1_000_000_000_000 / u64::from(millihertz))
 }
 
 #[cfg(test)]

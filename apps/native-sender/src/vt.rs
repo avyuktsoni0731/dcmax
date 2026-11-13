@@ -1,4 +1,6 @@
-use crate::h264::{length_prefixed_contains_idr, length_prefixed_to_annexb, AccessUnit};
+use crate::h264::{
+    length_prefixed_contains_idr, length_prefixed_to_annexb, monotonic_unix_us, AccessUnit,
+};
 use anyhow::{bail, Result};
 use core_foundation::array::CFArray;
 use core_foundation::base::{CFType, TCFType};
@@ -7,7 +9,7 @@ use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -109,10 +111,12 @@ struct OutputState {
     tx: mpsc::Sender<AccessUnit>,
     dropped: Arc<AtomicU64>,
     force_keyframe: Arc<AtomicBool>,
+    last_livekit_us: AtomicI64,
 }
 
 struct FrameMarker {
     captured_at: Instant,
+    livekit_us: i64,
     ticket: u64,
     flight: Arc<Flight>,
 }
@@ -207,6 +211,7 @@ impl VtSession {
             tx,
             dropped,
             force_keyframe,
+            last_livekit_us: AtomicI64::new(0),
         });
         let refcon = Box::into_raw(output);
         let spec = cf_dict(&[(
@@ -252,6 +257,7 @@ impl VtSession {
         &mut self,
         pixel_buffer: *mut c_void,
         timestamp_us: i64,
+        livekit_us: i64,
         force_keyframe: bool,
         bitrate_bps: u64,
         captured_at: Instant,
@@ -280,6 +286,7 @@ impl VtSession {
             .unwrap_or(std::ptr::null());
         let marker = Box::into_raw(Box::new(FrameMarker {
             captured_at,
+            livekit_us,
             ticket,
             flight: Arc::clone(flight),
         }));
@@ -439,12 +446,12 @@ unsafe extern "C" fn on_encoded_frame(
     _flags: u32,
     sample: *mut c_void,
 ) {
-    let captured_at = if source.is_null() {
-        Instant::now()
+    let (captured_at, livekit_us) = if source.is_null() {
+        (Instant::now(), 0)
     } else {
         let marker = unsafe { Box::from_raw(source.cast::<FrameMarker>()) };
         marker.flight.finish(marker.ticket);
-        marker.captured_at
+        (marker.captured_at, marker.livekit_us)
     };
     if refcon.is_null() || status != 0 || sample.is_null() {
         return;
@@ -454,6 +461,12 @@ unsafe extern "C" fn on_encoded_frame(
     };
     unit.captured_at = captured_at;
     let state = unsafe { &*refcon.cast::<OutputState>() };
+    if livekit_us > 0 {
+        let mut last = state.last_livekit_us.load(Ordering::Relaxed);
+        let stamped = monotonic_unix_us(&mut last, livekit_us);
+        state.last_livekit_us.store(stamped, Ordering::Relaxed);
+        unit.timestamp_us = Some(stamped);
+    }
     // Blocking here stalls the hardware encoder, and the encode thread then
     // produces nothing until the publish side catches up. A dropped delta
     // breaks the reference chain, so the next encode is a keyframe.
