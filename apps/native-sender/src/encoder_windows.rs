@@ -239,7 +239,7 @@ impl ScreenEncoder {
                 encoder
                     .shared
                     .bitrate_bps
-                    .store(bps.clamp(800_000, 50_000_000), Ordering::Relaxed);
+                    .store(bps.clamp(800_000, 100_000_000), Ordering::Relaxed);
             }
             Inner::Ffmpeg(encoder) => encoder.set_bitrate_bps(bps),
         }

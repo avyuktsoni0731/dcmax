@@ -196,6 +196,15 @@ pub async fn run(
                 window_latency_ms = 0.0;
             }
             _ = rate_tick.tick() => {
+                if picture.is_some() {
+                    // The watch is on the direct picture, and that path can
+                    // carry the bitrate from --bitrate-kbps. LiveKit's estimate
+                    // describes the cloud hop, which will not hold 50–100 Mbps,
+                    // so it must not walk the encoder down.
+                    rate_frames = 0;
+                    rate_send_drops = 0;
+                    continue;
+                }
                 let decision = governor.decide(rate_frames, rate_send_drops);
                 rate_frames = 0;
                 rate_send_drops = 0;

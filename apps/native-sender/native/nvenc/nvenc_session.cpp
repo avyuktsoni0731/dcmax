@@ -111,8 +111,8 @@ static int clamp_bitrate(int bitrate_bps) {
     if (bitrate_bps < 800000) {
         return 800000;
     }
-    if (bitrate_bps > 50000000) {
-        return 50000000;
+    if (bitrate_bps > 100000000) {
+        return 100000000;
     }
     return bitrate_bps;
 }

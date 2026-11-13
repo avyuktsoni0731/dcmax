@@ -30,6 +30,7 @@ pub struct CliArgs {
     pub width: u32,
     #[arg(long, default_value_t = 1080)]
     pub height: u32,
+    /// Encoder target in kilobits per second. 800 is the floor and 100000 is the ceiling.
     #[arg(long, default_value_t = 8000)]
     pub bitrate_kbps: u32,
     /// Join the room and show the shared screen. Does not capture.
@@ -146,8 +147,8 @@ impl AppConfig {
         if args.width % 2 != 0 || args.height % 2 != 0 {
             bail!("--width and --height must be even");
         }
-        if args.bitrate_kbps < 800 || args.bitrate_kbps > 50_000 {
-            bail!("--bitrate-kbps must be between 800 and 50000");
+        if args.bitrate_kbps < 800 || args.bitrate_kbps > 100_000 {
+            bail!("--bitrate-kbps must be between 800 and 100000");
         }
         let encoder_backend = match args.encoder.to_ascii_lowercase().as_str() {
             "fast" => EncoderBackend::Fast,

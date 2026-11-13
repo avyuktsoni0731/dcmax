@@ -103,7 +103,7 @@ impl ScreenEncoder {
     pub fn set_bitrate_bps(&self, bps: u64) {
         self.control
             .bitrate_bps
-            .store(bps.clamp(800_000, 50_000_000), Ordering::Release);
+            .store(bps.clamp(800_000, 100_000_000), Ordering::Release);
     }
 
     fn kill_child(&self) {
