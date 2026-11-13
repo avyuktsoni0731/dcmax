@@ -3,12 +3,14 @@ use crate::config::AppConfig;
 use crate::encoder::ScreenEncoder;
 use crate::h264::MAX_FRAME_AGE;
 use anyhow::{Context, Result};
-use livekit::options::{TrackPublishOptions, VideoCodec, VideoEncoderBackend, VideoEncoding};
+use livekit::options::{
+    DegradationPreference, TrackPublishOptions, VideoCodec, VideoEncoderBackend, VideoEncoding,
+};
 use livekit::prelude::*;
 use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
 use livekit::webrtc::video_source::{native::NativeVideoSource, RtcVideoSource, VideoResolution};
 use reqwest::Client;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
 pub async fn run(
@@ -51,6 +53,10 @@ pub async fn run(
             max_bitrate: u64::from(config.bitrate_kbps) * 1000,
             max_framerate: f64::from(config.target_fps),
         }),
+        // A screen-share default drops frames to keep resolution. That breaks
+        // a pre-encoded chain until the next keyframe, and the FFmpeg stand-in
+        // cannot make one on request.
+        degradation_preference: Some(DegradationPreference::MaintainFramerateAndResolution),
         ..Default::default()
     };
     room.local_participant()
@@ -98,8 +104,7 @@ pub async fn run(
     let mut rate_send_drops: u64 = 0;
     let mut late_drops: u64 = 0;
     let mut need_key = true;
-    let frame_duration_us = 1_000_000i64 / i64::from(config.target_fps.max(1));
-    let mut frame_index: i64 = 0;
+    let mut last_timestamp_us: i64 = 0;
 
     loop {
         tokio::select! {
@@ -189,12 +194,8 @@ pub async fn run(
                     }
                 }
                 let timestamp_us = match unit.timestamp_us {
-                    Some(timestamp) => timestamp,
-                    None => {
-                        let timestamp = frame_index.saturating_mul(frame_duration_us);
-                        frame_index += 1;
-                        timestamp
-                    }
+                    Some(timestamp) if timestamp > 0 => timestamp,
+                    _ => live_timestamp_us(&mut last_timestamp_us),
                 };
                 let frame = EncodedVideoFrame {
                     codec: EncodedVideoCodec::H264,
@@ -238,6 +239,19 @@ enum Admit {
     Send,
     TooLate,
     WaitForKey,
+}
+
+/// FFmpeg's pipe has no capture clock. A counter from zero is not a
+/// timestamp: LiveKit reads 0 as "missing" and the following small values
+/// as 1970, then drops the chain and asks for a keyframe on every frame.
+fn live_timestamp_us(last_us: &mut i64) -> i64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as i64)
+        .unwrap_or(1);
+    let timestamp = now.max(last_us.saturating_add(1)).max(1);
+    *last_us = timestamp;
+    timestamp
 }
 
 /// The first frame on the wire is a keyframe. A frame that has already missed
@@ -371,7 +385,7 @@ fn ease_down(applied: u64, estimate: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{admit, Admit, RateGovernor};
+    use super::{admit, live_timestamp_us, Admit, RateGovernor};
     use std::time::Duration;
 
     #[test]
@@ -486,5 +500,14 @@ mod tests {
             let decision = governor.decide(57, 0);
             assert_eq!(decision.bps, settled);
         }
+    }
+
+    #[test]
+    fn a_missing_capture_clock_uses_the_wall_clock() {
+        let mut last = 0;
+        let first = live_timestamp_us(&mut last);
+        let second = live_timestamp_us(&mut last);
+        assert!(first > 1_577_836_800_000_000, "{first}");
+        assert!(second > first);
     }
 }

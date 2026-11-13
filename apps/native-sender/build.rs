@@ -2,7 +2,24 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
+        cc::Build::new()
+            .cpp(true)
+            .file("native/nvenc/nvenc_session.cpp")
+            .include("native/nvenc")
+            .flag("/EHsc")
+            .flag("/std:c++17")
+            .compile("nvenc_session");
+        println!("cargo:rustc-link-lib=d3d11");
+        println!("cargo:rustc-link-lib=dxgi");
+        println!("cargo:rustc-link-lib=ole32");
+        println!("cargo:rerun-if-changed=native/nvenc/nvenc_session.cpp");
+        println!("cargo:rerun-if-changed=native/nvenc/nvenc_session.h");
+        println!("cargo:rerun-if-changed=native/nvenc/nvEncodeAPI.h");
+        return;
+    }
+    if target_os != "macos" {
         return;
     }
     // LiveKit's WebRTC static library registers NSString categories. Without

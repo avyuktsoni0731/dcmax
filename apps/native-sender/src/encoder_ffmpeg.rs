@@ -3,8 +3,10 @@ use crate::h264::{AccessUnit, AnnexBSplitter};
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,8 +26,19 @@ impl CodecKind {
     }
 }
 
+struct Control {
+    stop: AtomicBool,
+    restart: AtomicBool,
+    bitrate_bps: AtomicU64,
+    /// Wall-clock millis when the current process was spawned. 0 if none.
+    born_at_ms: AtomicU64,
+    fatal: Mutex<Option<String>>,
+    child: Mutex<Option<Child>>,
+}
+
 pub struct ScreenEncoder {
-    child: Child,
+    control: Arc<Control>,
+    worker: Option<JoinHandle<()>>,
     pub units: mpsc::Receiver<AccessUnit>,
     stderr_tail: Arc<Mutex<String>>,
     pub capture_backend: String,
@@ -64,30 +77,42 @@ impl ScreenEncoder {
             .unwrap_or_default()
     }
 
-    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        Ok(self.child.try_wait()?)
-    }
-
     pub fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-
-    pub fn fatal_error(&mut self) -> Result<Option<String>> {
-        match self.try_wait()? {
-            Some(status) => Ok(Some(format!(
-                "ffmpeg exited: {status} {}",
-                self.stderr_tail()
-            ))),
-            None => Ok(None),
+        self.control.stop.store(true, Ordering::Release);
+        self.kill_child();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 
-    /// The FFmpeg process cannot emit an IDR on demand. Windows still uses
-    /// this stand-in until Graphics Capture and NVENC replace it.
+    pub fn fatal_error(&mut self) -> Result<Option<String>> {
+        Ok(self
+            .control
+            .fatal
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone()))
+    }
+
+    /// A new ffmpeg process does start on an IDR, which is what a keyframe
+    /// request wants. Killing the capture to get that IDR also drops the
+    /// picture for the whole startup, so this stand-in does not do it.
+    /// In-process NVENC has to answer the request without a new process.
     pub fn request_keyframe(&self) {}
 
-    pub fn set_bitrate_bps(&self, _bps: u64) {}
+    pub fn set_bitrate_bps(&self, bps: u64) {
+        self.control
+            .bitrate_bps
+            .store(bps.clamp(800_000, 50_000_000), Ordering::Release);
+    }
+
+    fn kill_child(&self) {
+        if let Ok(mut slot) = self.control.child.lock() {
+            if let Some(child) = slot.as_mut() {
+                let _ = child.kill();
+            }
+        }
+    }
 
     pub fn queue_drops(&self) -> u64 {
         0
@@ -132,6 +157,14 @@ fn select_codec(config: &AppConfig, encoders: &str) -> CodecKind {
     preferred
 }
 
+struct EncoderPlan {
+    codec: CodecKind,
+    input_args: Vec<String>,
+    scale: String,
+    gop: String,
+    fps: String,
+}
+
 fn spawn_encoder(
     config: &AppConfig,
     codec: CodecKind,
@@ -147,29 +180,174 @@ fn spawn_encoder(
         );
     }
 
-    let gop = config.gop_frames().to_string();
-    let fps = config.target_fps.to_string();
-    let bitrate = format!("{}k", config.bitrate_kbps);
-    let maxrate = format!("{}k", config.bitrate_kbps.saturating_mul(5) / 4);
-    let bufsize = bitrate.clone();
-    let scale = format!(
-        "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,fps={},format=yuv420p",
-        config.width, config.height, config.width, config.height, config.target_fps
-    );
+    let plan = EncoderPlan {
+        codec,
+        input_args: screen_input_args(config)?,
+        scale: format!(
+            "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,fps={},format=yuv420p",
+            config.width, config.height, config.width, config.height, config.target_fps
+        ),
+        gop: config.gop_frames().to_string(),
+        fps: config.target_fps.to_string(),
+    };
+    let bitrate_bps = u64::from(config.bitrate_kbps) * 1000;
+    let control = Arc::new(Control {
+        stop: AtomicBool::new(false),
+        restart: AtomicBool::new(false),
+        bitrate_bps: AtomicU64::new(bitrate_bps),
+        born_at_ms: AtomicU64::new(0),
+        fatal: Mutex::new(None),
+        child: Mutex::new(None),
+    });
+    let stderr_tail = Arc::new(Mutex::new(String::new()));
+    let (tx, rx) = mpsc::channel(2);
+    let worker_control = Arc::clone(&control);
+    let worker_tail = Arc::clone(&stderr_tail);
+    let worker = thread::spawn(move || run_ffmpeg(plan, worker_control, worker_tail, tx));
 
+    Ok(ScreenEncoder {
+        control,
+        worker: Some(worker),
+        units: rx,
+        stderr_tail,
+        capture_backend: capture_backend.to_string(),
+        encoder_backend: codec.ffmpeg_name().to_string(),
+        width: config.width,
+        height: config.height,
+    })
+}
+
+fn run_ffmpeg(
+    plan: EncoderPlan,
+    control: Arc<Control>,
+    stderr_tail: Arc<Mutex<String>>,
+    tx: mpsc::Sender<AccessUnit>,
+) {
+    loop {
+        if control.stop.load(Ordering::Acquire) {
+            break;
+        }
+        let bitrate_bps = control.bitrate_bps.load(Ordering::Acquire).max(800_000);
+        let mut child = match ffmpeg_command(&plan, bitrate_bps).spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                remember_fatal(&control, format!("failed to start ffmpeg: {err}"));
+                break;
+            }
+        };
+        let Some(stdout) = child.stdout.take() else {
+            remember_fatal(&control, "ffmpeg stdout was not piped".to_string());
+            break;
+        };
+        let Some(stderr) = child.stderr.take() else {
+            remember_fatal(&control, "ffmpeg stderr was not piped".to_string());
+            break;
+        };
+        eprintln!(
+            "ffmpeg started: {} at {} kbps",
+            plan.codec.ffmpeg_name(),
+            bitrate_bps / 1000
+        );
+        control.born_at_ms.store(wall_ms(), Ordering::Release);
+        // This process's opening keyframe answers whatever was pending.
+        control.restart.store(false, Ordering::Release);
+        {
+            let Ok(mut slot) = control.child.lock() else {
+                break;
+            };
+            *slot = Some(child);
+        }
+        let tail = Arc::clone(&stderr_tail);
+        thread::spawn(move || collect_stderr(stderr, tail));
+        if !pump_access_units(stdout, &tx) {
+            break;
+        }
+        if let Ok(mut slot) = control.child.lock() {
+            if let Some(mut child) = slot.take() {
+                let _ = child.wait();
+            }
+        }
+        control.born_at_ms.store(0, Ordering::Release);
+        if control.stop.load(Ordering::Acquire) || tx.is_closed() {
+            break;
+        }
+        if !control.restart.swap(false, Ordering::AcqRel) {
+            let tail = stderr_tail
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            remember_fatal(&control, format!("ffmpeg exited. {}", tail.trim()));
+            break;
+        }
+        eprintln!("ffmpeg restarting for a keyframe or a new bitrate");
+    }
+}
+
+fn pump_access_units(stdout: impl Read, tx: &mpsc::Sender<AccessUnit>) -> bool {
+    let mut reader = stdout;
+    let mut splitter = AnnexBSplitter::default();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(size) => {
+                for unit in splitter.push(&chunk[..size]) {
+                    if tx.blocking_send(unit).is_err() {
+                        return false;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    for unit in splitter.finish() {
+        if tx.blocking_send(unit).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+fn collect_stderr(stderr: impl Read, tail: Arc<Mutex<String>>) {
+    let reader = BufReader::new(stderr);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        eprintln!("[ffmpeg] {line}");
+        if let Ok(mut guard) = tail.lock() {
+            if !guard.is_empty() {
+                guard.push('\n');
+            }
+            guard.push_str(&line);
+            if guard.len() > 4000 {
+                let keep_from = guard.len().saturating_sub(3000);
+                *guard = guard[keep_from..].to_string();
+            }
+        }
+    }
+}
+
+fn remember_fatal(control: &Control, message: String) {
+    eprintln!("{message}");
+    if let Ok(mut slot) = control.fatal.lock() {
+        *slot = Some(message);
+    }
+}
+
+fn ffmpeg_command(plan: &EncoderPlan, bitrate_bps: u64) -> Command {
+    let bitrate = format!("{}k", bitrate_bps / 1000);
+    let maxrate = format!("{}k", bitrate_bps.saturating_mul(5) / 4 / 1000);
     let mut command = Command::new("ffmpeg");
     command
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("warning")
-        .args(screen_input_args(config)?)
+        .args(&plan.input_args)
         .arg("-vf")
-        .arg(scale)
+        .arg(&plan.scale)
         .arg("-an")
         .arg("-c:v")
-        .arg(codec.ffmpeg_name());
-
-    match codec {
+        .arg(plan.codec.ffmpeg_name());
+    match plan.codec {
         CodecKind::Libx264 => {
             command
                 .arg("-preset")
@@ -179,9 +357,9 @@ fn spawn_encoder(
                 .arg("-profile:v")
                 .arg("high")
                 .arg("-g")
-                .arg(&gop)
+                .arg(&plan.gop)
                 .arg("-keyint_min")
-                .arg(&gop)
+                .arg(&plan.gop)
                 .arg("-sc_threshold")
                 .arg("0")
                 .arg("-bf")
@@ -191,7 +369,7 @@ fn spawn_encoder(
                 .arg("-maxrate")
                 .arg(&maxrate)
                 .arg("-bufsize")
-                .arg(&bufsize)
+                .arg(&bitrate)
                 .arg("-x264-params")
                 .arg("aud=1:repeat-headers=1");
         }
@@ -206,7 +384,7 @@ fn spawn_encoder(
                 .arg("-profile:v")
                 .arg("high")
                 .arg("-g")
-                .arg(&gop)
+                .arg(&plan.gop)
                 .arg("-bf")
                 .arg("0")
                 .arg("-b:v")
@@ -214,7 +392,7 @@ fn spawn_encoder(
                 .arg("-maxrate")
                 .arg(&bitrate)
                 .arg("-bufsize")
-                .arg(&bufsize);
+                .arg(&bitrate);
         }
         CodecKind::VideoToolbox => {
             command
@@ -225,19 +403,18 @@ fn spawn_encoder(
                 .arg("-profile:v")
                 .arg("high")
                 .arg("-g")
-                .arg(&gop)
+                .arg(&plan.gop)
                 .arg("-bf")
                 .arg("0")
                 .arg("-b:v")
                 .arg(&bitrate);
         }
     }
-
     command
         .arg("-pix_fmt")
         .arg("yuv420p")
         .arg("-r")
-        .arg(&fps)
+        .arg(&plan.fps)
         .arg("-fps_mode")
         .arg("cfr")
         .arg("-f")
@@ -246,66 +423,14 @@ fn spawn_encoder(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command
+}
 
-    let mut child = command.spawn().context(
-        "failed to start ffmpeg. Install ffmpeg and grant Screen Recording permission on macOS.",
-    )?;
-    let stdout = child.stdout.take().context("ffmpeg stdout was not piped")?;
-    let stderr = child.stderr.take().context("ffmpeg stderr was not piped")?;
-    let stderr_tail = Arc::new(Mutex::new(String::new()));
-    let tail = Arc::clone(&stderr_tail);
-    thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            eprintln!("[ffmpeg] {line}");
-            if let Ok(mut guard) = tail.lock() {
-                if !guard.is_empty() {
-                    guard.push('\n');
-                }
-                guard.push_str(&line);
-                if guard.len() > 4000 {
-                    let keep_from = guard.len().saturating_sub(3000);
-                    *guard = guard[keep_from..].to_string();
-                }
-            }
-        }
-    });
-
-    let (tx, rx) = mpsc::channel(2);
-    thread::spawn(move || {
-        let mut reader = stdout;
-        let mut splitter = AnnexBSplitter::default();
-        let mut chunk = [0u8; 64 * 1024];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(size) => {
-                    for unit in splitter.push(&chunk[..size]) {
-                        if tx.blocking_send(unit).is_err() {
-                            return;
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        for unit in splitter.finish() {
-            if tx.blocking_send(unit).is_err() {
-                return;
-            }
-        }
-    });
-
-    Ok(ScreenEncoder {
-        child,
-        units: rx,
-        stderr_tail,
-        capture_backend: capture_backend.to_string(),
-        encoder_backend: codec.ffmpeg_name().to_string(),
-        width: config.width,
-        height: config.height,
-    })
+fn wall_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn screen_input_name() -> &'static str {
