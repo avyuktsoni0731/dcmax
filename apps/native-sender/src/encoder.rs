@@ -297,8 +297,12 @@ fn screen_input_args(config: &AppConfig) -> Result<Vec<String>> {
         return Ok(vec![
             "-f".to_string(),
             "avfoundation".to_string(),
+            "-pixel_format".to_string(),
+            "nv12".to_string(),
             "-framerate".to_string(),
             fps,
+            "-use_wallclock_as_timestamps".to_string(),
+            "1".to_string(),
             "-capture_cursor".to_string(),
             "1".to_string(),
             "-i".to_string(),

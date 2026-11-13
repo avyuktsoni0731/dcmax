@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
     )
     .await?;
     println!("token fetch: ok ({})", token.url);
-    post_state(&client, &config, "starting", "screen", None).await;
+    post_state(&client, &config, "starting", "screen", "pending", "pending", None).await;
 
     if config.dry_run {
         println!("dry-run: token ok, skipping capture and publish");
@@ -55,6 +55,8 @@ async fn main() -> Result<()> {
             &config,
             "stopped",
             "screen",
+            "pending",
+            "pending",
             Some("dry-run shutdown"),
         )
         .await;
@@ -69,6 +71,8 @@ async fn main() -> Result<()> {
                 &config,
                 "error",
                 "screen",
+                "pending",
+                "pending",
                 Some("encoder failed to start"),
             )
             .await;
@@ -80,11 +84,22 @@ async fn main() -> Result<()> {
         publish::run(&client, &config, &token.token, &token.url, &mut screen).await;
     let tail = screen.stderr_tail();
     let label = screen.label();
+    let capture_backend = screen.capture_backend.clone();
+    let encoder_backend = screen.encoder_backend.clone();
     screen.stop();
 
     match publish_result {
         Ok(()) => {
-            post_state(&client, &config, "stopped", &label, Some("shutdown")).await;
+            post_state(
+                &client,
+                &config,
+                "stopped",
+                &label,
+                &capture_backend,
+                &encoder_backend,
+                Some("shutdown"),
+            )
+            .await;
             Ok(())
         }
         Err(err) => {
@@ -93,7 +108,16 @@ async fn main() -> Result<()> {
             } else {
                 format!("publish failed: {}", tail.trim())
             };
-            post_state(&client, &config, "error", &label, Some(&message)).await;
+            post_state(
+                &client,
+                &config,
+                "error",
+                &label,
+                &capture_backend,
+                &encoder_backend,
+                Some(&message),
+            )
+            .await;
             Err(err)
         }
     }
@@ -121,10 +145,10 @@ async fn post_state(
     config: &AppConfig,
     state: &str,
     backend: &str,
+    capture_backend: &str,
+    encoder_backend: &str,
     message: Option<&str>,
 ) {
-    let capture = format!("{:?}", config.capture_backend).to_ascii_lowercase();
-    let encoder = format!("{:?}", config.encoder_backend).to_ascii_lowercase();
     let clipped;
     let message = match message {
         Some(text) => {
@@ -140,8 +164,8 @@ async fn post_state(
         &config.identity,
         state,
         backend,
-        &capture,
-        &encoder,
+        capture_backend,
+        encoder_backend,
         message,
     )
     .await

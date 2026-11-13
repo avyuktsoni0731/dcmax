@@ -51,6 +51,7 @@ struct NativePublisherEventRequest<'a> {
     capture_backend: &'a str,
     #[serde(rename = "encoderBackend")]
     encoder_backend: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<&'a str>,
 }
 

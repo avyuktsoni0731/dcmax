@@ -180,6 +180,7 @@ fn find_start(buf: &[u8], from: usize) -> Option<(usize, usize)> {
     None
 }
 
+#[cfg(test)]
 fn nal(header: u8, body: &[u8]) -> Vec<u8> {
     let mut bytes = vec![0, 0, 0, 1, header];
     bytes.extend_from_slice(body);
