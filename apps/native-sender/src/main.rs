@@ -1,98 +1,41 @@
 mod api;
-mod capture;
 mod config;
-mod platform;
-mod publisher;
+mod encoder;
+mod h264;
+mod publish;
 
 use anyhow::Result;
 use clap::Parser;
-use capture::CaptureTuning;
 use config::{AppConfig, CliArgs, TargetPlatform};
-use platform::CaptureBackend;
-use publisher::PublisherState;
 use reqwest::Client;
-use std::io::{BufRead, BufReader};
-use std::process::Child;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use tokio::time::{interval, Duration};
-
-async fn post_native_report(client: &Client, config: &AppConfig, report: &capture::PipelineReport) -> Result<()> {
-    api::report_native_session(
-        client,
-        &config.api_base_url,
-        &config.room_name,
-        &config.identity,
-        &report.backend,
-        report.achieved_fps,
-        report.produced_frames,
-        report.dropped_frames,
-        report.avg_ingest_latency_ms,
-        report.avg_payload_bytes,
-    )
-    .await
-}
-
-async fn post_publisher_event(
-    client: &Client,
-    config: &AppConfig,
-    state: PublisherState,
-    backend: &str,
-    message: Option<&str>,
-) -> Result<()> {
-    let capture_backend = format!("{:?}", config.capture_backend).to_ascii_lowercase();
-    let encoder_backend = format!("{:?}", config.encoder_backend).to_ascii_lowercase();
-    api::report_native_publisher_event(
-        client,
-        &config.api_base_url,
-        &config.room_name,
-        &config.identity,
-        state.as_str(),
-        backend,
-        &capture_backend,
-        &encoder_backend,
-        message,
-    )
-    .await
-}
-
-fn stop_publisher_child(child: &mut Option<Child>) {
-    if let Some(proc) = child.as_mut() {
-        let _ = proc.kill();
-        let _ = proc.wait();
-    }
-    *child = None;
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let args = CliArgs::parse();
     let config = AppConfig::from_env(&args)?;
-    let client = Client::new();
+    ensure_host_platform(&config)?;
 
+    let client = Client::new();
     println!(
-        "native-sender starting: room='{}' identity='{}' platform='{:?}' dry_run={} target_fps={} probe_seconds={} heartbeat_seconds={} capture={:?} encoder={:?}",
+        "native-sender starting: room='{}' identity='{}' platform='{:?}' dry_run={} {}x{} @ {}fps bitrate={}kbps encoder={:?} capture_flag={:?}",
         config.room_name,
         config.identity,
         config.platform,
         config.dry_run,
+        config.width,
+        config.height,
         config.target_fps,
-        config.probe_seconds,
-        config.heartbeat_seconds,
-        config.capture_backend,
-        config.encoder_backend
+        config.bitrate_kbps,
+        config.encoder_backend,
+        config.capture_backend
     );
-    let tuning = CaptureTuning {
-        target_fps: config.target_fps,
-        probe_seconds: config.probe_seconds,
-        encoder_backend: config.encoder_backend,
-        capture_backend: config.capture_backend,
-    };
+    if config.probe_seconds > 0 {
+        println!("capture probe window is not used; video publishes until Ctrl+C");
+    }
 
     api::health_check(&client, &config.api_base_url).await?;
     println!("api health check: ok");
-
     let token = api::fetch_token(
         &client,
         &config.api_base_url,
@@ -101,256 +44,120 @@ async fn main() -> Result<()> {
         &config.client_type,
     )
     .await?;
-    println!("token fetch: ok");
+    println!("token fetch: ok ({})", token.url);
+    post_state(&client, &config, "starting", "screen", None).await;
 
-    #[cfg(target_os = "windows")]
-    {
-        let backend = platform::windows::WindowsCaptureBackend;
-        if config.platform == TargetPlatform::MacOs {
-            anyhow::bail!("requested macos backend on windows host");
-        }
-        println!("selected backend: {}", backend.name());
-        println!("hint: {}", backend.diagnostics_hint());
-        let _ = post_publisher_event(&client, &config, PublisherState::Starting, backend.name(), None).await;
-        if let Err(err) = publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await {
-            let _ = post_publisher_event(
-                &client,
-                &config,
-                PublisherState::Error,
-                backend.name(),
-                Some("publisher bootstrap failed"),
-            )
-            .await;
-            anyhow::bail!("publisher bootstrap failed: {}", err);
-        }
-        let mut ffmpeg_publisher: Option<Child> = if config.dry_run {
-            None
-        } else {
-            match publisher::start_ffmpeg_whip_publisher(
-                backend.name(),
-                &token,
-                config.target_fps,
-                config.capture_backend,
-                config.encoder_backend,
-            ) {
-                Ok(child) => {
-                    println!("ffmpeg WHIP publisher process started");
-                    Some(child)
-                }
-                Err(err) => {
-                    let _ = post_publisher_event(
-                        &client,
-                        &config,
-                        PublisherState::Error,
-                        backend.name(),
-                        Some("ffmpeg WHIP publisher failed to start"),
-                    )
-                    .await;
-                    anyhow::bail!("ffmpeg WHIP publisher failed to start: {}", err);
-                }
-            }
-        };
-        let ffmpeg_stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        if let Some(proc) = ffmpeg_publisher.as_mut() {
-            if let Some(stderr) = proc.stderr.take() {
-                let stderr_tail = Arc::clone(&ffmpeg_stderr_tail);
-                thread::spawn(move || {
-                    let reader = BufReader::new(stderr);
-                    for line in reader.lines() {
-                        let line = match line {
-                            Ok(value) => value,
-                            Err(_) => break,
-                        };
-                        eprintln!("[ffmpeg-whip] {}", line);
-                        if let Ok(mut guard) = stderr_tail.lock() {
-                            if !guard.is_empty() {
-                                guard.push('\n');
-                            }
-                            guard.push_str(&line);
-                            if guard.len() > 4000 {
-                                let keep_from = guard.len().saturating_sub(3000);
-                                *guard = guard[keep_from..].to_string();
-                            }
-                        }
-                    }
-                });
-            }
-        }
-        let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
-        if let Some(report) = report {
-            let last_report = report;
-            post_native_report(&client, &config, &last_report).await?;
-            println!("native session report: posted");
-            let _ = post_publisher_event(&client, &config, PublisherState::Running, backend.name(), None).await;
-            if !config.dry_run {
-                println!(
-                    "native session heartbeat started (every {}s). Press Ctrl+C to stop.",
-                    config.heartbeat_seconds
-                );
-                let mut ticker = interval(Duration::from_secs(config.heartbeat_seconds));
-                loop {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            println!("shutdown signal received, stopping native sender heartbeat");
-                            stop_publisher_child(&mut ffmpeg_publisher);
-                            let _ = post_publisher_event(
-                                &client,
-                                &config,
-                                PublisherState::Stopped,
-                                backend.name(),
-                                Some("shutdown signal received"),
-                            )
-                            .await;
-                            break;
-                        }
-                        _ = ticker.tick() => {
-                            if let Some(proc) = ffmpeg_publisher.as_mut() {
-                                match proc.try_wait() {
-                                    Ok(Some(status)) => {
-                                        let mut msg = format!("ffmpeg WHIP publisher exited: {}", status);
-                                        let stderr_tail = ffmpeg_stderr_tail
-                                            .lock()
-                                            .map(|s| s.clone())
-                                            .unwrap_or_default();
-                                        if !stderr_tail.trim().is_empty() {
-                                            msg = format!("{} :: {}", msg, stderr_tail.trim());
-                                            if stderr_tail.contains("Invalid answer: OK") {
-                                                msg = format!(
-                                                    "{} :: hint: LiveKit signaling URL is not a WHIP ingest endpoint. Set LIVEKIT_WHIP_URL (and optionally LIVEKIT_WHIP_BEARER_TOKEN) for a valid ingest target.",
-                                                    msg
-                                                );
-                                            }
-                                        }
-                                        let _ = post_publisher_event(
-                                            &client,
-                                            &config,
-                                            PublisherState::Error,
-                                            backend.name(),
-                                            Some("ffmpeg WHIP publisher exited"),
-                                        )
-                                        .await;
-                                        anyhow::bail!("{}", msg);
-                                    }
-                                    Ok(None) => {}
-                                    Err(err) => {
-                                        eprintln!("ffmpeg WHIP publisher status check failed: {}", err);
-                                    }
-                                }
-                            }
-
-                            if let Err(err) = post_native_report(&client, &config, &last_report).await {
-                                eprintln!("native session heartbeat post failed: {}", err);
-                                let _ = post_publisher_event(
-                                    &client,
-                                    &config,
-                                    PublisherState::Error,
-                                    backend.name(),
-                                    Some("native session heartbeat post failed"),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        stop_publisher_child(&mut ffmpeg_publisher);
+    if config.dry_run {
+        println!("dry-run: token ok, skipping capture and publish");
+        tokio::signal::ctrl_c().await?;
+        post_state(
+            &client,
+            &config,
+            "stopped",
+            "screen",
+            Some("dry-run shutdown"),
+        )
+        .await;
         return Ok(());
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let backend = platform::macos::MacOsCaptureBackend;
-        if config.platform == TargetPlatform::Windows {
-            anyhow::bail!("requested windows backend on macos host");
-        }
-        println!("selected backend: {}", backend.name());
-        println!("hint: {}", backend.diagnostics_hint());
-        let _ = post_publisher_event(&client, &config, PublisherState::Starting, backend.name(), None).await;
-        if let Err(err) = publisher::publish_bootstrap(backend.name(), &token, config.dry_run).await {
-            let _ = post_publisher_event(
+    let mut screen = match encoder::ScreenEncoder::start(&config) {
+        Ok(screen) => screen,
+        Err(err) => {
+            post_state(
                 &client,
                 &config,
-                PublisherState::Error,
-                backend.name(),
-                Some("publisher bootstrap failed"),
+                "error",
+                "screen",
+                Some("encoder failed to start"),
             )
             .await;
-            anyhow::bail!("publisher bootstrap failed: {}", err);
+            return Err(err);
         }
-        let report = backend.bootstrap_capture_pipeline(config.dry_run, tuning)?;
-        if let Some(report) = report {
-            post_native_report(&client, &config, &report).await?;
-            println!("native session report: posted");
-            let _ = post_publisher_event(&client, &config, PublisherState::Running, backend.name(), None).await;
-            if !config.dry_run {
-                println!(
-                    "native session heartbeat started (every {}s). Press Ctrl+C to stop.",
-                    config.heartbeat_seconds
-                );
-                let mut ticker = interval(Duration::from_secs(config.heartbeat_seconds));
-                let heartbeat_tuning = CaptureTuning {
-                    target_fps: config.target_fps,
-                    probe_seconds: 1,
-                    encoder_backend: config.encoder_backend,
-                    capture_backend: config.capture_backend,
-                };
-                loop {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            println!("shutdown signal received, stopping native sender heartbeat");
-                            let _ = post_publisher_event(
-                                &client,
-                                &config,
-                                PublisherState::Stopped,
-                                backend.name(),
-                                Some("shutdown signal received"),
-                            )
-                            .await;
-                            break;
-                        }
-                        _ = ticker.tick() => {
-                            match backend.bootstrap_capture_pipeline(false, heartbeat_tuning) {
-                                Ok(Some(live_report)) => {
-                                    if let Err(err) = post_native_report(&client, &config, &live_report).await {
-                                        eprintln!("native session heartbeat post failed: {}", err);
-                                        let _ = post_publisher_event(
-                                            &client,
-                                            &config,
-                                            PublisherState::Error,
-                                            backend.name(),
-                                            Some("native session heartbeat post failed"),
-                                        )
-                                        .await;
-                                    }
-                                }
-                                Ok(None) => {
-                                    // no-op
-                                }
-                                Err(err) => {
-                                    eprintln!("native session heartbeat sampling failed: {}", err);
-                                    let _ = post_publisher_event(
-                                        &client,
-                                        &config,
-                                        PublisherState::Error,
-                                        backend.name(),
-                                        Some("native session heartbeat sampling failed"),
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return Ok(());
-    }
+    };
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let _ = config;
-        anyhow::bail!("native-sender currently supports windows and macos only");
+    let publish_result =
+        publish::run(&client, &config, &token.token, &token.url, &mut screen).await;
+    let tail = screen.stderr_tail();
+    let label = screen.label();
+    screen.stop();
+
+    match publish_result {
+        Ok(()) => {
+            post_state(&client, &config, "stopped", &label, Some("shutdown")).await;
+            Ok(())
+        }
+        Err(err) => {
+            let message = if tail.trim().is_empty() {
+                "publish failed".to_string()
+            } else {
+                format!("publish failed: {}", tail.trim())
+            };
+            post_state(&client, &config, "error", &label, Some(&message)).await;
+            Err(err)
+        }
     }
 }
 
+fn ensure_host_platform(config: &AppConfig) -> Result<()> {
+    match config.platform {
+        TargetPlatform::Windows if !cfg!(target_os = "windows") => {
+            anyhow::bail!("requested windows backend on this host");
+        }
+        TargetPlatform::MacOs if !cfg!(target_os = "macos") => {
+            anyhow::bail!("requested macos backend on this host");
+        }
+        TargetPlatform::Auto | TargetPlatform::Windows | TargetPlatform::MacOs => {
+            if !cfg!(any(target_os = "windows", target_os = "macos")) {
+                anyhow::bail!("native-sender currently supports windows and macos only");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn post_state(
+    client: &Client,
+    config: &AppConfig,
+    state: &str,
+    backend: &str,
+    message: Option<&str>,
+) {
+    let capture = format!("{:?}", config.capture_backend).to_ascii_lowercase();
+    let encoder = format!("{:?}", config.encoder_backend).to_ascii_lowercase();
+    let clipped;
+    let message = match message {
+        Some(text) => {
+            clipped = clip_message(text);
+            Some(clipped.as_str())
+        }
+        None => None,
+    };
+    if let Err(err) = api::report_native_publisher_event(
+        client,
+        &config.api_base_url,
+        &config.room_name,
+        &config.identity,
+        state,
+        backend,
+        &capture,
+        &encoder,
+        message,
+    )
+    .await
+    {
+        eprintln!("publisher state '{state}' was not reported: {err}");
+    }
+}
+
+fn clip_message(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() <= 240 {
+        return trimmed.to_string();
+    }
+    let mut end = 240;
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    trimmed[..end].to_string()
+}

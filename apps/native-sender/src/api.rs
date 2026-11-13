@@ -63,7 +63,10 @@ pub async fn health_check(client: &Client, api_base_url: &str) -> Result<()> {
         .context("health request failed")?;
 
     if !res.status().is_success() {
-        anyhow::bail!("health request returned non-success status {}", res.status());
+        anyhow::bail!(
+            "health request returned non-success status {}",
+            res.status()
+        );
     }
 
     let payload = res
@@ -161,7 +164,10 @@ pub async fn report_native_publisher_event(
     encoder_backend: &str,
     message: Option<&str>,
 ) -> Result<()> {
-    let endpoint = format!("{}/native/publisher/events", api_base_url.trim_end_matches('/'));
+    let endpoint = format!(
+        "{}/native/publisher/events",
+        api_base_url.trim_end_matches('/')
+    );
     let req = NativePublisherEventRequest {
         room_name,
         identity,
@@ -186,4 +192,3 @@ pub async fn report_native_publisher_event(
     }
     Ok(())
 }
-
