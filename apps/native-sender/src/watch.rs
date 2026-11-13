@@ -23,9 +23,9 @@ use winit::window::{Window, WindowId};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 const FRAME_GAP: Duration = Duration::from_millis(34);
-const CONTENT_FRAME: Duration = Duration::from_nanos(16_666_667);
-const PLAYBACK_LIMIT: usize = 5;
-const DEFAULT_REFRESH: Duration = CONTENT_FRAME;
+const PLAYBACK_LIMIT: usize = 12;
+const MIRROR_DELAY: Duration = Duration::from_millis(50);
+const MIRROR_LIMIT: Duration = Duration::from_millis(100);
 
 enum WatchEvent {
     Frame,
@@ -48,6 +48,67 @@ enum Picture {
         buffer: CVPixelBuffer,
         full_range: bool,
     },
+}
+
+struct Queued {
+    picture: Picture,
+    due: Instant,
+}
+
+/// Plays the sender's capture clock on this machine's refresh.
+///
+/// A frame is shown when its own capture time comes due. The sender's refresh
+/// rate is never a setting here: 60 Hz and 180 Hz both arrive as timestamps.
+struct MirrorClock {
+    origin_sender: i64,
+    origin_local: Instant,
+    delay: Duration,
+    started: bool,
+}
+
+impl MirrorClock {
+    fn new() -> Self {
+        Self {
+            origin_sender: 0,
+            origin_local: Instant::now(),
+            delay: MIRROR_DELAY,
+            started: false,
+        }
+    }
+
+    fn due(&mut self, sender_us: i64, arrived: Instant) -> Instant {
+        if !self.started {
+            self.started = true;
+            self.origin_sender = sender_us;
+            self.origin_local = arrived;
+            return arrived + self.delay;
+        }
+        let elapsed = Duration::from_micros(sender_us.saturating_sub(self.origin_sender).max(0) as u64);
+        let scheduled = self.origin_local + elapsed;
+        let late = arrived.saturating_duration_since(scheduled);
+        if late > MIRROR_LIMIT + MIRROR_DELAY {
+            self.origin_sender = sender_us;
+            self.origin_local = arrived;
+            self.delay = MIRROR_DELAY;
+            return arrived + self.delay;
+        }
+        if late + Duration::from_millis(8) > self.delay {
+            self.delay = (late + Duration::from_millis(8)).min(MIRROR_LIMIT);
+        }
+        scheduled + self.delay
+    }
+}
+
+fn push_picture(queue: &Mutex<VecDeque<Queued>>, picture: Picture, due: Instant) -> bool {
+    queue
+        .lock()
+        .map(|mut slot| {
+            slot.push_back(Queued { picture, due });
+            while slot.len() > PLAYBACK_LIMIT {
+                slot.pop_front();
+            }
+        })
+        .is_ok()
 }
 
 struct CursorState {
@@ -94,19 +155,18 @@ struct WatchApp {
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     #[cfg(target_os = "macos")]
     presenter: Option<crate::present_macos::Presenter>,
-    queue: Arc<Mutex<VecDeque<Picture>>>,
+    queue: Arc<Mutex<VecDeque<Queued>>>,
     inflight: VecDeque<Picture>,
     shown: Option<Picture>,
     stop: Arc<AtomicBool>,
     drawn_width: u32,
     drawn_height: u32,
-    next_present: Instant,
     frame_interval: Duration,
     vsync: bool,
 }
 
 pub fn run(config: &AppConfig) -> Result<()> {
-    let queue = Arc::new(Mutex::new(VecDeque::new()));
+    let queue: Arc<Mutex<VecDeque<Queued>>> = Arc::new(Mutex::new(VecDeque::new()));
     let cursor = Arc::new(CursorState::new());
     let stop = Arc::new(AtomicBool::new(false));
     let event_loop = EventLoop::<WatchEvent>::with_user_event()
@@ -164,8 +224,7 @@ pub fn run(config: &AppConfig) -> Result<()> {
         stop,
         drawn_width: 0,
         drawn_height: 0,
-        next_present: Instant::now(),
-        frame_interval: DEFAULT_REFRESH,
+        frame_interval: Duration::from_millis(16),
         vsync: false,
     };
     let result = event_loop.run_app(&mut app);
@@ -180,7 +239,7 @@ pub fn run(config: &AppConfig) -> Result<()> {
 
 fn picture_watch(
     addr: std::net::SocketAddr,
-    queue: Arc<Mutex<VecDeque<Picture>>>,
+    queue: Arc<Mutex<VecDeque<Queued>>>,
     proxy: EventLoopProxy<WatchEvent>,
     stop: Arc<AtomicBool>,
     cursor: Arc<CursorState>,
@@ -199,7 +258,7 @@ fn picture_watch(
 #[cfg(target_os = "macos")]
 fn picture_watch_macos(
     addr: std::net::SocketAddr,
-    queue: Arc<Mutex<VecDeque<Picture>>>,
+    queue: Arc<Mutex<VecDeque<Queued>>>,
     proxy: EventLoopProxy<WatchEvent>,
     stop: Arc<AtomicBool>,
     cursor: Arc<CursorState>,
@@ -222,6 +281,8 @@ fn picture_watch_macos(
     let mut remote = None;
     let mut asked_for_keyframe: Option<Instant> = None;
     let mut window_datagrams: u64 = 0;
+    let mut clock = MirrorClock::new();
+    let mut last_nak: Option<(u32, Instant)> = None;
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -268,6 +329,16 @@ fn picture_watch_macos(
         }
         socket.set_nonblocking(false).ok();
         let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
+        if let Some(gap) = assembler.missing() {
+            let retry = last_nak
+                .is_none_or(|(id, asked)| id != gap.frame_id || asked.elapsed() >= Duration::from_millis(15));
+            if retry {
+                if let Some(addr) = remote {
+                    let _ = socket.send_to(&gap.to_bytes(), addr);
+                }
+                last_nak = Some((gap.frame_id, Instant::now()));
+            }
+        }
         let Some(frame) = pending.pop_front() else {
             continue;
         };
@@ -298,42 +369,34 @@ fn picture_watch_macos(
             asked_for_keyframe = None;
         }
         next_frame = Some(frame.frame_id.wrapping_add(1));
-            let arrival = Instant::now();
-            if received > 0 && arrival.duration_since(last_arrival) > FRAME_GAP {
-                gaps += 1;
-                window_gaps += 1;
-            }
-            last_arrival = arrival;
-            received += 1;
-            window_received += 1;
-            note_once(&format!(
-                "watch picture: udp nv12 {}x{}",
-                decoded.buffer.width(),
-                decoded.buffer.height()
-            ));
-            let picture = Picture::Gpu {
-                buffer: decoded.buffer,
-                full_range: decoded.full_range,
-            };
-            if queue
-                .lock()
-                .map(|mut slot| {
-                    slot.push_back(picture);
-                    while slot.len() > PLAYBACK_LIMIT {
-                        slot.pop_front();
-                    }
-                })
-                .is_ok()
-            {
-                let _ = proxy.send_event(WatchEvent::Frame);
-            }
+        let arrival = Instant::now();
+        if received > 0 && arrival.duration_since(last_arrival) > FRAME_GAP {
+            gaps += 1;
+            window_gaps += 1;
+        }
+        last_arrival = arrival;
+        received += 1;
+        window_received += 1;
+        note_once(&format!(
+            "watch picture: udp nv12 {}x{}",
+            decoded.buffer.width(),
+            decoded.buffer.height()
+        ));
+        let picture = Picture::Gpu {
+            buffer: decoded.buffer,
+            full_range: decoded.full_range,
+        };
+        let due = clock.due(frame.timestamp_us, arrival);
+        if push_picture(&queue, picture, due) {
+            let _ = proxy.send_event(WatchEvent::Frame);
+        }
     }
     Ok(())
 }
 
 async fn session(
     config: AppConfig,
-    queue: Arc<Mutex<VecDeque<Picture>>>,
+    queue: Arc<Mutex<VecDeque<Queued>>>,
     proxy: EventLoopProxy<WatchEvent>,
     stop: Arc<AtomicBool>,
     cursor: Arc<CursorState>,
@@ -376,6 +439,8 @@ async fn session(
     let mut window_received: u64 = 0;
     let mut window_gaps: u64 = 0;
     let mut last_arrival = Instant::now();
+    let mut clock = MirrorClock::new();
+    let clock_origin = Instant::now();
 
     loop {
         if stop.load(Ordering::Acquire) {
@@ -423,13 +488,9 @@ async fn session(
                 received += 1;
                 window_received += 1;
                 if let Some(image) = presentable(&frame) {
-                    let queued = queue.lock().map(|mut slot| {
-                        slot.push_back(image);
-                        while slot.len() > PLAYBACK_LIMIT {
-                            slot.pop_front();
-                        }
-                    });
-                    if queued.is_ok() {
+                    let sender_us = clock_origin.elapsed().as_micros().min(i64::MAX as u128) as i64;
+                    let due = clock.due(sender_us, arrival);
+                    if push_picture(&queue, image, due) {
                         let _ = proxy.send_event(WatchEvent::Frame);
                     }
                 }
@@ -806,7 +867,7 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
         if self.start_display_link() {
             self.vsync = true;
             eprintln!(
-                "watch vsync: one frame every {} ms",
+                "watch vsync: this display refreshes every {} ms, and each refresh shows the sender frame that is due",
                 self.frame_interval.as_millis()
             );
         }
@@ -840,10 +901,6 @@ impl ApplicationHandler<WatchEvent> for WatchApp {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested if !self.vsync => {
-                if Instant::now() < self.next_present {
-                    self.schedule(event_loop);
-                    return;
-                }
                 self.present_due();
                 self.schedule(event_loop);
             }
@@ -899,43 +956,39 @@ impl WatchApp {
     }
 
     fn schedule(&mut self, event_loop: &ActiveEventLoop) {
-        let pending = self
+        let due = self
             .queue
             .lock()
-            .map(|slot| !slot.is_empty())
-            .unwrap_or(false);
-        if !pending {
+            .ok()
+            .and_then(|slot| slot.front().map(|item| item.due));
+        let Some(due) = due else {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
-        }
-        let now = Instant::now();
-        if now >= self.next_present {
+        };
+        if Instant::now() >= due {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_present));
+        event_loop.set_control_flow(ControlFlow::WaitUntil(due));
     }
 
     fn present_due(&mut self) {
         let cursor_seq = self.cursor.get().3;
-        if Instant::now() < self.next_present {
-            if cursor_seq != self.cursor_drawn {
-                if let Some(frame) = self.shown.clone() {
-                    if self.paint(&frame).unwrap_or(false) {
-                        self.cursor_drawn = cursor_seq;
-                    }
-                }
-            }
-            return;
-        }
+        let now = Instant::now();
         let frame = {
             let Ok(mut queue) = self.queue.lock() else {
                 return;
             };
-            queue.pop_front()
+            let mut chosen = None;
+            while queue.front().is_some_and(|item| item.due <= now) {
+                if let Some(item) = queue.pop_front() {
+                    chosen = Some(item.picture);
+                }
+            }
+            chosen
         };
         let Some(frame) = frame else {
             if cursor_seq != self.cursor_drawn {
@@ -949,14 +1002,16 @@ impl WatchApp {
         };
         match self.paint(&frame) {
             Ok(true) => {
-                self.next_present = Instant::now() + self.frame_interval;
                 self.cursor_drawn = cursor_seq;
                 self.shown = Some(frame.clone());
                 self.hold(frame);
             }
             Ok(false) => {
                 if let Ok(mut queue) = self.queue.lock() {
-                    queue.push_front(frame);
+                    queue.push_front(Queued {
+                        picture: frame,
+                        due: now,
+                    });
                 }
             }
             Err(err) => eprintln!("watch draw failed: {err}"),
@@ -1097,13 +1152,8 @@ fn frame_interval(window: &Window) -> Duration {
         .and_then(|monitor| monitor.refresh_rate_millihertz())
         .filter(|rate| *rate > 0)
         .unwrap_or(60_000);
-    let display = Duration::from_nanos(1_000_000_000_000 / u64::from(millihertz))
-        .clamp(Duration::from_millis(8), Duration::from_millis(20));
-    if display < CONTENT_FRAME {
-        CONTENT_FRAME
-    } else {
-        display
-    }
+    Duration::from_nanos(1_000_000_000_000 / u64::from(millihertz))
+        .clamp(Duration::from_millis(4), Duration::from_millis(20))
 }
 
 #[cfg(test)]

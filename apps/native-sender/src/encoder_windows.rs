@@ -22,7 +22,8 @@ use windows_capture::settings::{
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
-const KEYFRAME_GAP: Duration = Duration::from_secs(1);
+// Two frames. A request for a fresh picture is honored on the next frame.
+const KEYFRAME_GAP: Duration = Duration::from_millis(32);
 const OUTPUT_CAP: usize = 8 * 1024 * 1024;
 
 #[repr(C)]
@@ -615,6 +616,7 @@ fn mark_failed(shared: &Shared, message: String) {
 }
 
 fn remember_fatal(shared: &Shared, message: &str) {
+    eprintln!("screen encoder stopped: {message}");
     if let Ok(mut fatal) = shared.fatal.lock() {
         if fatal.is_none() {
             *fatal = Some(message.to_string());

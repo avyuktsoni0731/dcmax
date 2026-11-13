@@ -9,20 +9,20 @@
 use crate::h264::CursorSample;
 use anyhow::{Context, Result};
 use reed_solomon_erasure::galois_8::ReedSolomon;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAGIC: u32 = 0x4443_4D58;
 const VERSION: u8 = 1;
 const HEADER: usize = 32;
 const SHARD: usize = 1100;
-const HOLD_FRAMES: u32 = 8;
+const HOLD_FRAMES: u32 = 16;
 const MAX_DATA: usize = 200;
 const FLAG_KEY: u8 = 0x01;
 
@@ -56,7 +56,7 @@ pub struct PictureSender {
 
 impl PictureSender {
     pub fn connect(addr: SocketAddr) -> Result<Self> {
-        let (tx, rx) = sync_channel(2);
+        let (tx, rx) = sync_channel(4);
         let shared = Arc::new(Shared {
             sent: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
@@ -120,6 +120,18 @@ impl Drop for PictureSender {
     }
 }
 
+struct Wave {
+    frame_id: u32,
+    packets: Vec<Vec<u8>>,
+    payload_len: usize,
+    next: usize,
+}
+
+struct Saved {
+    frame_id: u32,
+    packets: Vec<Vec<u8>>,
+}
+
 fn send_loop(addr: SocketAddr, rx: Receiver<Outgoing>, shared: Arc<Shared>) {
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(socket) => socket,
@@ -134,46 +146,98 @@ fn send_loop(addr: SocketAddr, rx: Receiver<Outgoing>, shared: Arc<Shared>) {
     let mut codec: Option<(usize, usize, ReedSolomon)> = None;
     let mut frame_id = 0u32;
     let mut announced = false;
-    while let Ok(frame) = rx.recv() {
-        match packets_for(
-            &mut codec,
-            frame_id,
-            &frame.payload,
-            frame.keyframe,
-            frame.timestamp_us,
-            frame.cursor,
-        ) {
-            Some(packets) => {
-                let mut failed = false;
-                for packet in &packets {
-                    if socket.send_to(packet, addr).is_err() {
-                        failed = true;
-                        break;
-                    }
+    let mut wave: VecDeque<Wave> = VecDeque::new();
+    let mut saved: VecDeque<Saved> = VecDeque::new();
+    let mut next_at = Instant::now();
+    let mut sent_packets: u32 = 0;
+    let gap = Duration::from_micros(250);
+    loop {
+        if wave.is_empty() {
+            let Ok(frame) = rx.recv() else { break };
+            push_wave(&mut wave, &mut codec, frame_id, frame, &shared);
+            frame_id = frame_id.wrapping_add(1);
+        }
+        while wave.len() < 3 {
+            match rx.try_recv() {
+                Ok(frame) => {
+                    push_wave(&mut wave, &mut codec, frame_id, frame, &shared);
+                    frame_id = frame_id.wrapping_add(1);
                 }
-                if failed {
-                    shared.skipped.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    shared.sent.fetch_add(1, Ordering::Relaxed);
-                    if !announced {
-                        announced = true;
-                        println!(
-                            "picture udp: first frame {} bytes in {} datagrams",
-                            frame.payload.len(),
-                            packets.len()
-                        );
-                    }
-                }
-                frame_id = frame_id.wrapping_add(1);
-                poll_keyframe_request(&socket, &shared);
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
-            None => {
-                shared.skipped.fetch_add(1, Ordering::Relaxed);
-                eprintln!(
-                    "picture udp: frame of {} bytes is too large to send",
-                    frame.payload.len()
+        }
+        let Some(mut item) = wave.pop_front() else {
+            continue;
+        };
+        let now = Instant::now();
+        if next_at > now {
+            while Instant::now() < next_at {
+                std::hint::spin_loop();
+            }
+        }
+        next_at = Instant::now() + gap;
+        if socket.send_to(&item.packets[item.next], addr).is_err() {
+            shared.skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        item.next += 1;
+        sent_packets = sent_packets.wrapping_add(1);
+        if sent_packets.is_multiple_of(8) {
+            poll_feedback(&socket, addr, &shared, &saved);
+        }
+        if item.next == item.packets.len() {
+            saved.push_back(Saved {
+                frame_id: item.frame_id,
+                packets: item.packets.clone(),
+            });
+            while saved.len() > 16 {
+                saved.pop_front();
+            }
+            shared.sent.fetch_add(1, Ordering::Relaxed);
+            if !announced {
+                announced = true;
+                println!(
+                    "picture udp: first frame {} bytes in {} datagrams",
+                    item.payload_len,
+                    item.packets.len()
                 );
             }
+            poll_feedback(&socket, addr, &shared, &saved);
+        } else {
+            wave.push_back(item);
+        }
+    }
+}
+
+fn push_wave(
+    wave: &mut VecDeque<Wave>,
+    codec: &mut Option<(usize, usize, ReedSolomon)>,
+    frame_id: u32,
+    frame: Outgoing,
+    shared: &Shared,
+) {
+    match packets_for(
+        codec,
+        frame_id,
+        &frame.payload,
+        frame.keyframe,
+        frame.timestamp_us,
+        frame.cursor,
+    ) {
+        Some(packets) => {
+            wave.push_back(Wave {
+                frame_id,
+                payload_len: frame.payload.len(),
+                next: 0,
+                packets,
+            });
+        }
+        None => {
+            shared.skipped.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "picture udp: frame of {} bytes is too large to send",
+                frame.payload.len()
+            );
         }
     }
 }
@@ -227,6 +291,7 @@ impl Assembler {
             || self
                 .newest
                 .is_some_and(|newest| header.frame_id.saturating_add(HOLD_FRAMES) < newest)
+            || self.expected.is_some_and(|expected| header.frame_id < expected)
         {
             return Vec::new();
         }
@@ -264,6 +329,9 @@ impl Assembler {
             let ready = self.frames.get(&oldest).is_some_and(|frame| frame.have >= frame.data_shards);
             if ready {
                 let frame = self.frames.remove(&oldest)?;
+                if self.expected.is_some_and(|expected| oldest < expected) {
+                    continue;
+                }
                 if let Some(picture) = self.recover(oldest, frame) {
                     self.note_gap_before(oldest);
                     self.expected = Some(oldest.wrapping_add(1));
@@ -272,6 +340,22 @@ impl Assembler {
                 self.note_lost(oldest);
                 continue;
             }
+            if let Some(key_id) = self.ready_keyframe_after(oldest) {
+                if key_id > oldest.saturating_add(4) {
+                    while self
+                        .frames
+                        .keys()
+                        .next()
+                        .copied()
+                        .is_some_and(|id| id < key_id)
+                    {
+                        let id = self.frames.keys().next().copied().unwrap();
+                        self.frames.remove(&id);
+                        self.note_lost(id);
+                    }
+                    continue;
+                }
+            }
             if newest > oldest.saturating_add(HOLD_FRAMES) {
                 self.frames.remove(&oldest);
                 self.note_lost(oldest);
@@ -279,6 +363,33 @@ impl Assembler {
             }
             return None;
         }
+    }
+
+    fn ready_keyframe_after(&self, oldest: u32) -> Option<u32> {
+        self.frames.range(oldest.wrapping_add(1)..).find_map(|(&id, frame)| {
+            (frame.keyframe && frame.have >= frame.data_shards).then_some(id)
+        })
+    }
+
+    pub fn missing(&self) -> Option<Missing> {
+        let newest = self.newest?;
+        let (&id, frame) = self.frames.iter().find(|(_, frame)| frame.have < frame.data_shards)?;
+        // The sender still has this frame on the wire for a few frame times.
+        // Asking before that just makes it send the whole frame twice.
+        if newest < id.saturating_add(5) {
+            return None;
+        }
+        let total = frame.data_shards + frame.parity_shards;
+        let mut bitmap = vec![0u8; total.div_ceil(8)];
+        for (index, shard) in frame.shards.iter().enumerate() {
+            if shard.is_none() {
+                bitmap[index / 8] |= 1 << (index % 8);
+            }
+        }
+        Some(Missing {
+            frame_id: id,
+            bitmap,
+        })
     }
 
     fn note_gap_before(&mut self, frame_id: u32) {
@@ -409,7 +520,10 @@ fn plan(len: usize) -> Option<(usize, usize)> {
         return None;
     }
     let data = len.div_ceil(SHARD).clamp(1, MAX_DATA);
-    let mut parity = (data / 3).max(4);
+    // Half the datagrams can vanish and the frame still rebuilds. The copies
+    // are mixed with the picture data so a drop at the end of a burst does not
+    // take every recovery shard with it.
+    let mut parity = (data / 2).max(4);
     if data + parity > 255 {
         parity = 255 - data;
     }
@@ -468,7 +582,22 @@ fn packets_for(
             packet
         })
         .collect();
-    Some(packets)
+    Some(mix_recovery(packets))
+}
+
+fn mix_recovery(packets: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let half = packets.len().div_ceil(2);
+    let mut head = packets;
+    let mut tail = head.split_off(half);
+    let mut mixed = Vec::with_capacity(head.len() + tail.len());
+    for packet in head {
+        mixed.push(packet);
+        if let Some(packet) = tail.pop() {
+            mixed.push(packet);
+        }
+    }
+    mixed.extend(tail);
+    mixed
 }
 
 pub fn listen(addr: SocketAddr) -> Result<(UdpSocket, Assembler)> {
@@ -498,19 +627,60 @@ pub fn recv_packet(
     }
 }
 
-fn poll_keyframe_request(socket: &UdpSocket, shared: &Shared) {
+pub struct Missing {
+    pub frame_id: u32,
+    pub bitmap: Vec<u8>,
+}
+
+impl Missing {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(10 + self.bitmap.len());
+        packet.extend_from_slice(b"NAK");
+        packet.push(1);
+        packet.extend_from_slice(&self.frame_id.to_le_bytes());
+        packet.extend_from_slice(&self.bitmap);
+        packet
+    }
+}
+
+fn poll_feedback(socket: &UdpSocket, addr: SocketAddr, shared: &Shared, saved: &VecDeque<Saved>) {
     let _ = socket.set_nonblocking(true);
-    let mut buf = [0u8; 8];
+    let mut buf = [0u8; 64];
     loop {
         match socket.recv_from(&mut buf) {
             Ok((size, _)) if size >= 3 && &buf[..3] == b"IDR" => {
                 shared.want_idr.store(true, Ordering::Release);
+            }
+            Ok((size, _)) if size >= 8 && &buf[..3] == b"NAK" => {
+                resend(socket, addr, saved, &buf[..size]);
             }
             Ok(_) => continue,
             Err(_) => break,
         }
     }
     let _ = socket.set_nonblocking(false);
+}
+
+fn resend(socket: &UdpSocket, addr: SocketAddr, saved: &VecDeque<Saved>, packet: &[u8]) {
+    let Ok(frame_id) = packet[4..8].try_into().map(u32::from_le_bytes) else {
+        return;
+    };
+    let Some(frame) = saved.iter().find(|frame| frame.frame_id == frame_id) else {
+        return;
+    };
+    let bitmap = &packet[8..];
+    for shard in &frame.packets {
+        let Some(&index) = shard.get(12) else {
+            continue;
+        };
+        let index = index as usize;
+        let missing = bitmap
+            .get(index / 8)
+            .is_some_and(|bits| bits & (1 << (index % 8)) != 0);
+        if missing {
+            let _ = socket.send_to(shard, addr);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -578,5 +748,30 @@ mod tests {
             picture = assembler.push(packet).pop().or(picture);
         }
         assert!(picture.is_none());
+    }
+
+    #[test]
+    fn a_short_frame_asks_for_the_shards_it_still_needs() {
+        let payload = sample(12_000);
+        let cursor = CursorSample {
+            visible: false,
+            x: 0,
+            y: 0,
+        };
+        let mut cache = None;
+        let first = packets_for(&mut cache, 4, &payload, false, 10, cursor).unwrap();
+        let second = packets_for(&mut cache, 9, &payload, false, 20, cursor).unwrap();
+        let mut assembler = Assembler::new();
+        for packet in first.iter().take(2) {
+            assembler.push(packet);
+        }
+        assembler.push(&second[0]);
+        assembler.push(&second[1]);
+        let gap = assembler.missing().expect("the short frame should be reported");
+        assert_eq!(gap.frame_id, 4);
+        assert!(gap.bitmap.iter().any(|bits| *bits != 0));
+        let nak = gap.to_bytes();
+        assert_eq!(&nak[..3], b"NAK");
+        assert_eq!(u32::from_le_bytes(nak[4..8].try_into().unwrap()), 4);
     }
 }

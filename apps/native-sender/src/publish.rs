@@ -209,8 +209,13 @@ pub async fn run(
             }
             maybe_unit = encoder.units.recv() => {
                 let Some(unit) = maybe_unit else {
+                    let fatal = encoder.fatal_error().ok().flatten().unwrap_or_default();
                     let tail = encoder.stderr_tail();
-                    anyhow::bail!("ffmpeg stopped producing video. {}", tail.trim());
+                    anyhow::bail!(
+                        "encoder stopped producing video. {} {}",
+                        fatal.trim(),
+                        tail.trim()
+                    );
                 };
                 let timestamp_us = match unit.timestamp_us {
                     Some(timestamp) if timestamp > 0 => timestamp,
