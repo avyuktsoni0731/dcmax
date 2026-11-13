@@ -1,5 +1,6 @@
 use crate::api;
 use crate::config::AppConfig;
+use crate::h264::CursorSample;
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use livekit::prelude::*;
@@ -10,7 +11,7 @@ use screencapturekit::cv::CVPixelBuffer;
 use reqwest::Client;
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::interval;
@@ -32,12 +33,14 @@ enum WatchEvent {
     Quit,
 }
 
+#[derive(Clone)]
 struct Presented {
     width: u32,
     height: u32,
     pixels: Vec<u32>,
 }
 
+#[derive(Clone)]
 enum Picture {
     Cpu(Presented),
     #[cfg(target_os = "macos")]
@@ -47,8 +50,45 @@ enum Picture {
     },
 }
 
+struct CursorState {
+    visible: AtomicBool,
+    x: AtomicU16,
+    y: AtomicU16,
+    seq: AtomicU64,
+}
+
+impl CursorState {
+    fn new() -> Self {
+        Self {
+            visible: AtomicBool::new(false),
+            x: AtomicU16::new(0),
+            y: AtomicU16::new(0),
+            seq: AtomicU64::new(0),
+        }
+    }
+
+    fn set(&self, cursor: CursorSample) {
+        self.visible.store(cursor.visible, Ordering::Relaxed);
+        self.x.store(cursor.x, Ordering::Relaxed);
+        self.y.store(cursor.y, Ordering::Relaxed);
+        self.seq.fetch_add(1, Ordering::Release);
+    }
+
+    fn get(&self) -> (bool, f32, f32, u64) {
+        let seq = self.seq.load(Ordering::Acquire);
+        (
+            self.visible.load(Ordering::Relaxed),
+            f32::from(self.x.load(Ordering::Relaxed)) / 65535.0,
+            f32::from(self.y.load(Ordering::Relaxed)) / 65535.0,
+            seq,
+        )
+    }
+}
+
 struct WatchApp {
     proxy: EventLoopProxy<WatchEvent>,
+    cursor: Arc<CursorState>,
+    cursor_drawn: u64,
     window: Option<Arc<Window>>,
     context: Option<softbuffer::Context<Arc<Window>>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
@@ -56,6 +96,7 @@ struct WatchApp {
     presenter: Option<crate::present_macos::Presenter>,
     queue: Arc<Mutex<VecDeque<Picture>>>,
     inflight: VecDeque<Picture>,
+    shown: Option<Picture>,
     stop: Arc<AtomicBool>,
     drawn_width: u32,
     drawn_height: u32,
@@ -65,29 +106,53 @@ struct WatchApp {
 }
 
 pub fn run(config: &AppConfig) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to start the watch runtime")?;
     let queue = Arc::new(Mutex::new(VecDeque::new()));
+    let cursor = Arc::new(CursorState::new());
     let stop = Arc::new(AtomicBool::new(false));
     let event_loop = EventLoop::<WatchEvent>::with_user_event()
         .build()
         .context("failed to create the watch window")?;
     let proxy = event_loop.create_proxy();
 
-    let task_config = config.clone();
     let task_queue = Arc::clone(&queue);
     let task_stop = Arc::clone(&stop);
     let task_proxy = proxy.clone();
-    runtime.spawn(async move {
-        if let Err(err) = session(task_config, task_queue, task_proxy, task_stop).await {
-            eprintln!("watch failed: {err:#}");
-        }
-    });
+    let task_cursor = Arc::clone(&cursor);
+    let _runtime;
+    let picture_thread;
+    if let Some(addr) = config.picture_listen {
+        println!("watch picture: direct udp {addr}");
+        picture_thread = Some(
+            std::thread::Builder::new()
+                .name("picture-udp".to_string())
+                .spawn(move || {
+                    if let Err(err) = picture_watch(addr, task_queue, task_proxy, task_stop, task_cursor)
+                    {
+                        eprintln!("watch picture failed: {err:#}");
+                    }
+                })
+                .context("failed to start the picture receiver")?,
+        );
+        _runtime = None;
+    } else {
+        picture_thread = None;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("failed to start the watch runtime")?;
+        let task_config = config.clone();
+        runtime.spawn(async move {
+            if let Err(err) = session(task_config, task_queue, task_proxy, task_stop, task_cursor).await {
+                eprintln!("watch failed: {err:#}");
+            }
+        });
+        _runtime = Some(runtime);
+    }
 
     let mut app = WatchApp {
         proxy,
+        cursor,
+        cursor_drawn: 0,
         window: None,
         context: None,
         surface: None,
@@ -95,6 +160,7 @@ pub fn run(config: &AppConfig) -> Result<()> {
         presenter: None,
         queue,
         inflight: VecDeque::new(),
+        shown: None,
         stop,
         drawn_width: 0,
         drawn_height: 0,
@@ -106,6 +172,162 @@ pub fn run(config: &AppConfig) -> Result<()> {
     #[cfg(target_os = "macos")]
     crate::present_macos::stop_vsync();
     result.context("watch window stopped")?;
+    if let Some(thread) = picture_thread {
+        let _ = thread.join();
+    }
+    Ok(())
+}
+
+fn picture_watch(
+    addr: std::net::SocketAddr,
+    queue: Arc<Mutex<VecDeque<Picture>>>,
+    proxy: EventLoopProxy<WatchEvent>,
+    stop: Arc<AtomicBool>,
+    cursor: Arc<CursorState>,
+) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (queue, proxy, stop, cursor);
+        anyhow::bail!("UDP picture playback is available on macOS ({addr})");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        picture_watch_macos(addr, queue, proxy, stop, cursor)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn picture_watch_macos(
+    addr: std::net::SocketAddr,
+    queue: Arc<Mutex<VecDeque<Picture>>>,
+    proxy: EventLoopProxy<WatchEvent>,
+    stop: Arc<AtomicBool>,
+    cursor: Arc<CursorState>,
+) -> Result<()> {
+    use crate::decode_macos::Decoder;
+    use crate::picture::{listen, recv_packet};
+    let (socket, mut assembler) = listen(addr)?;
+    let mut decoder = Decoder::new();
+    let mut buffer = [0u8; 2048];
+    let started = Instant::now();
+    let mut received: u64 = 0;
+    let mut gaps: u64 = 0;
+    let mut window_received: u64 = 0;
+    let mut window_gaps: u64 = 0;
+    let mut last_arrival = Instant::now();
+    let mut last_log = Instant::now();
+    let mut saw_packet = false;
+    let mut next_frame: Option<u32> = None;
+    let mut pending = VecDeque::new();
+    let mut remote = None;
+    let mut asked_for_keyframe: Option<Instant> = None;
+    let mut window_datagrams: u64 = 0;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        if last_log.elapsed() >= Duration::from_secs(1) {
+            let held = queue.lock().map(|slot| slot.len()).unwrap_or(0);
+            println!(
+                "watch: fps={window_received:.0} gaps_this_second={window_gaps} held={held} frames={received} gaps={gaps} lost={} datagrams={window_datagrams} uptime={:.0}s",
+                assembler.lost(),
+                started.elapsed().as_secs_f64()
+            );
+            window_received = 0;
+            window_gaps = 0;
+            window_datagrams = 0;
+            last_log = Instant::now();
+        }
+        if pending.is_empty() {
+            let (size, addr) = match recv_packet(&socket, &mut buffer) {
+                Ok(Some(packet)) => packet,
+                Ok(None) => continue,
+                Err(err) => return Err(err.into()),
+            };
+            remote = Some(addr);
+            window_datagrams += 1;
+            if !saw_packet {
+                saw_packet = true;
+                println!("watch picture: udp packet");
+            }
+            pending.extend(assembler.push(&buffer[..size]));
+        }
+        // Take every datagram already waiting before decoding, so a decode
+        // does not let the kernel throw the rest of the frame away.
+        socket.set_nonblocking(true).ok();
+        loop {
+            match recv_packet(&socket, &mut buffer) {
+                Ok(Some((size, addr))) => {
+                    remote = Some(addr);
+                    window_datagrams += 1;
+                    pending.extend(assembler.push(&buffer[..size]));
+                }
+                Ok(None) => break,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        socket.set_nonblocking(false).ok();
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
+        let Some(frame) = pending.pop_front() else {
+            continue;
+        };
+        // A delta after a missing frame is predicted from the wrong picture.
+        // Hold the last clean frame until the next keyframe.
+        let follows = next_frame.is_some_and(|expected| frame.frame_id == expected);
+        if !frame.keyframe && !follows {
+            let due = asked_for_keyframe
+                .is_none_or(|asked| asked.elapsed() >= Duration::from_millis(100));
+            if due {
+                if let Some(addr) = remote {
+                    let _ = socket.send_to(b"IDR", addr);
+                }
+                asked_for_keyframe = Some(Instant::now());
+            }
+            continue;
+        }
+        cursor.set(frame.cursor);
+        let Some(decoded) = decoder.decode(&frame.payload) else {
+            next_frame = None;
+            if let Some(addr) = remote {
+                let _ = socket.send_to(b"IDR", addr);
+            }
+            asked_for_keyframe = Some(Instant::now());
+            continue;
+        };
+        if frame.keyframe {
+            asked_for_keyframe = None;
+        }
+        next_frame = Some(frame.frame_id.wrapping_add(1));
+            let arrival = Instant::now();
+            if received > 0 && arrival.duration_since(last_arrival) > FRAME_GAP {
+                gaps += 1;
+                window_gaps += 1;
+            }
+            last_arrival = arrival;
+            received += 1;
+            window_received += 1;
+            note_once(&format!(
+                "watch picture: udp nv12 {}x{}",
+                decoded.buffer.width(),
+                decoded.buffer.height()
+            ));
+            let picture = Picture::Gpu {
+                buffer: decoded.buffer,
+                full_range: decoded.full_range,
+            };
+            if queue
+                .lock()
+                .map(|mut slot| {
+                    slot.push_back(picture);
+                    while slot.len() > PLAYBACK_LIMIT {
+                        slot.pop_front();
+                    }
+                })
+                .is_ok()
+            {
+                let _ = proxy.send_event(WatchEvent::Frame);
+            }
+    }
     Ok(())
 }
 
@@ -114,6 +336,7 @@ async fn session(
     queue: Arc<Mutex<VecDeque<Picture>>>,
     proxy: EventLoopProxy<WatchEvent>,
     stop: Arc<AtomicBool>,
+    cursor: Arc<CursorState>,
 ) -> Result<()> {
     let http = Client::new();
     api::health_check(&http, &config.api_base_url).await?;
@@ -174,10 +397,19 @@ async fn session(
                 window_gaps = 0;
             }
             event = events.recv() => {
-                if let Some(RoomEvent::Disconnected { reason }) = event {
-                    eprintln!("livekit disconnected: {reason:?}");
-                    let _ = proxy.send_event(WatchEvent::Quit);
-                    break;
+                match event {
+                    Some(RoomEvent::DataReceived { payload, topic, .. }) if topic.as_deref() == Some("cursor") => {
+                        if let Some(sample) = CursorSample::from_bytes(&payload) {
+                            cursor.set(sample);
+                            let _ = proxy.send_event(WatchEvent::Vsync);
+                        }
+                    }
+                    Some(RoomEvent::Disconnected { reason }) => {
+                        eprintln!("livekit disconnected: {reason:?}");
+                        let _ = proxy.send_event(WatchEvent::Quit);
+                        break;
+                    }
+                    _ => {}
                 }
             }
             frame = stream.next() => {
@@ -688,7 +920,15 @@ impl WatchApp {
     }
 
     fn present_due(&mut self) {
+        let cursor_seq = self.cursor.get().3;
         if Instant::now() < self.next_present {
+            if cursor_seq != self.cursor_drawn {
+                if let Some(frame) = self.shown.clone() {
+                    if self.paint(&frame).unwrap_or(false) {
+                        self.cursor_drawn = cursor_seq;
+                    }
+                }
+            }
             return;
         }
         let frame = {
@@ -698,11 +938,20 @@ impl WatchApp {
             queue.pop_front()
         };
         let Some(frame) = frame else {
+            if cursor_seq != self.cursor_drawn {
+                if let Some(frame) = self.shown.clone() {
+                    if self.paint(&frame).unwrap_or(false) {
+                        self.cursor_drawn = cursor_seq;
+                    }
+                }
+            }
             return;
         };
         match self.paint(&frame) {
             Ok(true) => {
                 self.next_present = Instant::now() + self.frame_interval;
+                self.cursor_drawn = cursor_seq;
+                self.shown = Some(frame.clone());
                 self.hold(frame);
             }
             Ok(false) => {
@@ -712,6 +961,12 @@ impl WatchApp {
             }
             Err(err) => eprintln!("watch draw failed: {err}"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pointer(&self) -> crate::present_macos::Pointer {
+        let (visible, x, y, _) = self.cursor.get();
+        crate::present_macos::Pointer { visible, x, y }
     }
 
     fn hold(&mut self, frame: Picture) {
@@ -739,9 +994,14 @@ impl WatchApp {
         let Some(presenter) = self.presenter.as_ref() else {
             return Ok(false);
         };
+        let pointer = self.pointer();
         let status = match picture {
-            Picture::Gpu { buffer, full_range } => presenter.draw_nv12(buffer.as_ptr(), *full_range),
-            Picture::Cpu(image) => presenter.draw_bgra(&image.pixels, image.width, image.height),
+            Picture::Gpu { buffer, full_range } => {
+                presenter.draw_nv12(buffer.as_ptr(), *full_range, pointer)
+            }
+            Picture::Cpu(image) => {
+                presenter.draw_bgra(&image.pixels, image.width, image.height, pointer)
+            }
         };
         match status {
             0 => Ok(true),
@@ -752,7 +1012,7 @@ impl WatchApp {
                 };
                 let image = gpu_to_cpu(buffer, *full_range)
                     .ok_or_else(|| anyhow!("could not read the hardware frame"))?;
-                Ok(presenter.draw_bgra(&image.pixels, image.width, image.height) == 0)
+                Ok(presenter.draw_bgra(&image.pixels, image.width, image.height, pointer) == 0)
             }
             status => Err(anyhow!("failed to present the watch frame ({status})")),
         }

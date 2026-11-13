@@ -515,6 +515,7 @@ fn access_unit_from_sample(sample: *mut c_void) -> Option<AccessUnit> {
         read_at: Instant::now(),
         captured_at: Instant::now(),
         timestamp_us,
+        cursor: None,
     })
 }
 

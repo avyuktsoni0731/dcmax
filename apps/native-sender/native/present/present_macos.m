@@ -19,10 +19,21 @@ static NSString *const kShader = @
     "  out.uv = float2((corners[id].x + 1.0) * 0.5, (1.0 - corners[id].y) * 0.5);\n"
     "  return out;\n"
     "}\n"
+    "float3 paint_cursor(float3 rgb, float2 uv, constant float *cursor) {\n"
+    "  if (cursor[2] < 0.5) return rgb;\n"
+    "  float2 px = (uv - float2(cursor[0], cursor[1])) * float2(cursor[3], cursor[4]);\n"
+    "  float x = px.x;\n"
+    "  float y = px.y;\n"
+    "  bool arrow = x >= 0.0 && y >= 0.0 && x < 12.0 && y < 16.0 && (x + y * 0.55) < 12.0;\n"
+    "  if (!arrow) return rgb;\n"
+    "  bool edge = x < 1.0 || y < 1.0 || (x + y * 0.55) > 10.6;\n"
+    "  return edge ? float3(0.0) : float3(1.0);\n"
+    "}\n"
     "fragment float4 fs_nv12(VOut in [[stage_in]],\n"
     "                        texture2d<float> yTex [[texture(0)]],\n"
     "                        texture2d<float> uvTex [[texture(1)]],\n"
-    "                        constant uint *range [[buffer(0)]]) {\n"
+    "                        constant uint *range [[buffer(0)]],\n"
+    "                        constant float *cursor [[buffer(1)]]) {\n"
     "  constexpr sampler s(address::clamp_to_edge, filter::linear);\n"
     "  float y = yTex.sample(s, in.uv).r;\n"
     "  float2 uv = uvTex.sample(s, in.uv).rg - 0.5;\n"
@@ -37,11 +48,13 @@ static NSString *const kShader = @
     "                 1.164383 * c - 0.391762 * uv.r - 0.812968 * uv.g,\n"
     "                 1.164383 * c + 2.017232 * uv.r);\n"
     "  }\n"
-    "  return float4(saturate(rgb), 1.0);\n"
+    "  return float4(saturate(paint_cursor(rgb, in.uv, cursor)), 1.0);\n"
     "}\n"
-    "fragment float4 fs_bgra(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {\n"
+    "fragment float4 fs_bgra(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]],\n"
+    "                        constant float *cursor [[buffer(0)]]) {\n"
     "  constexpr sampler s(address::clamp_to_edge, filter::linear);\n"
-    "  return float4(tex.sample(s, in.uv).rgb, 1.0);\n"
+    "  float3 rgb = paint_cursor(tex.sample(s, in.uv).rgb, in.uv, cursor);\n"
+    "  return float4(rgb, 1.0);\n"
     "}\n";
 
 @interface DcmaxPresenter : NSObject
@@ -192,7 +205,7 @@ void dcmax_presenter_resize(void *raw) {
     [presenter syncLayerSize];
 }
 
-static int draw_textures(DcmaxPresenter *presenter, float *fit, id<MTLTexture> y, id<MTLTexture> uv, int full_range) {
+static int draw_textures(DcmaxPresenter *presenter, float *fit, id<MTLTexture> y, id<MTLTexture> uv, int full_range, const float *cursor) {
     if (!y || !uv) {
         return -3;
     }
@@ -213,6 +226,7 @@ static int draw_textures(DcmaxPresenter *presenter, float *fit, id<MTLTexture> y
     [encoder setFragmentTexture:y atIndex:0];
     [encoder setFragmentTexture:uv atIndex:1];
     [encoder setFragmentBytes:&range length:sizeof(range) atIndex:0];
+    [encoder setFragmentBytes:cursor length:sizeof(float) * 5 atIndex:1];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
     [encoder endEncoding];
     [buffer presentDrawable:drawable];
@@ -220,7 +234,7 @@ static int draw_textures(DcmaxPresenter *presenter, float *fit, id<MTLTexture> y
     return 0;
 }
 
-int dcmax_presenter_draw_nv12(void *raw, void *pixel_buffer, int full_range) {
+int dcmax_presenter_draw_nv12(void *raw, void *pixel_buffer, int full_range, const float *cursor) {
     if (!raw || !pixel_buffer) {
         return -1;
     }
@@ -251,7 +265,13 @@ int dcmax_presenter_draw_nv12(void *raw, void *pixel_buffer, int full_range) {
         }
         id<MTLTexture> y = CVMetalTextureGetTexture(yRef);
         id<MTLTexture> uv = CVMetalTextureGetTexture(uvRef);
-        int drawn = draw_textures(presenter, fit, y, uv, full_range);
+        float pointer[5] = {0.5f, 0.5f, 0.0f, (float)width, (float)height};
+        if (cursor) {
+            memcpy(pointer, cursor, sizeof(pointer));
+            pointer[3] = (float)width;
+            pointer[4] = (float)height;
+        }
+        int drawn = draw_textures(presenter, fit, y, uv, full_range, pointer);
         CFRelease(yRef);
         CFRelease(uvRef);
         CVMetalTextureCacheFlush(presenter.cache, 0);
@@ -259,7 +279,7 @@ int dcmax_presenter_draw_nv12(void *raw, void *pixel_buffer, int full_range) {
     }
 }
 
-int dcmax_presenter_draw_bgra(void *raw, const void *bytes, uint32_t width, uint32_t height, uint32_t stride) {
+int dcmax_presenter_draw_bgra(void *raw, const void *bytes, uint32_t width, uint32_t height, uint32_t stride, const float *cursor) {
     if (!raw || !bytes || width == 0 || height == 0 || stride < width * 4) {
         return -1;
     }
@@ -298,6 +318,13 @@ int dcmax_presenter_draw_bgra(void *raw, const void *bytes, uint32_t width, uint
         [encoder setRenderPipelineState:presenter.bgraPipeline];
         [encoder setVertexBytes:fit length:sizeof(fit) atIndex:0];
         [encoder setFragmentTexture:presenter.bgraTexture atIndex:0];
+        float pointer[5] = {0.5f, 0.5f, 0.0f, (float)width, (float)height};
+        if (cursor) {
+            memcpy(pointer, cursor, sizeof(float) * 3);
+            pointer[3] = (float)width;
+            pointer[4] = (float)height;
+        }
+        [encoder setFragmentBytes:pointer length:sizeof(pointer) atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
         [encoder endEncoding];
         [buffer presentDrawable:drawable];

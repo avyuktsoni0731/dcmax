@@ -1,7 +1,8 @@
 use crate::api;
 use crate::config::AppConfig;
 use crate::encoder::ScreenEncoder;
-use crate::h264::MAX_FRAME_AGE;
+use crate::h264::{CursorSample, MAX_FRAME_AGE};
+use crate::picture::PictureSender;
 use anyhow::{Context, Result};
 use livekit::options::{
     DegradationPreference, TrackPublishOptions, VideoCodec, VideoEncoderBackend, VideoEncoding,
@@ -105,6 +106,30 @@ pub async fn run(
     let mut late_drops: u64 = 0;
     let mut need_key = true;
     let mut last_timestamp_us: i64 = 0;
+    let picture = match config.picture_to {
+        Some(addr) => Some(PictureSender::connect(addr)?),
+        None => None,
+    };
+    let (cursor_tx, mut cursor_rx) = tokio::sync::watch::channel(None::<CursorSample>);
+    let cursor_participant = room.local_participant();
+    tokio::spawn(async move {
+        loop {
+            if cursor_rx.changed().await.is_err() {
+                break;
+            }
+            let Some(cursor) = *cursor_rx.borrow() else {
+                continue;
+            };
+            let _ = cursor_participant
+                .publish_data(DataPacket {
+                    payload: cursor.to_bytes().to_vec(),
+                    topic: Some("cursor".to_string()),
+                    reliable: false,
+                    destination_identities: Vec::new(),
+                })
+                .await;
+        }
+    });
 
     loop {
         tokio::select! {
@@ -125,8 +150,16 @@ pub async fn run(
                 let achieved_fps = window_frames as f64 / elapsed;
                 let avg_payload = if window_frames > 0 { window_bytes / window_frames as usize } else { 0 };
                 let avg_latency = if window_frames > 0 { window_latency_ms / window_frames as f64 } else { 0.0 };
+                let picture_note = match &picture {
+                    Some(picture) => format!(
+                        " picture_sent={} picture_skipped={}",
+                        picture.sent(),
+                        picture.skipped()
+                    ),
+                    None => String::new(),
+                };
                 println!(
-                    "heartbeat: fps={achieved_fps:.1} frames={produced} dropped={dropped} queue_drops={} late={late_drops} stale={} keyframe_requests={keyframe_requests} rate_target_bps={} uptime={:.0}s",
+                    "heartbeat: fps={achieved_fps:.1} frames={produced} dropped={dropped} queue_drops={} late={late_drops} stale={} keyframe_requests={keyframe_requests} rate_target_bps={} uptime={:.0}s{picture_note}",
                     encoder.queue_drops(),
                     encoder.stale_skips(),
                     governor.applied_bps(),
@@ -179,6 +212,16 @@ pub async fn run(
                     let tail = encoder.stderr_tail();
                     anyhow::bail!("ffmpeg stopped producing video. {}", tail.trim());
                 };
+                let timestamp_us = match unit.timestamp_us {
+                    Some(timestamp) if timestamp > 0 => timestamp,
+                    _ => live_timestamp_us(&mut last_timestamp_us),
+                };
+                if let Some(picture) = &picture {
+                    if picture.take_keyframe() {
+                        encoder.request_keyframe();
+                    }
+                    picture.offer(&unit.payload, unit.keyframe, timestamp_us, unit.cursor);
+                }
                 match admit(&mut need_key, unit.keyframe, unit.captured_at.elapsed()) {
                     Admit::Send => {}
                     Admit::TooLate => {
@@ -193,10 +236,6 @@ pub async fn run(
                         continue;
                     }
                 }
-                let timestamp_us = match unit.timestamp_us {
-                    Some(timestamp) if timestamp > 0 => timestamp,
-                    _ => live_timestamp_us(&mut last_timestamp_us),
-                };
                 let frame = EncodedVideoFrame {
                     codec: EncodedVideoCodec::H264,
                     payload: &unit.payload,
@@ -206,6 +245,9 @@ pub async fn run(
                     frame_metadata: None,
                 };
                 rate_frames += 1;
+                if let Some(cursor) = unit.cursor {
+                    let _ = cursor_tx.send(Some(cursor));
+                }
                 if source.capture_encoded_frame(&frame) {
                     produced += 1;
                     window_frames += 1;

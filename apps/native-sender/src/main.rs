@@ -1,7 +1,10 @@
 mod api;
 mod config;
+#[cfg(target_os = "macos")]
+mod decode_macos;
 mod encoder;
 mod h264;
+mod picture;
 #[cfg(target_os = "macos")]
 mod present_macos;
 mod publish;

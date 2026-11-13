@@ -1,5 +1,6 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "native-sender")]
@@ -34,6 +35,12 @@ pub struct CliArgs {
     /// Join the room and show the shared screen. Does not capture.
     #[arg(long, default_value_t = false)]
     pub watch: bool,
+    /// Also send the picture to this host:port. LiveKit publish stays on.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub picture_to: Option<String>,
+    /// Show the picture from this UDP address instead of the LiveKit video.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub picture_listen: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +92,8 @@ pub struct AppConfig {
     pub height: u32,
     pub bitrate_kbps: u32,
     pub watch: bool,
+    pub picture_to: Option<SocketAddr>,
+    pub picture_listen: Option<SocketAddr>,
 }
 
 impl AppConfig {
@@ -171,10 +180,24 @@ impl AppConfig {
             height: args.height,
             bitrate_kbps: args.bitrate_kbps,
             watch: args.watch,
+            picture_to: parse_addr(args.picture_to.as_deref(), "--picture-to")?,
+            picture_listen: parse_addr(args.picture_listen.as_deref(), "--picture-listen")?,
         })
     }
 
     pub fn gop_frames(&self) -> u32 {
-        self.target_fps.saturating_mul(2).max(self.target_fps)
+        // One keyframe a second. A missed picture frame heals on the next one
+        // instead of smearing every later frame for two seconds.
+        self.target_fps.max(1)
     }
+}
+
+fn parse_addr(raw: Option<&str>, flag: &str) -> Result<Option<SocketAddr>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let addr = raw
+        .parse::<SocketAddr>()
+        .with_context(|| format!("{flag} must be host:port, for example 100.72.237.115:46000"))?;
+    Ok(Some(addr))
 }

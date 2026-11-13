@@ -18,9 +18,13 @@ struct NvencSession {
     void* encoder = nullptr;
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
-    ID3D11Texture2D* scratch = nullptr;
+    ID3D11Texture2D* scratch[2] = {};
     ID3D11Texture2D* encode_tex = nullptr;
-    ID3D11Query* query = nullptr;
+    ID3D11Query* blit_query[2] = {};
+    ID3D11Query* copy_query = nullptr;
+    bool blit_issued[2] = {};
+    int write_slot = 0;
+    int latest_slot = -1;
     NV_ENC_REGISTERED_PTR registered = nullptr;
     NV_ENC_OUTPUT_PTR bitstream = nullptr;
     NV_ENC_INITIALIZE_PARAMS init{};
@@ -81,11 +85,17 @@ static bool create_texture(NvencSession* session, ID3D11Texture2D** target) {
     return true;
 }
 
-static bool wait_for_gpu(NvencSession* session) {
-    session->context->End(session->query);
+static bool wait_for_gpu(NvencSession* session, ID3D11Query* query, bool end_first) {
+    if (query == nullptr) {
+        set_error(session, "GPU query is missing");
+        return false;
+    }
+    if (end_first) {
+        session->context->End(query);
+    }
     ULONGLONG started = GetTickCount64();
     for (;;) {
-        HRESULT hr = session->context->GetData(session->query, nullptr, 0, 0);
+        HRESULT hr = session->context->GetData(query, nullptr, 0, 0);
         if (hr != S_FALSE) {
             return SUCCEEDED(hr);
         }
@@ -262,14 +272,21 @@ extern "C" NvencSession* nvenc_open(void* device_ptr, int width, int height, int
         return nullptr;
     }
 
-    if (!create_texture(session, &session->scratch) || !create_texture(session, &session->encode_tex)) {
+    if (!create_texture(session, &session->scratch[0]) || !create_texture(session, &session->scratch[1]) ||
+        !create_texture(session, &session->encode_tex)) {
         set_open_error(session->error);
         nvenc_close(session);
         return nullptr;
     }
     D3D11_QUERY_DESC query_desc{};
     query_desc.Query = D3D11_QUERY_EVENT;
-    HRESULT hr = session->device->CreateQuery(&query_desc, &session->query);
+    HRESULT hr = session->device->CreateQuery(&query_desc, &session->blit_query[0]);
+    if (SUCCEEDED(hr)) {
+        hr = session->device->CreateQuery(&query_desc, &session->blit_query[1]);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = session->device->CreateQuery(&query_desc, &session->copy_query);
+    }
     if (FAILED(hr)) {
         std::snprintf(session->error, sizeof(session->error), "CreateQuery failed (0x%08lx)", static_cast<unsigned long>(hr));
         set_open_error(session->error);
@@ -334,10 +351,26 @@ extern "C" int nvenc_blit(NvencSession* session, void* texture) {
     box.right = static_cast<UINT>(session->width);
     box.bottom = static_cast<UINT>(session->height);
     box.back = 1;
-    session->context->CopySubresourceRegion(session->scratch, 0, 0, 0, 0, source, 0, &box);
-    if (!wait_for_gpu(session)) {
-        return -1;
+    // Copy into the scratch the encoder is not reading, and return without
+    // waiting for the encode. The capture pool can hand over the next refresh
+    // while NVENC is still compressing this one.
+    const int slot = session->write_slot;
+    if (session->blit_issued[slot]) {
+        HRESULT ready = session->context->GetData(
+            session->blit_query[slot], nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (ready == S_FALSE) {
+            ready = session->context->GetData(session->blit_query[slot], nullptr, 0, 0);
+        }
+        if (ready != S_OK) {
+            return 1;
+        }
+        session->blit_issued[slot] = false;
     }
+    session->context->CopySubresourceRegion(session->scratch[slot], 0, 0, 0, 0, source, 0, &box);
+    session->context->End(session->blit_query[slot]);
+    session->blit_issued[slot] = true;
+    session->latest_slot = slot;
+    session->write_slot = slot ^ 1;
     session->has_frame = true;
     return 0;
 }
@@ -352,13 +385,18 @@ extern "C" int nvenc_encode(
     if (session == nullptr || out == nullptr || out_len == nullptr || is_key == nullptr) {
         return -1;
     }
-    std::lock_guard<std::mutex> lock(session->mutex);
-    if (!session->has_frame) {
+    std::unique_lock<std::mutex> lock(session->mutex);
+    if (!session->has_frame || session->latest_slot < 0) {
         set_error(session, "NVENC encode was asked for a frame before capture produced one");
         return -1;
     }
-    session->context->CopyResource(session->encode_tex, session->scratch);
-    if (!wait_for_gpu(session)) {
+    const int slot = session->latest_slot;
+    session->has_frame = false;
+    if (!wait_for_gpu(session, session->blit_query[slot], false)) {
+        return -1;
+    }
+    session->context->CopyResource(session->encode_tex, session->scratch[slot]);
+    if (!wait_for_gpu(session, session->copy_query, true)) {
         return -1;
     }
 
@@ -385,8 +423,11 @@ extern "C" int nvenc_encode(
         picture.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
     }
     session->frame_index += 1;
-
+    // The hardware encode does not need the capture texture. Releasing the
+    // lock lets the next refresh copy while this picture is compressed.
+    lock.unlock();
     NVENCSTATUS status = session->api.nvEncEncodePicture(session->encoder, &picture);
+    lock.lock();
     if (status != NV_ENC_SUCCESS) {
         check(session, status, "NvEncEncodePicture");
         session->api.nvEncUnmapInputResource(session->encoder, map.mappedResource);
@@ -461,17 +502,23 @@ extern "C" void nvenc_close(NvencSession* session) {
                 session->encoder = nullptr;
             }
         }
-        if (session->query != nullptr) {
-            session->query->Release();
-            session->query = nullptr;
+        if (session->copy_query != nullptr) {
+            session->copy_query->Release();
+            session->copy_query = nullptr;
+        }
+        for (int slot = 0; slot < 2; ++slot) {
+            if (session->blit_query[slot] != nullptr) {
+                session->blit_query[slot]->Release();
+                session->blit_query[slot] = nullptr;
+            }
+            if (session->scratch[slot] != nullptr) {
+                session->scratch[slot]->Release();
+                session->scratch[slot] = nullptr;
+            }
         }
         if (session->encode_tex != nullptr) {
             session->encode_tex->Release();
             session->encode_tex = nullptr;
-        }
-        if (session->scratch != nullptr) {
-            session->scratch->Release();
-            session->scratch = nullptr;
         }
         if (session->context != nullptr) {
             session->context->Release();

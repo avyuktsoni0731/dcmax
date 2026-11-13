@@ -4,6 +4,37 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// delay, and the viewer would rather get the next fresh one.
 pub const MAX_FRAME_AGE: Duration = Duration::from_millis(150);
 
+/// Pointer position inside the captured frame, independent of the video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorSample {
+    pub visible: bool,
+    /// 0 is the left edge and 65535 is the right edge of the encoded frame.
+    pub x: u16,
+    /// 0 is the top edge and 65535 is the bottom edge of the encoded frame.
+    pub y: u16,
+}
+
+impl CursorSample {
+    pub fn to_bytes(self) -> [u8; 5] {
+        let mut bytes = [0u8; 5];
+        bytes[0] = u8::from(self.visible);
+        bytes[1..3].copy_from_slice(&self.x.to_le_bytes());
+        bytes[3..5].copy_from_slice(&self.y.to_le_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 5 {
+            return None;
+        }
+        Some(Self {
+            visible: bytes[0] != 0,
+            x: u16::from_le_bytes([bytes[1], bytes[2]]),
+            y: u16::from_le_bytes([bytes[3], bytes[4]]),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AccessUnit {
     pub payload: Vec<u8>,
@@ -17,6 +48,7 @@ pub struct AccessUnit {
     /// stamp the frame from the wall clock. Never a small value that starts at
     /// zero: those are read as 1970 and the receiver drops the chain.
     pub timestamp_us: Option<i64>,
+    pub cursor: Option<CursorSample>,
 }
 
 /// Microseconds since the Unix epoch. Never zero.
@@ -165,6 +197,7 @@ impl AnnexBSplitter {
             read_at: Instant::now(),
             captured_at: Instant::now(),
             timestamp_us: None,
+            cursor: None,
         };
         self.reset_au();
         Some(unit)

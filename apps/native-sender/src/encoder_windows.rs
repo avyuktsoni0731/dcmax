@@ -1,6 +1,6 @@
 use super::ffmpeg;
 use crate::config::{AppConfig, EncoderBackend};
-use crate::h264::{monotonic_unix_us, unix_us_now, AccessUnit, MAX_FRAME_AGE};
+use crate::h264::{monotonic_unix_us, unix_us_now, AccessUnit, CursorSample, MAX_FRAME_AGE};
 use anyhow::{anyhow, Result};
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
@@ -63,6 +63,7 @@ enum Ready {
 struct Captured {
     at: Instant,
     unix_us: i64,
+    cursor: CursorSample,
 }
 
 struct Shared {
@@ -79,6 +80,10 @@ struct Shared {
     stale_skips: AtomicU64,
     width: u32,
     height: u32,
+    origin_x: i32,
+    origin_y: i32,
+    monitor_width: u32,
+    monitor_height: u32,
     fps: u32,
     gop: u32,
 }
@@ -131,6 +136,9 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         }
         let session = self.shared.session.load(Ordering::Acquire);
         let status = unsafe { nvenc_blit(session, frame.as_raw_texture().as_raw()) };
+        if status == 1 {
+            return Ok(());
+        }
         if status != 0 {
             let message = last_error(session);
             remember_fatal(&self.shared, &message);
@@ -140,6 +148,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             *slot = Some(Captured {
                 at: Instant::now(),
                 unix_us: unix_us_now(),
+                cursor: sample_cursor(&self.shared),
             });
             self.shared.pending_cv.notify_one();
         }
@@ -266,6 +275,7 @@ fn start_nvenc(config: &AppConfig) -> Result<ScreenEncoder> {
     let display_height = monitor
         .height()
         .map_err(|err| anyhow!("monitor height: {err}"))?;
+    let origin = monitor_origin();
     let width = even_min(config.width, display_width);
     let height = even_min(config.height, display_height);
     if width < 2 || height < 2 {
@@ -304,12 +314,16 @@ fn start_nvenc(config: &AppConfig) -> Result<ScreenEncoder> {
         stale_skips: AtomicU64::new(0),
         width,
         height,
+        origin_x: origin.0,
+        origin_y: origin.1,
+        monitor_width: display_width,
+        monitor_height: display_height,
         fps: config.target_fps.max(1),
         gop: config.gop_frames().max(1),
     });
     let settings = Settings::new(
         monitor,
-        CursorCaptureSettings::WithCursor,
+        CursorCaptureSettings::WithoutCursor,
         DrawBorderSettings::WithoutBorder,
         SecondaryWindowSettings::Default,
         MinimumUpdateIntervalSettings::Default,
@@ -441,6 +455,7 @@ fn spawn_encode_thread(
                     read_at: Instant::now(),
                     captured_at: captured.at,
                     timestamp_us: Some(monotonic_unix_us(&mut last_unix_us, captured.unix_us)),
+                    cursor: Some(captured.cursor),
                 };
                 match tx.try_send(unit) {
                     Ok(()) => {}
@@ -516,6 +531,55 @@ fn wait_until_started(shared: &Shared) -> Result<()> {
             }
         }
     }
+}
+
+fn monitor_origin() -> (i32, i32) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    };
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let mut info = std::mem::zeroed::<MONITORINFO>();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return (info.rcMonitor.left, info.rcMonitor.top);
+        }
+    }
+    (0, 0)
+}
+
+fn sample_cursor(shared: &Shared) -> CursorSample {
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
+    let mut info = unsafe { std::mem::zeroed::<CURSORINFO>() };
+    info.cbSize = std::mem::size_of::<CURSORINFO>() as u32;
+    let visible = unsafe { GetCursorInfo(&mut info) }.is_ok()
+        && (info.flags.0 & CURSOR_SHOWING.0) != 0;
+    let rel_x = (info.ptScreenPos.x - shared.origin_x).clamp(0, shared.monitor_width.saturating_sub(1) as i32);
+    let rel_y = (info.ptScreenPos.y - shared.origin_y).clamp(0, shared.monitor_height.saturating_sub(1) as i32);
+    let frame_x = if shared.monitor_width == 0 {
+        0
+    } else {
+        (rel_x as u64 * u64::from(shared.width) / u64::from(shared.monitor_width))
+            .min(u64::from(shared.width.saturating_sub(1)))
+    };
+    let frame_y = if shared.monitor_height == 0 {
+        0
+    } else {
+        (rel_y as u64 * u64::from(shared.height) / u64::from(shared.monitor_height))
+            .min(u64::from(shared.height.saturating_sub(1)))
+    };
+    let x = if shared.width <= 1 {
+        0
+    } else {
+        (frame_x * 65535 / u64::from(shared.width - 1)) as u16
+    };
+    let y = if shared.height <= 1 {
+        0
+    } else {
+        (frame_y * 65535 / u64::from(shared.height - 1)) as u16
+    };
+    CursorSample { visible, x, y }
 }
 
 fn frame_interval(fps: u32) -> Duration {
