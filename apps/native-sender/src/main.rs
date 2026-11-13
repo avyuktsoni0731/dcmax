@@ -3,17 +3,27 @@ mod config;
 mod encoder;
 mod h264;
 mod publish;
+mod watch;
 
 use anyhow::Result;
 use clap::Parser;
 use config::{AppConfig, CliArgs, TargetPlatform};
 use reqwest::Client;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let args = CliArgs::parse();
     let config = AppConfig::from_env(&args)?;
+    if config.watch {
+        return watch::run(&config);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_sender(config))
+}
+
+async fn run_sender(config: AppConfig) -> Result<()> {
     ensure_host_platform(&config)?;
 
     let client = Client::new();

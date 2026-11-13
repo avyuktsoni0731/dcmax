@@ -31,6 +31,9 @@ pub struct CliArgs {
     pub height: u32,
     #[arg(long, default_value_t = 8000)]
     pub bitrate_kbps: u32,
+    /// Join the room and show the shared screen. Does not capture.
+    #[arg(long, default_value_t = false)]
+    pub watch: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +84,7 @@ pub struct AppConfig {
     pub width: u32,
     pub height: u32,
     pub bitrate_kbps: u32,
+    pub watch: bool,
 }
 
 impl AppConfig {
@@ -92,11 +96,16 @@ impl AppConfig {
             .clone()
             .or_else(|| std::env::var("ROOM_NAME").ok())
             .unwrap_or_else(|| "mycord-room".to_string());
-        let identity = args
-            .identity
-            .clone()
-            .or_else(|| std::env::var("IDENTITY").ok())
-            .unwrap_or_else(|| "native-sender".to_string());
+        let identity = if args.watch {
+            args.identity
+                .clone()
+                .unwrap_or_else(|| "native-viewer".to_string())
+        } else {
+            args.identity
+                .clone()
+                .or_else(|| std::env::var("IDENTITY").ok())
+                .unwrap_or_else(|| "native-sender".to_string())
+        };
         let client_type =
             std::env::var("CLIENT_TYPE").unwrap_or_else(|_| "native_sender".to_string());
         let platform = TargetPlatform::parse(&args.platform)?;
@@ -128,8 +137,8 @@ impl AppConfig {
         if args.width % 2 != 0 || args.height % 2 != 0 {
             bail!("--width and --height must be even");
         }
-        if args.bitrate_kbps < 800 || args.bitrate_kbps > 20_000 {
-            bail!("--bitrate-kbps must be between 800 and 20000");
+        if args.bitrate_kbps < 800 || args.bitrate_kbps > 50_000 {
+            bail!("--bitrate-kbps must be between 800 and 50000");
         }
         let encoder_backend = match args.encoder.to_ascii_lowercase().as_str() {
             "fast" => EncoderBackend::Fast,
@@ -161,6 +170,7 @@ impl AppConfig {
             width: args.width,
             height: args.height,
             bitrate_kbps: args.bitrate_kbps,
+            watch: args.watch,
         })
     }
 
