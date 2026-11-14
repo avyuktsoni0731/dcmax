@@ -314,16 +314,133 @@ fn note_once(message: &str) {
     eprintln!("{message}");
 }
 
-/// Packed RGBA for the app window. The Metal presenter still owns the fast path
-/// in the watch window; this copy is only for the in-app stage.
+/// Packed RGBA for the app window. VideoToolbox decode is fast; a pixel-by-pixel
+/// copy was not, and the picture fell further behind every frame.
 pub fn rgba(buffer: &CVPixelBuffer, full_range: bool) -> Option<(u32, u32, Vec<u8>)> {
     let width = u32::try_from(buffer.width()).ok()?;
     let height = u32::try_from(buffer.height()).ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
     let guard = buffer.lock_read_only().ok()?;
     let y = plane(&guard, 0, height as usize)?;
     let uv = plane(&guard, 1, ((height as usize) + 1) / 2)?;
     let stride_y = u32::try_from(guard.bytes_per_row_of_plane(0)).ok()?;
     let stride_uv = u32::try_from(guard.bytes_per_row_of_plane(1)).ok()?;
+    let rgba = nv12_to_rgba(y, stride_y, uv, stride_uv, width, height, full_range)?;
+    Some((width, height, rgba))
+}
+
+fn nv12_to_rgba(
+    y: &[u8],
+    stride_y: u32,
+    uv: &[u8],
+    stride_uv: u32,
+    width: u32,
+    height: u32,
+    full_range: bool,
+) -> Option<Vec<u8>> {
+    if width % 2 != 0 || height % 2 != 0 {
+        return Some(rgba_scalar(y, stride_y, uv, stride_uv, width, height, full_range));
+    }
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+    let info = conversion(full_range)?;
+    let src_y = VImageBuffer {
+        data: y.as_ptr() as *mut u8,
+        height: height as usize,
+        width: width as usize,
+        row_bytes: stride_y as usize,
+    };
+    let src_uv = VImageBuffer {
+        data: uv.as_ptr() as *mut u8,
+        height: (height / 2) as usize,
+        width: (width / 2) as usize,
+        row_bytes: stride_uv as usize,
+    };
+    let dest = VImageBuffer {
+        data: rgba.as_mut_ptr(),
+        height: height as usize,
+        width: width as usize,
+        row_bytes: (width as usize) * 4,
+    };
+    // ARGB component order is A=0, R=1, G=2, B=3. This writes R, G, B, A.
+    let permute = [1u8, 2, 3, 0];
+    let status = unsafe {
+        vImageConvert_420Yp8_CbCr8ToARGB8888(
+            &src_y,
+            &src_uv,
+            &dest,
+            info,
+            permute.as_ptr(),
+            255,
+            0,
+        )
+    };
+    if status == 0 {
+        Some(rgba)
+    } else {
+        Some(rgba_scalar(y, stride_y, uv, stride_uv, width, height, full_range))
+    }
+}
+
+fn conversion(full_range: bool) -> Option<&'static VImageYpCbCrToARGB> {
+    use std::sync::OnceLock;
+    static LIMITED: OnceLock<Option<VImageYpCbCrToARGB>> = OnceLock::new();
+    static FULL: OnceLock<Option<VImageYpCbCrToARGB>> = OnceLock::new();
+    let slot = if full_range { &FULL } else { &LIMITED };
+    slot.get_or_init(|| {
+        let range = if full_range {
+            VImageYpCbCrPixelRange {
+                yp_bias: 0,
+                cbcr_bias: 128,
+                yp_range_max: 255,
+                cbcr_range_max: 255,
+                yp_max: 255,
+                yp_min: 1,
+                cbcr_max: 255,
+                cbcr_min: 0,
+            }
+        } else {
+            VImageYpCbCrPixelRange {
+                yp_bias: 16,
+                cbcr_bias: 128,
+                yp_range_max: 235,
+                cbcr_range_max: 240,
+                yp_max: 255,
+                yp_min: 0,
+                cbcr_max: 255,
+                cbcr_min: 1,
+            }
+        };
+        let mut info = VImageYpCbCrToARGB { opaque: [0; 128] };
+        let status = unsafe {
+            vImageConvert_YpCbCrToARGB_GenerateConversion(
+                kvImage_YpCbCrToARGBMatrix_ITU_R_709_2,
+                &range,
+                &mut info,
+                4,
+                0,
+                0,
+            )
+        };
+        if status == 0 {
+            Some(info)
+        } else {
+            None
+        }
+    })
+    .as_ref()
+}
+
+fn rgba_scalar(
+    y: &[u8],
+    stride_y: u32,
+    uv: &[u8],
+    stride_uv: u32,
+    width: u32,
+    height: u32,
+    full_range: bool,
+) -> Vec<u8> {
     let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
     for row in 0..height {
         for col in 0..width {
@@ -342,7 +459,7 @@ pub fn rgba(buffer: &CVPixelBuffer, full_range: bool) -> Option<(u32, u32, Vec<u
             rgba[at + 3] = 255;
         }
     }
-    Some((width, height, rgba))
+    rgba
 }
 
 fn plane<'a>(
@@ -481,4 +598,77 @@ extern "C" {
 extern "C" {
     fn CFRelease(value: *const c_void);
     fn CFRetain(value: *const c_void) -> *const c_void;
+}
+
+#[repr(C)]
+struct VImageBuffer {
+    data: *mut u8,
+    height: usize,
+    width: usize,
+    row_bytes: usize,
+}
+
+#[repr(C)]
+struct VImageYpCbCrPixelRange {
+    yp_bias: i32,
+    cbcr_bias: i32,
+    yp_range_max: i32,
+    cbcr_range_max: i32,
+    yp_max: i32,
+    yp_min: i32,
+    cbcr_max: i32,
+    cbcr_min: i32,
+}
+
+#[repr(C, align(16))]
+struct VImageYpCbCrToARGB {
+    opaque: [u8; 128],
+}
+
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    static kvImage_YpCbCrToARGBMatrix_ITU_R_709_2: *const u8;
+    fn vImageConvert_YpCbCrToARGB_GenerateConversion(
+        matrix: *const u8,
+        pixel_range: *const VImageYpCbCrPixelRange,
+        out_info: *mut VImageYpCbCrToARGB,
+        in_type: u32,
+        out_type: u32,
+        flags: u32,
+    ) -> i32;
+    fn vImageConvert_420Yp8_CbCr8ToARGB8888(
+        src_y: *const VImageBuffer,
+        src_cbcr: *const VImageBuffer,
+        dest: *const VImageBuffer,
+        info: *const VImageYpCbCrToARGB,
+        permute_map: *const u8,
+        alpha: u8,
+        flags: u32,
+    ) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn nv12_conversion_is_fast_enough_for_60fps() {
+        let width = 1920u32;
+        let height = 1080u32;
+        let y = vec![235u8; (width * height) as usize];
+        let uv = vec![128u8; (width * height / 2) as usize];
+        let started = Instant::now();
+        let mut rgba = Vec::new();
+        for _ in 0..8 {
+            rgba = nv12_to_rgba(&y, width, &uv, width, width, height, false).expect("convert");
+        }
+        let each = started.elapsed() / 8;
+        assert_eq!(rgba.len(), (width * height * 4) as usize);
+        assert!(rgba[0] > 200 && rgba[1] > 200 && rgba[2] > 200, "limited-range white");
+        assert!(
+            each.as_millis() < 12,
+            "1080p conversion took {each:?}, which cannot hold 60 fps"
+        );
+    }
 }

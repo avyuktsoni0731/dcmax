@@ -15,7 +15,6 @@ use livekit::options::{
 use livekit::prelude::*;
 use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
 use livekit::webrtc::video_source::{native::NativeVideoSource, RtcVideoSource, VideoResolution};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,13 +25,12 @@ struct Frame {
     width: usize,
     height: usize,
     rgba: Vec<u8>,
-    /// When this frame should hit the screen, on the sender's clock.
-    due: Instant,
 }
 
-/// Frames wait here in order. The window shows each one when it is due.
+/// The newest picture only. A queue of older frames is what made the share
+/// play several seconds behind live video.
 struct Stage {
-    frames: Mutex<VecDeque<Frame>>,
+    latest: Mutex<Option<Frame>>,
     ended: AtomicBool,
 }
 
@@ -80,7 +78,7 @@ pub fn run() -> Result<()> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (note_tx, note_rx) = std::sync::mpsc::channel();
     let stage = Arc::new(Stage {
-        frames: Mutex::new(VecDeque::new()),
+        latest: Mutex::new(None),
         ended: AtomicBool::new(false),
     });
     let stage_thread = Arc::clone(&stage);
@@ -131,6 +129,7 @@ struct MyCord {
     fullscreen: bool,
     status: String,
     picture: Option<egui::TextureHandle>,
+    shown: Instant,
 }
 
 const RESOLUTIONS: &[(u32, u32, &str)] = &[
@@ -180,6 +179,7 @@ impl MyCord {
             fullscreen: false,
             status: "You and the other person each open MyCord and join the same room.".to_string(),
             picture: None,
+            shown: Instant::now(),
         }
     }
 
@@ -268,44 +268,40 @@ impl MyCord {
         }
         if self.stage.ended.swap(false, Ordering::AcqRel) {
             self.picture = None;
-            if let Ok(mut frames) = self.stage.frames.lock() {
-                frames.clear();
+            if let Ok(mut latest) = self.stage.latest.lock() {
+                *latest = None;
             }
         }
-        let due = {
-            let Ok(mut frames) = self.stage.frames.lock() else {
-                return;
-            };
-            let now = Instant::now();
-            if frames.front().is_some_and(|frame| frame.due <= now) {
-                frames.pop_front()
-            } else {
-                frames.front().map(|frame| frame.due)
-                    .map(|due| ctx.request_repaint_after(due.saturating_duration_since(now)));
-                None
+        // One upload per refresh. Anything newer that arrived in between
+        // replaces this frame, so a burst cannot pile up into a delay.
+        let ready = self.picture.is_none() || self.shown.elapsed() >= Duration::from_millis(12);
+        if ready {
+            if let Some(frame) = take_frame(&self.stage) {
+                let pixels = frame.width.saturating_mul(frame.height).saturating_mul(4);
+                if frame.width == 0 || frame.height == 0 || frame.rgba.len() != pixels {
+                    note_log(&format!(
+                        "rejected a picture frame {}x{} ({} bytes)",
+                        frame.width,
+                        frame.height,
+                        frame.rgba.len()
+                    ));
+                } else {
+                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                        [frame.width, frame.height],
+                        &frame.rgba,
+                    );
+                    if let Some(texture) = &mut self.picture {
+                        texture.set(image, egui::TextureOptions::LINEAR);
+                    } else {
+                        self.picture =
+                            Some(ctx.load_texture("picture", image, egui::TextureOptions::LINEAR));
+                    }
+                    self.shown = Instant::now();
+                }
             }
-        };
-        if let Some(frame) = due {
-            let pixels = frame.width.saturating_mul(frame.height).saturating_mul(4);
-            if frame.width == 0 || frame.height == 0 || frame.rgba.len() != pixels {
-                note_log(&format!(
-                    "rejected a picture frame {}x{} ({} bytes)",
-                    frame.width,
-                    frame.height,
-                    frame.rgba.len()
-                ));
-                ctx.request_repaint();
-                return;
-            }
-            let image = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
-            if let Some(texture) = &mut self.picture {
-                texture.set(image, egui::TextureOptions::LINEAR);
-            } else {
-                self.picture = Some(ctx.load_texture("picture", image, egui::TextureOptions::LINEAR));
-            }
-            ctx.request_repaint();
-        } else if self.joined {
-            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        if self.joined {
+            ctx.request_repaint_after(Duration::from_millis(8));
         }
     }
 
@@ -872,9 +868,9 @@ fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<At
             Err(_) => break,
         };
         let mut reader = FrameReader::new(stream);
-        let mut pace = Pace::new();
         let mut decoder = PictureDecoder::new();
         let mut saw_video = false;
+        let mut logged = Instant::now();
         note_log("picture connected");
         loop {
             if stop.load(Ordering::Acquire) {
@@ -889,18 +885,24 @@ fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<At
                     }
                 }
                 Ok(Some(frame)) => {
-                    if let Some(mut decoded) = decoder.decode(&frame.payload) {
+                    if let Some(decoded) = decoder.decode(&frame.payload) {
                         if !saw_video {
                             saw_video = true;
                             note_log(&format!("picture {}x{}", decoded.width, decoded.height));
                         }
-                        decoded.due = pace.due(frame.timestamp_us);
-                        enqueue(&stage, decoded);
+                        if logged.elapsed() >= Duration::from_secs(1) {
+                            let now_us = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|time| time.as_micros() as i64)
+                                .unwrap_or(frame.timestamp_us);
+                            let late_ms = now_us.saturating_sub(frame.timestamp_us) / 1000;
+                            note_log(&format!("picture late {late_ms}ms"));
+                            logged = Instant::now();
+                        }
+                        store_frame(&stage, decoded);
                     }
                 }
                 Ok(None) => {
-                    // The sharer closed the picture. A quiet socket is not the
-                    // end: the next frame is still this same connection.
                     note_log("picture closed by the sharer");
                     finish_stream(&stage);
                     break;
@@ -918,52 +920,19 @@ fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<At
     }
 }
 
-struct Pace {
-    origin_us: i64,
-    origin: Instant,
-    started: bool,
-}
-
-impl Pace {
-    fn new() -> Self {
-        Self {
-            origin_us: 0,
-            origin: Instant::now(),
-            started: false,
-        }
-    }
-
-    /// Two frames of hold, then each frame keeps the gap the sender captured.
-    fn due(&mut self, timestamp_us: i64) -> Instant {
-        const HOLD: Duration = Duration::from_millis(34);
-        let now = Instant::now();
-        if !self.started || timestamp_us <= self.origin_us {
-            self.started = true;
-            self.origin_us = timestamp_us;
-            self.origin = now;
-            return now + HOLD;
-        }
-        let elapsed = Duration::from_micros(timestamp_us.saturating_sub(self.origin_us) as u64);
-        self.origin + elapsed + HOLD
+fn store_frame(stage: &Stage, frame: Frame) {
+    if let Ok(mut latest) = stage.latest.lock() {
+        *latest = Some(frame);
     }
 }
 
-fn enqueue(stage: &Stage, frame: Frame) {
-    const CAP: usize = 8;
-    let Ok(mut frames) = stage.frames.lock() else {
-        return;
-    };
-    if frames.len() >= CAP {
-        // The window is more than eight frames behind. Releasing the oldest
-        // keeps the delay from growing; every newer frame is still shown.
-        frames.pop_front();
-    }
-    frames.push_back(frame);
+fn take_frame(stage: &Stage) -> Option<Frame> {
+    stage.latest.lock().ok().and_then(|mut latest| latest.take())
 }
 
 fn finish_stream(stage: &Stage) {
-    if let Ok(mut frames) = stage.frames.lock() {
-        frames.clear();
+    if let Ok(mut latest) = stage.latest.lock() {
+        *latest = None;
     }
     stage.ended.store(true, Ordering::Release);
 }
@@ -994,7 +963,6 @@ impl PictureDecoder {
                 width: width as usize,
                 height: height as usize,
                 rgba,
-                due: Instant::now(),
             });
         }
         #[cfg(target_os = "windows")]
@@ -1012,7 +980,6 @@ impl PictureDecoder {
                 width,
                 height,
                 rgba,
-                due: Instant::now(),
             });
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1109,4 +1076,36 @@ fn store(name: &str, room: &str, invite: Option<&str>, resolution: usize, fps: u
         invite.unwrap_or("")
     );
     let _ = std::fs::write(path, body);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stage_keeps_only_the_newest_frame() {
+        let stage = Stage {
+            latest: Mutex::new(None),
+            ended: AtomicBool::new(false),
+        };
+        store_frame(
+            &stage,
+            Frame {
+                width: 1,
+                height: 1,
+                rgba: vec![1, 0, 0, 255],
+            },
+        );
+        store_frame(
+            &stage,
+            Frame {
+                width: 1,
+                height: 1,
+                rgba: vec![9, 0, 0, 255],
+            },
+        );
+        let frame = take_frame(&stage).expect("a frame is waiting");
+        assert_eq!(frame.rgba[0], 9);
+        assert!(take_frame(&stage).is_none());
+    }
 }

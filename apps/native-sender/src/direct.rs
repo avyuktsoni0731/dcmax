@@ -631,9 +631,13 @@ fn transport() -> Arc<quinn::TransportConfig> {
     // picture while the handshake, which stays small, still succeeds.
     transport.initial_mtu(1200);
     transport.mtu_discovery_config(None);
-    let window = quinn::VarInt::from_u32(8 * 1024 * 1024);
+    // One megabyte is about a tenth of a second at 80 Mbps. The old 8 MB
+    // window held the pictures the viewer had not reached yet, so the share
+    // played that backlog instead of the live screen.
+    let window = quinn::VarInt::from_u32(1024 * 1024);
     transport.receive_window(window);
     transport.stream_receive_window(window);
+    transport.send_window(1024 * 1024);
     Arc::new(transport)
 }
 

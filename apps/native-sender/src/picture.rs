@@ -300,8 +300,10 @@ fn connect_picture(dial: &Dial, shared: Arc<Shared>) -> TcpStream {
 fn prepare(stream: &TcpStream) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let reference = socket2::SockRef::from(stream);
-    let _ = reference.set_send_buffer_size(4 * 1024 * 1024);
-    let _ = reference.set_recv_buffer_size(4 * 1024 * 1024);
+    // A multi-megabyte buffer is a queue of old pictures. A few frames of
+    // room is enough for a burst; anything older is discarded by the sender.
+    let _ = reference.set_send_buffer_size(256 * 1024);
+    let _ = reference.set_recv_buffer_size(256 * 1024);
     Ok(())
 }
 
