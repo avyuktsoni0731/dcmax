@@ -497,6 +497,9 @@ impl SCStreamOutputTrait for AudioHandler {
             }
             return;
         };
+        // Use the sample buffer's presentation timestamp for A/V sync,
+        // same as the video path does via capture_timestamp().
+        let timestamp_us = cmtime_to_us(sample.presentation_timestamp()).unwrap_or_else(unix_us_now);
         let Ok(mut codec) = self.codec.lock() else {
             return;
         };
@@ -506,7 +509,7 @@ impl SCStreamOutputTrait for AudioHandler {
             }
             let _ = self.tx.try_send(EncodedAudio {
                 payload,
-                timestamp_us: unix_us_now(),
+                timestamp_us,
             });
         }
     }

@@ -474,17 +474,21 @@ impl MyCord {
                 });
             });
             self.apply_bar(ctx, action);
-            let bottom_pad = 22.0;
-            let dock_height = 150.0;
+            let bottom_pad = 16.0;
+            let dock_height = 160.0;
+            let top_space = ui.cursor().top();
+            let available_height = ui.max_rect().bottom() - top_space;
+            let stage_height = (available_height - dock_height - bottom_pad).max(200.0);
             let stage = egui::Rect::from_min_size(
-                egui::pos2(ui.max_rect().left() + 16.0, ui.cursor().top() + 8.0),
+                egui::pos2(ui.max_rect().left() + 16.0, top_space + 8.0),
                 egui::vec2(
                     ui.available_width() - 32.0,
-                    (ui.available_height() - dock_height - bottom_pad).max(120.0),
+                    stage_height,
                 ),
             );
             self.stage_view(ui, theme, stage, 16);
-            ui.add_space(stage.height() + 16.0);
+            // Reserve space for dock at bottom
+            ui.allocate_space(egui::vec2(1.0, dock_height));
             self.dock(ui, ctx, theme);
             ui.add_space(bottom_pad);
         });

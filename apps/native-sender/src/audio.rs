@@ -475,8 +475,9 @@ fn capture_loopback(
                         }
                     }
                     let _ = capture.ReleaseBuffer(frames);
+                    // Use wall clock at capture time (same as video path in encoder_windows.rs)
+                    let timestamp_us = crate::h264::unix_us_now();
                     for packet in codec.push(&scratch, channels, rate) {
-                        let timestamp_us = crate::h264::unix_us_now();
                         if tx
                             .try_send(EncodedAudio {
                                 payload: packet,
