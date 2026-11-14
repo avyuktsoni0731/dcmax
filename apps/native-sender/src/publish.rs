@@ -124,7 +124,7 @@ pub async fn run(
         let identity = config.identity.clone();
         println!("picture direct: looking for the other app");
         tokio::spawn(async move {
-            match crate::direct::host(participant, &identity, &mut direct_rx).await {
+            match crate::direct::host(participant, &identity, direct_rx).await {
                 Ok(addr) => {
                     let _ = pipe_tx.send(addr);
                 }

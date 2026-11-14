@@ -483,8 +483,9 @@ fn capture_loopback(
 
 #[cfg(target_os = "windows")]
 fn is_float(format: &windows::Win32::Media::Audio::WAVEFORMATEX) -> bool {
-    use windows::Win32::Media::Audio::{WAVE_FORMAT_EXTENSIBLE, WAVE_FORMAT_IEEE_FLOAT};
-    if format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT as u16 {
+    const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+    const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+    if format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT {
         return true;
     }
     if format.wFormatTag != WAVE_FORMAT_EXTENSIBLE as u16 || format.cbSize < 22 {

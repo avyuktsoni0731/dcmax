@@ -20,8 +20,25 @@ const PUNCH: &[u8] = b"dcmax-punch";
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Card {
     id: String,
+    #[serde(default)]
     addr: String,
+    #[serde(default)]
+    addrs: Vec<String>,
     cert: String,
+}
+
+impl Card {
+    fn targets(&self) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = self.addrs.iter().filter_map(|item| item.parse().ok()).collect();
+        if let Ok(one) = self.addr.parse() {
+            if !out.contains(&one) {
+                out.push(one);
+            }
+        }
+        out.sort_by_key(rank);
+        out.dedup();
+        out
+    }
 }
 
 struct Identity {
@@ -34,23 +51,15 @@ struct Identity {
 pub async fn host(
     participant: LocalParticipant,
     identity: &str,
-    incoming: &mut UnboundedReceiver<Vec<u8>>,
+    mut incoming: UnboundedReceiver<Vec<u8>>,
 ) -> Result<SocketAddr> {
-    let (socket, mapped) = tokio::task::spawn_blocking(stun_bind)
+    let (socket, candidates) = tokio::task::spawn_blocking(prepare)
         .await
-        .context("stun task")??;
+        .context("address lookup")??;
     let mine = make_cert()?;
-    println!("picture direct: this app is at {mapped}");
-    let card = Card {
-        id: identity.to_string(),
-        addr: mapped.to_string(),
-        cert: hex(&mine.cert),
-    };
-    let peer = exchange(&participant, &card, incoming, false).await?;
-    let peer_addr = peer.addr.parse().context("other app address")?;
-    println!("picture direct: other app is at {peer_addr}");
-    let socket = punch_owned(socket, peer_addr).await?;
+    println!("picture direct: this app is at {}", join_addrs(&candidates));
     let endpoint = server_endpoint(socket, &mine)?;
+    println!("picture direct: listening");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let local = listener.local_addr()?;
     tokio::spawn(async move {
@@ -61,16 +70,40 @@ pub async fn host(
                 .await
                 .context("picture direct: the watcher did not connect")?;
             let connection = incoming.await.context("picture direct: handshake failed")?;
+            // The sender opens the stream. Quinn does not tell the watcher a
+            // stream exists until this side writes, and the watcher has nothing
+            // to write until a frame has already arrived.
             connection
-                .accept_bi()
+                .open_bi()
                 .await
                 .context("picture direct: no stream")
         };
         let (tcp, streams) = tokio::join!(accepted, quic);
         match (tcp, streams) {
-            (Ok((tcp, _)), Ok((send, recv))) => bridge(tcp, send, recv).await,
+            (Ok((tcp, _)), Ok((send, recv))) => {
+                println!("picture direct: carrying the picture");
+                bridge(tcp, send, recv).await;
+                println!("picture direct: picture stopped");
+            }
             (Err(err), _) => eprintln!("picture direct: local pipe {err}"),
             (_, Err(err)) => eprintln!("picture direct: {err:#}"),
+        }
+    });
+    let card = Card {
+        id: identity.to_string(),
+        addr: candidates.first().map(|addr| addr.to_string()).unwrap_or_default(),
+        addrs: candidates.iter().map(|addr| addr.to_string()).collect(),
+        cert: hex(&mine.cert),
+    };
+    tokio::spawn(async move {
+        match exchange(&participant, &card, &mut incoming, false).await {
+            Ok(peer) => {
+                println!(
+                    "picture direct: other app is at {}",
+                    join_addrs(&peer.targets())
+                );
+            }
+            Err(err) => eprintln!("picture direct: {err:#}"),
         }
     });
     Ok(local)
@@ -105,31 +138,36 @@ pub async fn join_watch(config: crate::config::AppConfig, playback: SocketAddr) 
             }
         }
     });
-    let (socket, mapped) = tokio::task::spawn_blocking(stun_bind)
+    let (socket, candidates) = tokio::task::spawn_blocking(prepare)
         .await
-        .context("stun task")??;
-    println!("picture direct: this app is at {mapped}");
+        .context("address lookup")??;
+    println!("picture direct: this app is at {}", join_addrs(&candidates));
     let card = Card {
         id: config.identity.clone(),
-        addr: mapped.to_string(),
+        addr: candidates.first().map(|addr| addr.to_string()).unwrap_or_default(),
+        addrs: candidates.iter().map(|addr| addr.to_string()).collect(),
         cert: String::new(),
     };
     let participant = room.local_participant();
     let peer = exchange(&participant, &card, &mut incoming, true).await?;
-    let peer_addr = peer.addr.parse().context("other app address")?;
+    let targets = peer.targets();
     let expected = unhex(&peer.cert)?;
-    println!("picture direct: other app is at {peer_addr}");
-    let socket = punch_owned(socket, peer_addr).await?;
+    println!("picture direct: other app is at {}", join_addrs(&targets));
+    let (socket, reached) = punch_owned(socket, targets.clone()).await?;
+    if !reached.is_empty() {
+        println!("picture direct: reached {}", join_addrs(&reached));
+    }
     let mut endpoint = client_endpoint(socket, expected)?;
-    let connection = connect_with_retry(&mut endpoint, peer_addr).await?;
-    let (send, recv) = connection
-        .open_bi()
-        .await
-        .context("picture direct: stream")?;
+    let connection = connect_first(&mut endpoint, dial_order(&reached, &targets)).await?;
     let local = tokio::net::TcpStream::connect(playback)
         .await
         .context("picture direct: playback pipe")?;
-    println!("picture direct: connected");
+    println!("picture direct: connected, waiting for the first frame");
+    let (send, recv) = connection
+        .accept_bi()
+        .await
+        .context("picture direct: stream")?;
+    println!("picture direct: picture stream open");
     bridge(local, send, recv).await;
     Ok(())
 }
@@ -168,7 +206,7 @@ async fn exchange(
                 let Ok(card) = serde_json::from_slice::<Card>(&message) else {
                     continue;
                 };
-                if card.id == me.id || card.addr.parse::<SocketAddr>().is_err() {
+                if card.id == me.id || card.targets().is_empty() {
                     continue;
                 }
                 if want_cert && card.cert.is_empty() {
@@ -180,59 +218,93 @@ async fn exchange(
     }
 }
 
-async fn punch_owned(socket: UdpSocket, peer: SocketAddr) -> Result<UdpSocket> {
+async fn punch_owned(socket: UdpSocket, peers: Vec<SocketAddr>) -> Result<(UdpSocket, Vec<SocketAddr>)> {
     tokio::task::spawn_blocking(move || {
-        punch(&socket, peer)?;
-        Ok(socket)
+        let reached = punch(&socket, &peers);
+        Ok((socket, reached))
     })
     .await
     .context("punch task")?
 }
 
-fn punch(socket: &UdpSocket, peer: SocketAddr) -> Result<()> {
+fn punch(socket: &UdpSocket, peers: &[SocketAddr]) -> Vec<SocketAddr> {
     socket
-        .set_read_timeout(Some(Duration::from_millis(200)))
+        .set_read_timeout(Some(Duration::from_millis(100)))
         .ok();
-    let mut seen = false;
-    for _ in 0..25 {
-        socket.send_to(PUNCH, peer).ok();
+    let mut reached = Vec::new();
+    for _ in 0..8 {
+        for peer in peers {
+            socket.send_to(PUNCH, peer).ok();
+        }
         let mut buf = [0u8; 64];
-        if let Ok((size, _)) = socket.recv_from(&mut buf) {
-            if &buf[..size] == PUNCH {
-                seen = true;
-                for _ in 0..4 {
-                    socket.send_to(PUNCH, peer).ok();
-                }
-                break;
+        if let Ok((size, from)) = socket.recv_from(&mut buf) {
+            if &buf[..size] == PUNCH && !reached.contains(&from) {
+                reached.push(from);
             }
+        }
+    }
+    for peer in &reached {
+        for _ in 0..4 {
+            socket.send_to(PUNCH, peer).ok();
         }
     }
     socket.set_nonblocking(true).ok();
     let mut buf = [0u8; 1500];
     while socket.recv_from(&mut buf).is_ok() {}
     socket.set_nonblocking(false).ok();
-    if !seen {
-        println!("picture direct: no punch packet back yet, trying the connection anyway");
+    reached
+}
+
+fn dial_order(reached: &[SocketAddr], targets: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut order = reached.to_vec();
+    order.extend(targets.iter().copied());
+    order.sort_by_key(|addr| (rank(addr), !reached.contains(addr)));
+    order.dedup();
+    order
+}
+
+async fn connect_first(
+    endpoint: &mut quinn::Endpoint,
+    peers: Vec<SocketAddr>,
+) -> Result<quinn::Connection> {
+    if peers.is_empty() {
+        bail!("the other app did not share an address");
     }
-    Ok(())
+    let mut last = anyhow::anyhow!("picture direct: handshake failed");
+    for peer in peers {
+        println!("picture direct: trying {peer}");
+        match connect_with_retry(endpoint, peer, Duration::from_secs(2)).await {
+            Ok(connection) => {
+                println!("picture direct: connected via {peer}");
+                return Ok(connection);
+            }
+            Err(err) => {
+                eprintln!("picture direct: {peer} did not connect ({err:#})");
+                last = err;
+            }
+        }
+    }
+    Err(last)
 }
 
 async fn connect_with_retry(
     endpoint: &mut quinn::Endpoint,
     peer: SocketAddr,
+    budget: Duration,
 ) -> Result<quinn::Connection> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let deadline = tokio::time::Instant::now() + budget;
     loop {
         let connecting = endpoint
             .connect(peer, "dcmax")
             .context("picture direct: connect")?;
-        match connecting.await {
-            Ok(connection) => return Ok(connection),
-            Err(err) if tokio::time::Instant::now() < deadline => {
+        match tokio::time::timeout(Duration::from_secs(2), connecting).await {
+            Ok(Ok(connection)) => return Ok(connection),
+            Ok(Err(err)) if tokio::time::Instant::now() < deadline => {
                 eprintln!("picture direct: handshake retry ({err})");
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            Err(err) => return Err(err).context("picture direct: handshake failed"),
+            Ok(Err(err)) => return Err(err).context("picture direct: handshake failed"),
+            Err(_) => return Err(anyhow::anyhow!("picture direct: {peer} timed out")),
         }
     }
 }
@@ -240,43 +312,134 @@ async fn connect_with_retry(
 async fn bridge(local: tokio::net::TcpStream, mut send: quinn::SendStream, mut recv: quinn::RecvStream) {
     local.set_nodelay(true).ok();
     let (mut reader, mut writer) = local.into_split();
-    let mut outbound = vec![0u8; 32 * 1024];
-    let mut inbound = vec![0u8; 32 * 1024];
-    loop {
-        tokio::select! {
-            read = reader.read(&mut outbound) => {
-                match read {
-                    Ok(0) | Err(_) => break,
-                    Ok(size) => {
-                        if send.write_all(&outbound[..size]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
+    // The two directions have to stay independent. The watcher often sends
+    // nothing, and treating that quiet direction as a closed connection was
+    // throwing away the picture.
+    let to_remote = async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut sent = 0u64;
+        loop {
+            let size = match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(size) => size,
+            };
+            if send.write_all(&buf[..size]).await.is_err() {
+                eprintln!("picture direct: send stopped after {sent} bytes");
+                break;
             }
-            read = recv.read(&mut inbound) => {
-                match read {
-                    Ok(Some(size)) if size > 0 => {
-                        if writer.write_all(&inbound[..size]).await.is_err() {
-                            break;
-                        }
+            if sent == 0 {
+                println!("picture direct: sending picture bytes");
+            }
+            sent += size as u64;
+        }
+        let _ = send.finish();
+    };
+    let to_local = async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut received = 0u64;
+        loop {
+            match recv.read(&mut buf).await {
+                Ok(Some(size)) if size > 0 => {
+                    if writer.write_all(&buf[..size]).await.is_err() {
+                        eprintln!("picture direct: playback write stopped after {received} bytes");
+                        break;
                     }
-                    _ => break,
+                    if received == 0 {
+                        println!("picture direct: picture bytes arrived");
+                    }
+                    received += size as u64;
+                }
+                Ok(_) => break,
+                Err(err) => {
+                    eprintln!("picture direct: receive stopped after {received} bytes ({err})");
+                    break;
                 }
             }
         }
-    }
+    };
+    tokio::join!(to_remote, to_local);
 }
 
-fn stun_bind() -> Result<(UdpSocket, SocketAddr)> {
+fn prepare() -> Result<(UdpSocket, Vec<SocketAddr>)> {
     let socket = UdpSocket::bind("0.0.0.0:0").context("udp bind")?;
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
         .ok();
+    let port = socket.local_addr().context("local port")?.port();
+    let mut candidates = local_candidates(port);
+    match stun_mapped(&socket) {
+        Ok(mapped) if mapped.is_ipv4() && !candidates.contains(&mapped) => candidates.push(mapped),
+        Ok(_) => {}
+        Err(err) => eprintln!("picture direct: public address unavailable ({err:#})"),
+    }
+    candidates.sort_by_key(rank);
+    candidates.dedup();
+    if candidates.is_empty() {
+        bail!("this app has no IPv4 address to share");
+    }
+    Ok((socket, candidates))
+}
+
+fn local_candidates(port: u16) -> Vec<SocketAddr> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|iface| {
+            if virtual_adapter(&iface.name) {
+                return None;
+            }
+            match iface.addr {
+                if_addrs::IfAddr::V4(addr)
+                    if !addr.ip.is_loopback() && !addr.ip.is_link_local() =>
+                {
+                    Some(SocketAddr::new(IpAddr::V4(addr.ip), port))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn virtual_adapter(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["virtualbox", "vmware", "hyper-v", "vethernet", "docker", "bluetooth", "teredo", "wsl"]
+        .iter()
+        .any(|label| name.contains(label))
+}
+
+fn rank(addr: &SocketAddr) -> u8 {
+    let IpAddr::V4(ip) = addr.ip() else {
+        return 3;
+    };
+    let [first, second, third, _] = ip.octets();
+    // VirtualBox's host-only network. It is a private address on this PC and
+    // is not reachable from the other machine.
+    if first == 192 && second == 168 && third == 56 {
+        return 5;
+    }
+    if ip.is_private() {
+        return 0;
+    }
+    if first == 100 && (second & 0xc0) == 64 {
+        return 1;
+    }
+    2
+}
+
+fn join_addrs(addrs: &[SocketAddr]) -> String {
+    addrs
+        .iter()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn stun_mapped(socket: &UdpSocket) -> Result<SocketAddr> {
     let mut last = anyhow::anyhow!("no STUN server answered");
     for server in ["stun.l.google.com:19302", "stun.cloudflare.com:3478"] {
-        match stun_query(&socket, server) {
-            Ok(mapped) => return Ok((socket, mapped)),
+        match stun_query(socket, server) {
+            Ok(mapped) if mapped.is_ipv4() => return Ok(mapped),
+            Ok(_) => {}
             Err(err) => last = err,
         }
     }
@@ -284,9 +447,27 @@ fn stun_bind() -> Result<(UdpSocket, SocketAddr)> {
 }
 
 fn stun_query(socket: &UdpSocket, server: &str) -> Result<SocketAddr> {
-    let server = server
-        .to_socket_addrs_first()
-        .with_context(|| format!("resolve {server}"))?;
+    use std::net::ToSocketAddrs;
+    let addresses: Vec<SocketAddr> = server
+        .to_socket_addrs()
+        .with_context(|| format!("resolve {server}"))?
+        .filter(|addr| addr.is_ipv4())
+        .collect();
+    if addresses.is_empty() {
+        bail!("{server} has no IPv4 address");
+    }
+    let mut last = anyhow::anyhow!("{server} did not answer on IPv4");
+    for address in addresses {
+        match stun_exchange(socket, address) {
+            Ok(mapped) if mapped.is_ipv4() => return Ok(mapped),
+            Ok(mapped) => last = anyhow::anyhow!("stun {address} returned {mapped}"),
+            Err(err) => last = err,
+        }
+    }
+    Err(last)
+}
+
+fn stun_exchange(socket: &UdpSocket, server: SocketAddr) -> Result<SocketAddr> {
     let txid = transaction_id();
     socket
         .send_to(&binding_request(&txid), server)
@@ -296,24 +477,10 @@ fn stun_query(socket: &UdpSocket, server: &str) -> Result<SocketAddr> {
         .recv_from(&mut buf)
         .with_context(|| format!("stun {server} timed out"))?;
     let mapped = parse_xor_mapped(&buf[..size])?;
-    if buf.len() >= 20 && buf[8..20] != txid {
+    if buf[8..20] != txid {
         bail!("stun response was for a different request");
     }
     Ok(mapped)
-}
-
-trait FirstAddr {
-    fn to_socket_addrs_first(&self) -> Result<SocketAddr>;
-}
-
-impl FirstAddr for str {
-    fn to_socket_addrs_first(&self) -> Result<SocketAddr> {
-        use std::net::ToSocketAddrs;
-        self.to_socket_addrs()
-            .with_context(|| format!("resolve {self}"))?
-            .next()
-            .context("no address")
-    }
 }
 
 fn binding_request(txid: &[u8; 12]) -> [u8; 20] {
@@ -416,6 +583,13 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 fn transport() -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    // Tailscale's tunnel is 1280 bytes. Letting QUIC grow past that drops the
+    // picture while the handshake, which stays small, still succeeds.
+    transport.initial_mtu(1200);
+    transport.mtu_discovery_config(None);
+    let window = quinn::VarInt::from_u32(8 * 1024 * 1024);
+    transport.receive_window(window);
+    transport.stream_receive_window(window);
     Arc::new(transport)
 }
 
@@ -592,22 +766,22 @@ mod tests {
             let endpoint = server_endpoint(server_socket, &identity).unwrap();
             let incoming = endpoint.accept().await.unwrap();
             let connection = incoming.await.unwrap();
-            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            send.write_all(b"frame").await.unwrap();
             let mut buf = [0u8; 5];
             recv.read_exact(&mut buf).await.unwrap();
-            assert_eq!(&buf, b"frame");
-            send.write_all(b"audio").await.unwrap();
+            assert_eq!(&buf, b"audio");
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
         let mut endpoint = client_endpoint(client_socket, expected).unwrap();
-        let connection = connect_with_retry(&mut endpoint, server_addr)
+        let connection = connect_with_retry(&mut endpoint, server_addr, Duration::from_secs(3))
             .await
             .unwrap();
-        let (mut send, mut recv) = connection.open_bi().await.unwrap();
-        send.write_all(b"frame").await.unwrap();
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
         let mut buf = [0u8; 5];
         recv.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"audio");
+        assert_eq!(&buf, b"frame");
+        send.write_all(b"audio").await.unwrap();
         server.await.unwrap();
     }
 }

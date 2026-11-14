@@ -8,6 +8,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+if-addrs = "0.13"
 livekit = { version = "0.10", features = ["rustls-tls-native-roots"] }
 quinn = "0.11"
 rcgen = "0.13"
@@ -33,6 +34,8 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
