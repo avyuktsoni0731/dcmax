@@ -98,8 +98,9 @@ pub fn run() -> Result<()> {
 
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([860.0, 560.0])
+            .with_inner_size([440.0, 660.0])
+            .with_min_inner_size([420.0, 620.0])
+            .with_decorations(false)
             .with_title("MyCord"),
         ..Default::default()
     };
@@ -127,9 +128,13 @@ struct MyCord {
     sharing: bool,
     muted: bool,
     fullscreen: bool,
+    dark: bool,
+    window_for_call: bool,
     status: String,
     picture: Option<egui::TextureHandle>,
     shown: Instant,
+    pointer_at: Option<egui::Pos2>,
+    controls_until: Instant,
 }
 
 const RESOLUTIONS: &[(u32, u32, &str)] = &[
@@ -161,7 +166,7 @@ impl MyCord {
         visuals.override_text_color = Some(egui::Color32::from_rgb(243, 239, 230));
         cc.egui_ctx.set_visuals(visuals);
         let saved = remember();
-        Self {
+        let app = Self {
             cmd,
             notes,
             stage,
@@ -177,10 +182,15 @@ impl MyCord {
             sharing: false,
             muted: false,
             fullscreen: false,
-            status: "You and the other person each open MyCord and join the same room.".to_string(),
+            dark: saved.dark,
+            window_for_call: false,
+            status: String::new(),
             picture: None,
             shown: Instant::now(),
-        }
+            pointer_at: None,
+            controls_until: Instant::now(),
+        };
+        app
     }
 
     fn picture_settings(&self) -> PictureSettings {
@@ -204,10 +214,17 @@ impl eframe::App for MyCord {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_with(ctx);
         self.keys(ctx);
-        if self.joined {
-            self.call_screen(ctx);
+        self.fit_window(ctx);
+        let theme = self.theme(ctx);
+        if !self.fullscreen {
+            resize_borders(ctx);
+        }
+        if self.fullscreen {
+            self.fullscreen_stage(ctx, &theme);
+        } else if self.joined {
+            self.call_screen(ctx, &theme);
         } else {
-            self.lobby(ctx);
+            self.lobby(ctx, &theme);
         }
     }
 }
@@ -228,6 +245,9 @@ impl MyCord {
 
     fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
         self.fullscreen = on;
+        if on {
+            self.controls_until = Instant::now() + Duration::from_millis(2800);
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
     }
 
@@ -305,139 +325,373 @@ impl MyCord {
         }
     }
 
-    fn lobby(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let top = (ui.available_height() * 0.14).clamp(28.0, 96.0);
-            ui.add_space(top);
+    fn fit_window(&mut self, ctx: &egui::Context) {
+        if self.fullscreen || self.joined == self.window_for_call {
+            return;
+        }
+        self.window_for_call = self.joined;
+        let (size, min) = if self.joined {
+            (egui::vec2(1080.0, 720.0), egui::vec2(860.0, 560.0))
+        } else {
+            (egui::vec2(440.0, 660.0), egui::vec2(420.0, 620.0))
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min));
+        if let Some(monitor) = ctx.input(|input| input.viewport().monitor_size) {
+            if monitor.x > size.x && monitor.y > size.y {
+                let origin = egui::pos2(
+                    ((monitor.x - size.x) / 2.0).max(0.0),
+                    ((monitor.y - size.y) / 2.0).max(24.0),
+                );
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(origin));
+            }
+        }
+    }
+
+    fn theme(&self, ctx: &egui::Context) -> Theme {
+        let blend = ctx.animate_bool_with_time(egui::Id::new("mycord-theme"), self.dark, 0.32);
+        let theme = Theme::blend(blend);
+        let mut visuals = if blend < 0.5 {
+            egui::Visuals::light()
+        } else {
+            egui::Visuals::dark()
+        };
+        visuals.panel_fill = theme.bg;
+        visuals.window_fill = theme.raised;
+        visuals.extreme_bg_color = theme.field;
+        visuals.override_text_color = Some(theme.text);
+        visuals.widgets.noninteractive.fg_stroke.color = theme.text;
+        visuals.widgets.inactive.bg_fill = theme.field;
+        visuals.widgets.inactive.weak_bg_fill = theme.field;
+        visuals.widgets.inactive.fg_stroke.color = theme.text;
+        visuals.widgets.hovered.bg_fill = theme.pill_hover;
+        visuals.widgets.hovered.weak_bg_fill = theme.pill_hover;
+        visuals.widgets.hovered.fg_stroke.color = theme.text;
+        visuals.widgets.active.bg_fill = theme.pill;
+        visuals.widgets.active.fg_stroke.color = theme.text;
+        visuals.widgets.open.bg_fill = theme.raised;
+        visuals.widgets.open.fg_stroke.color = theme.text;
+        visuals.selection.bg_fill = theme.accent;
+        visuals.selection.stroke.color = theme.accent_ink;
+        visuals.window_corner_radius = egui::CornerRadius::same(12);
+        visuals.menu_corner_radius = egui::CornerRadius::same(10);
+        ctx.set_visuals(visuals);
+        theme
+    }
+
+    fn toggle_theme(&mut self) {
+        self.dark = !self.dark;
+        self.persist();
+    }
+
+    fn persist(&self) {
+        let trimmed = self.invite.trim();
+        let invite = if trimmed.is_empty() { None } else { Some(trimmed) };
+        store(
+            &self.name,
+            &self.room,
+            invite,
+            self.resolution,
+            self.fps,
+            self.bitrate_kbps,
+            self.dark,
+        );
+    }
+
+    fn lobby(&mut self, ctx: &egui::Context, theme: &Theme) {
+        let frame = egui::Frame::new().fill(theme.bg);
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            window_edge(ui, theme);
+            let action = title_bar(ui, theme, self.dark, |ui| {
+                let center = egui::pos2(ui.ctx().screen_rect().center().x, ui.max_rect().center().y);
+                ui.painter().text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "MyCord",
+                    egui::FontId::proportional(13.0),
+                    theme.muted,
+                );
+            });
+            self.apply_bar(ctx, action);
+            ui.add_space(18.0);
             ui.vertical_centered(|ui| {
-                ui.set_width(420.0);
-                ui.label(egui::RichText::new("MyCord").size(18.0).color(egui::Color32::from_rgb(224, 168, 92)));
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("Open a room").size(32.0).strong());
-                ui.add_space(6.0);
-                ui.label("The other person opens MyCord, types this room code, and joins. Voice and the screen stay in this window.");
-                ui.add_space(22.0);
-                field(ui, "Your name", &mut self.name, "Ava");
-                ui.add_space(10.0);
-                field(ui, "Room code", &mut self.room, "mycord-room");
-                ui.add_space(10.0);
-                field(ui, "Invite, if this room uses one", &mut self.invite, "Leave blank if you have none");
+                ui.set_width(360.0);
+                brand_row(ui, theme);
                 ui.add_space(18.0);
-                self.picture_pickers(ui);
+                ui.label(egui::RichText::new("Open a room").size(34.0).strong().color(theme.text));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("The other person opens MyCord, enters this room code, and joins. Voice and screen sharing stay right here.")
+                        .size(13.0)
+                        .color(theme.muted),
+                );
+                ui.add_space(18.0);
+                field(ui, theme, "Your name", &mut self.name, "Ava");
+                ui.add_space(12.0);
+                field(ui, theme, "Room code", &mut self.room, "mycord-room");
+                ui.add_space(12.0);
+                field(ui, theme, "Invite, if this room uses one", &mut self.invite, "Leave blank if you have none");
+                ui.add_space(16.0);
+                self.picture_pickers(ui, theme);
                 ui.add_space(18.0);
                 let label = if self.joining { "Joining…" } else { "Join room" };
-                let join = egui::Button::new(label).fill(egui::Color32::from_rgb(224, 168, 92)).min_size(egui::vec2(420.0, 40.0));
-                if ui.add_enabled(!self.joining, join).clicked() {
+                if !self.joining && lime_button(ui, theme, label, true).clicked() {
                     self.join();
                 }
                 ui.add_space(12.0);
-                ui.label(egui::RichText::new(&self.status).color(egui::Color32::from_rgb(156, 148, 134)));
+                if self.status.is_empty() {
+                    status_line(ui, theme, "Ready to join. No account needed.", false);
+                } else {
+                    let joining = self.status.starts_with("Joining");
+                    status_line(ui, theme, &self.status, !joining);
+                }
             });
         });
     }
 
-    fn call_screen(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("bar").exact_height(52.0).show(ctx, |ui| {
-            ui.horizontal_centered(|ui| {
-                ui.label(egui::RichText::new("MyCord").strong().color(egui::Color32::from_rgb(224, 168, 92)));
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new(&self.room).size(16.0));
-                ui.add_space(12.0);
-                ui.label(egui::RichText::new(&self.status).color(egui::Color32::from_rgb(156, 148, 134)));
-            });
-        });
-        egui::TopBottomPanel::bottom("dock").exact_height(108.0).show(ctx, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let mute = if self.muted { "Unmute" } else { "Mute" };
-                if dock_button(ui, mute, self.muted).clicked() {
-                    self.muted = !self.muted;
-                    self.send(Cmd::Mute(self.muted));
-                }
-                let share = if self.sharing { "Stop sharing" } else { "Share screen" };
-                if dock_button(ui, share, self.sharing).clicked() {
-                    if self.sharing {
-                        self.sharing = false;
-                        self.send(Cmd::StopShare);
-                    } else {
-                        self.send(Cmd::Share(self.picture_settings()));
-                    }
-                }
-                let full = if self.fullscreen { "Exit full screen" } else { "Full screen" };
-                if dock_button(ui, full, self.fullscreen).clicked() {
-                    self.set_fullscreen(ctx, !self.fullscreen);
-                }
-                let leave = if self.leaving { "Leaving…" } else { "Leave" };
-                let leave_button = egui::Button::new(leave)
-                    .fill(egui::Color32::from_rgb(227, 106, 85))
-                    .min_size(egui::vec2(120.0, 40.0));
-                if ui.add_enabled(!self.leaving, leave_button).clicked() {
-                    self.leaving = true;
-                    self.status = "Leaving the room…".to_string();
-                    self.send(Cmd::Leave);
-                }
-            });
-            ui.add_space(8.0);
-            self.picture_pickers(ui);
-        });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let rect = ui.max_rect();
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(12, 11, 9));
-            if let Some(texture) = &self.picture {
-                let available = rect.size();
-                let sized = texture.size_vec2();
-                let scale = (available.x / sized.x).min(available.y / sized.y);
-                let size = sized * scale;
-                let image_rect = egui::Rect::from_center_size(rect.center(), size);
-                ui.put(image_rect, egui::Image::new((texture.id(), size)));
+    fn call_screen(&mut self, ctx: &egui::Context, theme: &Theme) {
+        let frame = egui::Frame::new().fill(theme.bg);
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            window_edge(ui, theme);
+            let room = self.room.clone();
+            let status = if self.status.is_empty() {
+                format!("In {}", self.room)
             } else {
-                ui.allocate_ui_at_rect(rect, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(rect.height() * 0.38);
-                        ui.label(egui::RichText::new("Waiting for a screen").size(22.0));
-                        ui.add_space(6.0);
-                        ui.label("When someone presses Share screen, it shows here. Yours shows on their window.");
-                    });
+                self.status.clone()
+            };
+            let action = title_bar(ui, theme, self.dark, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add_space(6.0);
+                    brand_mark(ui, theme, 13.0);
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("|").color(theme.line));
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new(room).size(14.0).color(theme.text));
+                    ui.add_space(12.0);
+                    dot(ui, theme.dot, 4.0);
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(status).size(13.0).color(theme.muted));
                 });
+            });
+            self.apply_bar(ctx, action);
+            let bottom_pad = 22.0;
+            let dock_height = 150.0;
+            let stage = egui::Rect::from_min_size(
+                egui::pos2(ui.max_rect().left() + 16.0, ui.cursor().top() + 8.0),
+                egui::vec2(
+                    ui.available_width() - 32.0,
+                    (ui.available_height() - dock_height - bottom_pad).max(120.0),
+                ),
+            );
+            self.stage_view(ui, theme, stage, 16);
+            ui.add_space(stage.height() + 16.0);
+            self.dock(ui, ctx, theme);
+            ui.add_space(bottom_pad);
+        });
+    }
+
+    fn fullscreen_stage(&mut self, ctx: &egui::Context, theme: &Theme) {
+        let frame = egui::Frame::new().fill(theme.stage);
+        let rect = egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            let rect = ui.max_rect();
+            self.stage_view(ui, theme, rect, 0);
+            rect
+        });
+        let rect = rect.inner;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.bottom() - 84.0),
+            rect.right_bottom(),
+        );
+        let fade = self.chrome_fade(ctx, bar);
+        if fade <= 0.04 {
+            return;
+        }
+        let hint = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.top() + 36.0),
+            egui::vec2(250.0, 36.0),
+        );
+        let mut painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("fs-hint-layer")));
+        painter.set_opacity(fade);
+        painter.rect_filled(hint, 18.0, mix(theme.raised, egui::Color32::BLACK, 0.25));
+        painter.text(
+            hint.center(),
+            egui::Align2::CENTER_CENTER,
+            "Press  Esc  to exit full screen",
+            egui::FontId::proportional(13.0),
+            theme.text,
+        );
+        egui::Area::new(egui::Id::new("fs-dock"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(rect.left(), rect.bottom() - 68.0))
+            .show(ctx, |ui| {
+                ui.set_width(rect.width());
+                ui.set_opacity(fade);
+                self.pills(ui, ctx, theme);
+            });
+    }
+
+    fn chrome_fade(&mut self, ctx: &egui::Context, bar: egui::Rect) -> f32 {
+        let pointer = ctx.input(|input| input.pointer.hover_pos());
+        let moved = match (pointer, self.pointer_at) {
+            (Some(now), Some(previous)) => now.distance(previous) > 2.0,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if let Some(pos) = pointer {
+            self.pointer_at = Some(pos);
+        }
+        let over_bar = pointer.is_some_and(|pos| bar.contains(pos));
+        if moved || over_bar {
+            self.controls_until = Instant::now() + Duration::from_millis(2800);
+        }
+        let show = Instant::now() < self.controls_until;
+        ctx.animate_bool_with_time(egui::Id::new("fs-chrome"), show, 0.24)
+    }
+
+    fn stage_view(&mut self, ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, radius: u8) {
+        ui.painter().rect_filled(rect, radius, theme.stage);
+        if let Some(texture) = &self.picture {
+            let inset = if radius == 0 { 0.0 } else { 8.0 };
+            let available = rect.shrink(inset);
+            let sized = texture.size_vec2();
+            let scale = (available.width() / sized.x).min(available.height() / sized.y);
+            let size = sized * scale;
+            let image_rect = egui::Rect::from_center_size(available.center(), size);
+            ui.put(
+                image_rect,
+                egui::Image::new((texture.id(), size)).corner_radius(egui::CornerRadius::same(radius.saturating_sub(2))),
+            );
+        } else {
+            let icon = egui::Rect::from_center_size(rect.center() - egui::vec2(0.0, 42.0), egui::vec2(42.0, 34.0));
+            let icon_color = if theme.text.r() > 180 { theme.accent } else { theme.text };
+            glyph(ui.painter(), icon, Glyph::Monitor, icon_color);
+            ui.painter().text(
+                rect.center() + egui::vec2(0.0, 8.0),
+                egui::Align2::CENTER_CENTER,
+                "Waiting for a screen",
+                egui::FontId::proportional(22.0),
+                theme.text,
+            );
+            ui.painter().text(
+                rect.center() + egui::vec2(0.0, 36.0),
+                egui::Align2::CENTER_CENTER,
+                "When someone presses Share screen,",
+                egui::FontId::proportional(13.0),
+                theme.muted,
+            );
+            ui.painter().text(
+                rect.center() + egui::vec2(0.0, 54.0),
+                egui::Align2::CENTER_CENTER,
+                "it shows here.",
+                egui::FontId::proportional(13.0),
+                theme.muted,
+            );
+        }
+    }
+
+    fn dock(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, theme: &Theme) {
+        self.pills(ui, ctx, theme);
+        ui.add_space(16.0);
+        self.picture_pickers(ui, theme);
+    }
+
+    fn pills(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, theme: &Theme) {
+        let mute = if self.muted { "Unmute" } else { "Mute" };
+        let share = if self.sharing { "Stop sharing" } else { "Share screen" };
+        let full = if self.fullscreen { "Exit" } else { "Full screen" };
+        let leave = if self.leaving { "Leaving…" } else { "Leave" };
+        let gap = 10.0;
+        let widths = [
+            pill_width(ui, mute),
+            pill_width(ui, share),
+            pill_width(ui, full),
+            pill_width(ui, leave),
+        ];
+        let total = widths.iter().sum::<f32>() + gap * 3.0;
+        ui.horizontal(|ui| {
+            ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
+            if pill(ui, theme, "mute", mute, Glyph::Mic, Pill::Plain, 0.0).clicked() {
+                self.muted = !self.muted;
+                self.send(Cmd::Mute(self.muted));
+            }
+            ui.add_space(gap);
+            let live = ctx.animate_bool_with_time(egui::Id::new("share-live"), self.sharing, 0.2);
+            if pill(ui, theme, "share", share, Glyph::Share, Pill::Live, live).clicked() {
+                if self.sharing {
+                    self.sharing = false;
+                    self.send(Cmd::StopShare);
+                } else {
+                    self.send(Cmd::Share(self.picture_settings()));
+                }
+            }
+            ui.add_space(gap);
+            if pill(ui, theme, "full", full, Glyph::Expand, Pill::Plain, 0.0).clicked() {
+                self.set_fullscreen(ctx, !self.fullscreen);
+            }
+            ui.add_space(gap);
+            if pill(ui, theme, "leave", leave, Glyph::Leave, Pill::Leave, 1.0).clicked() && !self.leaving {
+                self.leaving = true;
+                self.status = "Leaving the room…".to_string();
+                self.send(Cmd::Leave);
             }
         });
     }
 
-    fn picture_pickers(&mut self, ui: &mut egui::Ui) {
+    fn apply_bar(&mut self, ctx: &egui::Context, action: BarClick) {
+        match action {
+            BarClick::None => {}
+            BarClick::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            BarClick::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            BarClick::Zoom => {
+                if self.joined {
+                    self.set_fullscreen(ctx, !self.fullscreen);
+                }
+            }
+            BarClick::Theme => self.toggle_theme(),
+        }
+    }
+
+    fn picture_pickers(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let before = (self.resolution, self.fps, self.bitrate_kbps);
+        let gap = 12.0;
+        let full = ui.available_width();
+        let group = if full < 520.0 { full } else { 468.0 };
+        let column = ((group - gap * 2.0) / 3.0).max(108.0);
+        let total = column * 3.0 + gap * 2.0;
         ui.horizontal(|ui| {
+            ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
             let mut resolution = self.resolution;
-            egui::ComboBox::from_label("Resolution")
-                .selected_text(RESOLUTIONS[resolution].2)
-                .show_ui(ui, |ui| {
-                    for (index, (_, _, label)) in RESOLUTIONS.iter().enumerate() {
-                        ui.selectable_value(&mut resolution, index, *label);
-                    }
-                });
+            choice(ui, theme, "resolution", "Resolution", RESOLUTIONS[resolution].2, column, |ui| {
+                for (index, (_, _, label)) in RESOLUTIONS.iter().enumerate() {
+                    ui.selectable_value(&mut resolution, index, *label);
+                }
+            });
             self.resolution = resolution;
+            ui.add_space(gap);
             let mut fps = self.fps;
-            egui::ComboBox::from_label("Refresh")
-                .selected_text(format!("{fps} Hz"))
-                .show_ui(ui, |ui| {
-                    for rate in RATES {
-                        ui.selectable_value(&mut fps, *rate, format!("{rate} Hz"));
-                    }
-                });
+            choice(ui, theme, "refresh", "Refresh", &format!("{fps} Hz"), column, |ui| {
+                for rate in RATES {
+                    ui.selectable_value(&mut fps, *rate, format!("{rate} Hz"));
+                }
+            });
             self.fps = fps;
+            ui.add_space(gap);
             let mut bitrate = self.bitrate_kbps;
             let bitrate_label = BITRATES
                 .iter()
                 .find(|(kbps, _)| *kbps == bitrate)
                 .map(|(_, label)| *label)
                 .unwrap_or("Custom");
-            egui::ComboBox::from_label("Bitrate")
-                .selected_text(bitrate_label)
-                .show_ui(ui, |ui| {
-                    for (kbps, label) in BITRATES {
-                        ui.selectable_value(&mut bitrate, *kbps, *label);
-                    }
-                });
+            choice(ui, theme, "bitrate", "Bitrate", bitrate_label, column, |ui| {
+                for (kbps, label) in BITRATES {
+                    ui.selectable_value(&mut bitrate, *kbps, *label);
+                }
+            });
             self.bitrate_kbps = bitrate;
         });
+        if before != (self.resolution, self.fps, self.bitrate_kbps) {
+            self.persist();
+        }
     }
 
     fn join(&mut self) {
@@ -459,27 +713,481 @@ impl MyCord {
                 Some(trimmed)
             }
         };
-        store(&name, &room, invite.as_deref(), self.resolution, self.fps, self.bitrate_kbps);
+        store(
+            &name,
+            &room,
+            invite.as_deref(),
+            self.resolution,
+            self.fps,
+            self.bitrate_kbps,
+            self.dark,
+        );
         self.joining = true;
         self.status = "Joining…".to_string();
         self.send(Cmd::Join(CallSettings { name, room, invite }));
     }
 }
 
-fn field(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) {
-    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-        ui.set_width(420.0);
-        ui.label(label);
-        ui.add_sized([420.0, 32.0], egui::TextEdit::singleline(text).hint_text(hint));
+struct Theme {
+    bg: egui::Color32,
+    raised: egui::Color32,
+    text: egui::Color32,
+    muted: egui::Color32,
+    faint: egui::Color32,
+    line: egui::Color32,
+    field: egui::Color32,
+    pill: egui::Color32,
+    pill_hover: egui::Color32,
+    accent: egui::Color32,
+    accent_hover: egui::Color32,
+    accent_ink: egui::Color32,
+    leave_bg: egui::Color32,
+    leave_fg: egui::Color32,
+    stage: egui::Color32,
+    dot: egui::Color32,
+}
+
+impl Theme {
+    fn blend(t: f32) -> Self {
+        const LIGHT: Theme = Theme {
+            bg: egui::Color32::from_rgb(255, 255, 255),
+            raised: egui::Color32::from_rgb(255, 255, 255),
+            text: egui::Color32::from_rgb(22, 22, 22),
+            muted: egui::Color32::from_rgb(110, 110, 110),
+            faint: egui::Color32::from_rgb(168, 168, 168),
+            line: egui::Color32::from_rgb(230, 230, 230),
+            field: egui::Color32::from_rgb(255, 255, 255),
+            pill: egui::Color32::from_rgb(244, 244, 244),
+            pill_hover: egui::Color32::from_rgb(232, 232, 232),
+            accent: egui::Color32::from_rgb(198, 255, 46),
+            accent_hover: egui::Color32::from_rgb(214, 255, 92),
+            accent_ink: egui::Color32::from_rgb(22, 22, 22),
+            leave_bg: egui::Color32::from_rgb(255, 232, 229),
+            leave_fg: egui::Color32::from_rgb(214, 84, 72),
+            stage: egui::Color32::from_rgb(243, 243, 243),
+            dot: egui::Color32::from_rgb(61, 196, 86),
+        };
+        const DARK: Theme = Theme {
+            bg: egui::Color32::from_rgb(22, 22, 22),
+            raised: egui::Color32::from_rgb(28, 28, 28),
+            text: egui::Color32::from_rgb(245, 245, 245),
+            muted: egui::Color32::from_rgb(160, 160, 160),
+            faint: egui::Color32::from_rgb(120, 120, 120),
+            line: egui::Color32::from_rgb(48, 48, 48),
+            field: egui::Color32::from_rgb(36, 36, 36),
+            pill: egui::Color32::from_rgb(42, 42, 42),
+            pill_hover: egui::Color32::from_rgb(58, 58, 58),
+            accent: egui::Color32::from_rgb(198, 255, 46),
+            accent_hover: egui::Color32::from_rgb(214, 255, 92),
+            accent_ink: egui::Color32::from_rgb(22, 22, 22),
+            leave_bg: egui::Color32::from_rgb(92, 42, 38),
+            leave_fg: egui::Color32::from_rgb(255, 214, 208),
+            stage: egui::Color32::from_rgb(14, 14, 14),
+            dot: egui::Color32::from_rgb(182, 255, 60),
+        };
+        Self {
+            bg: mix(LIGHT.bg, DARK.bg, t),
+            raised: mix(LIGHT.raised, DARK.raised, t),
+            text: mix(LIGHT.text, DARK.text, t),
+            muted: mix(LIGHT.muted, DARK.muted, t),
+            faint: mix(LIGHT.faint, DARK.faint, t),
+            line: mix(LIGHT.line, DARK.line, t),
+            field: mix(LIGHT.field, DARK.field, t),
+            pill: mix(LIGHT.pill, DARK.pill, t),
+            pill_hover: mix(LIGHT.pill_hover, DARK.pill_hover, t),
+            accent: mix(LIGHT.accent, DARK.accent, t),
+            accent_hover: mix(LIGHT.accent_hover, DARK.accent_hover, t),
+            accent_ink: mix(LIGHT.accent_ink, DARK.accent_ink, t),
+            leave_bg: mix(LIGHT.leave_bg, DARK.leave_bg, t),
+            leave_fg: mix(LIGHT.leave_fg, DARK.leave_fg, t),
+            stage: mix(LIGHT.stage, DARK.stage, t),
+            dot: mix(LIGHT.dot, DARK.dot, t),
+        }
+    }
+}
+
+fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |from: u8, to: u8| (f32::from(from) + (f32::from(to) - f32::from(from)) * t).round() as u8;
+    egui::Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BarClick {
+    None,
+    Close,
+    Minimize,
+    Zoom,
+    Theme,
+}
+
+#[derive(Clone, Copy)]
+enum Pill {
+    Plain,
+    Live,
+    Leave,
+}
+
+#[derive(Clone, Copy)]
+enum Glyph {
+    Mic,
+    Share,
+    Expand,
+    Leave,
+    Monitor,
+    Sun,
+}
+
+fn title_bar(ui: &mut egui::Ui, theme: &Theme, dark: bool, body: impl FnOnce(&mut egui::Ui)) -> BarClick {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 46.0), egui::Sense::hover());
+    let mut action = BarClick::None;
+    let y = rect.center().y;
+    let mut x = rect.left() + 18.0;
+    let lights = [
+        (0, egui::Color32::from_rgb(255, 95, 87), BarClick::Close),
+        (1, egui::Color32::from_rgb(254, 188, 46), BarClick::Minimize),
+        (2, egui::Color32::from_rgb(40, 200, 64), BarClick::Zoom),
+    ];
+    for (index, color, click) in lights {
+        let spot = egui::Rect::from_center_size(egui::pos2(x, y), egui::vec2(16.0, 16.0));
+        if traffic_light(ui, spot, index, color) {
+            action = click;
+        }
+        x += 20.0;
+    }
+    let theme_rect = egui::Rect::from_center_size(egui::pos2(rect.right() - 24.0, y), egui::vec2(28.0, 28.0));
+    if theme_button(ui, theme_rect, theme, dark) {
+        action = BarClick::Theme;
+    }
+    let content = egui::Rect::from_min_max(
+        egui::pos2(x + 8.0, rect.top()),
+        egui::pos2(theme_rect.left() - 8.0, rect.bottom()),
+    );
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content), body);
+    let drag = ui.interact(content, egui::Id::new("title-drag"), egui::Sense::drag());
+    if drag.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    action
+}
+
+fn traffic_light(ui: &mut egui::Ui, rect: egui::Rect, index: u8, color: egui::Color32) -> bool {
+    let id = egui::Id::new(("traffic", index));
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(id, response.hovered(), 0.14);
+    let radius = 6.0 + hover * 1.4;
+    ui.painter().circle_filled(rect.center(), radius, color);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clicked()
+}
+
+fn theme_button(ui: &mut egui::Ui, rect: egui::Rect, theme: &Theme, dark: bool) -> bool {
+    let id = egui::Id::new("theme-toggle");
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(id, response.hovered(), 0.16);
+    let fill = mix(theme.pill, theme.pill_hover, hover);
+    ui.painter().circle_filled(rect.center(), 13.0 + hover, fill);
+    let icon = rect.shrink(7.0);
+    if dark {
+        glyph(ui.painter(), icon, Glyph::Sun, theme.text);
+    } else {
+        let center = icon.center();
+        ui.painter().circle_filled(center, 5.4, theme.text);
+        ui.painter().circle_filled(center + egui::vec2(2.8, -1.4), 4.6, fill);
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clicked()
+}
+
+fn window_edge(ui: &mut egui::Ui, theme: &Theme) {
+    let rect = ui.max_rect().shrink(0.5);
+    ui.painter().rect_stroke(
+        rect,
+        0,
+        egui::Stroke::new(1.0_f32, theme.line),
+        egui::StrokeKind::Outside,
+    );
+}
+
+fn resize_borders(ctx: &egui::Context) {
+    let rect = ctx.screen_rect();
+    let edges = [
+        (egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.left() + 5.0, rect.bottom())), egui::ResizeDirection::West, egui::CursorIcon::ResizeHorizontal),
+        (egui::Rect::from_min_max(egui::pos2(rect.right() - 5.0, rect.top()), rect.right_bottom()), egui::ResizeDirection::East, egui::CursorIcon::ResizeHorizontal),
+        (egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + 5.0)), egui::ResizeDirection::North, egui::CursorIcon::ResizeVertical),
+        (egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 5.0), rect.right_bottom()), egui::ResizeDirection::South, egui::CursorIcon::ResizeVertical),
+    ];
+    egui::Area::new(egui::Id::new("window-edges"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .interactable(true)
+        .show(ctx, |ui| {
+            for (index, (edge, direction, cursor)) in edges.into_iter().enumerate() {
+                let response = ui.interact(edge, egui::Id::new(("edge", index)), egui::Sense::drag());
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(cursor);
+                }
+                if response.drag_started() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+                }
+            }
+        });
+}
+
+fn brand_row(ui: &mut egui::Ui, theme: &Theme) {
+    ui.horizontal(|ui| {
+        let width = ui.available_width();
+        ui.add_space((width - 92.0).max(0.0) / 2.0);
+        brand_mark(ui, theme, 16.0);
     });
 }
 
-fn dock_button(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
-    let mut button = egui::Button::new(label).min_size(egui::vec2(140.0, 40.0));
-    if on {
-        button = button.fill(egui::Color32::from_rgb(224, 168, 92));
+fn brand_mark(ui: &mut egui::Ui, theme: &Theme, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, size + 4.0), egui::Sense::hover());
+    let painter = ui.painter();
+    let color = theme.accent;
+    for shift in [-4.5, 3.5] {
+        painter.line_segment(
+            [
+                egui::pos2(rect.center().x + shift - 2.2, rect.bottom() - 2.0),
+                egui::pos2(rect.center().x + shift + 2.2, rect.top() + 2.0),
+            ],
+            egui::Stroke::new(3.2_f32, color),
+        );
     }
-    ui.add(button)
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("MyCord").size(size).strong().color(theme.text));
+}
+
+fn field(ui: &mut egui::Ui, theme: &Theme, label: &str, text: &mut String, hint: &str) {
+    ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(egui::RichText::new(label).size(12.0).color(theme.muted));
+        ui.add_space(4.0);
+        egui::Frame::new()
+            .fill(theme.field)
+            .stroke(egui::Stroke::new(1.0_f32, theme.line))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(text)
+                        .hint_text(egui::RichText::new(hint).color(theme.faint))
+                        .frame(false)
+                        .desired_width(f32::INFINITY)
+                        .text_color(theme.text),
+                );
+            });
+    });
+}
+
+fn choice(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    id: &str,
+    label: &str,
+    selected: &str,
+    width: f32,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    ui.vertical(|ui| {
+        ui.set_width(width);
+        ui.label(egui::RichText::new(label).size(11.0).color(theme.muted));
+        ui.add_space(4.0);
+        egui::Frame::new()
+            .fill(theme.field)
+            .stroke(egui::Stroke::new(1.0_f32, theme.line))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                egui::ComboBox::from_id_salt(id)
+                    .selected_text(egui::RichText::new(selected).size(13.0).color(theme.text))
+                    .width((width - 18.0).max(72.0))
+                    .icon(|ui, rect, visuals, _, _| {
+                        let center = rect.center();
+                        let stroke = egui::Stroke::new(1.5_f32, visuals.fg_stroke.color);
+                        ui.painter().line_segment(
+                            [center + egui::vec2(-3.5, -1.0), center + egui::vec2(0.0, 2.2)],
+                            stroke,
+                        );
+                        ui.painter().line_segment(
+                            [center + egui::vec2(0.0, 2.2), center + egui::vec2(3.5, -1.0)],
+                            stroke,
+                        );
+                    })
+                    .show_ui(ui, body);
+            });
+    });
+}
+
+fn lime_button(ui: &mut egui::Ui, theme: &Theme, label: &str, enabled: bool) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 44.0), egui::Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(response.id, response.hovered() && enabled, 0.16);
+    let fill = mix(theme.accent, theme.accent_hover, hover);
+    let fill = if enabled { fill } else { mix(fill, theme.pill, 0.45) };
+    let pressed = response.is_pointer_button_down_on() && enabled;
+    let scale = if pressed { 0.985 } else { 1.0 };
+    let painted = egui::Rect::from_center_size(rect.center(), rect.size() * scale);
+    ui.painter().rect_filled(painted, 22.0, fill);
+    let slide = hover * 4.0;
+    let font = egui::FontId::proportional(15.0);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font.clone(), theme.accent_ink);
+    let gap = 10.0;
+    let arrow = 12.0;
+    let total = galley.rect.width() + gap + arrow;
+    let left = painted.center().x - total / 2.0 + slide;
+    let y = painted.center().y;
+    ui.painter().text(
+        egui::pos2(left + galley.rect.width() / 2.0, y),
+        egui::Align2::CENTER_CENTER,
+        label,
+        font,
+        theme.accent_ink,
+    );
+    let tail = egui::pos2(left + galley.rect.width() + gap, y);
+    let tip = tail + egui::vec2(arrow, 0.0);
+    let stroke = egui::Stroke::new(1.6_f32, theme.accent_ink);
+    ui.painter().line_segment([tail, tip], stroke);
+    ui.painter().line_segment([tip, tip + egui::vec2(-4.5, -3.5)], stroke);
+    ui.painter().line_segment([tip, tip + egui::vec2(-4.5, 3.5)], stroke);
+    if response.hovered() && enabled {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if enabled { response } else { response.on_hover_text("") }
+}
+
+fn pill(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    salt: &str,
+    label: &str,
+    icon: Glyph,
+    kind: Pill,
+    live: f32,
+) -> egui::Response {
+    let font = egui::FontId::proportional(13.5);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font.clone(), theme.text);
+    let width = 16.0 + 16.0 + 8.0 + galley.rect.width() + 16.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 36.0), egui::Sense::click());
+    let id = response.id.with(salt);
+    let hover = ui.ctx().animate_bool_with_time(id, response.hovered(), 0.16);
+    let (idle, hot, fg) = match kind {
+        Pill::Plain => (theme.pill, theme.pill_hover, theme.text),
+        Pill::Live => (mix(theme.pill, theme.accent, live), mix(theme.pill_hover, theme.accent_hover, live), mix(theme.text, theme.accent_ink, live)),
+        Pill::Leave => (theme.leave_bg, mix(theme.leave_bg, theme.leave_fg, 0.12), theme.leave_fg),
+    };
+    let fill = mix(idle, hot, hover);
+    let pressed = response.is_pointer_button_down_on();
+    let scale = if pressed { 0.97 } else { 1.0 };
+    let painted = egui::Rect::from_center_size(rect.center(), rect.size() * scale);
+    ui.painter().rect_filled(painted, 18.0, fill);
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(painted.left() + 12.0, painted.center().y - 8.0),
+        egui::vec2(16.0, 16.0),
+    );
+    glyph(ui.painter(), icon_rect, icon, fg);
+    ui.painter().text(
+        egui::pos2(icon_rect.right() + 8.0 + galley.rect.width() / 2.0, painted.center().y),
+        egui::Align2::CENTER_CENTER,
+        label,
+        font,
+        fg,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn pill_width(ui: &egui::Ui, label: &str) -> f32 {
+    let font = egui::FontId::proportional(13.5);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, egui::Color32::WHITE);
+    16.0 + 16.0 + 8.0 + galley.rect.width() + 16.0
+}
+
+fn status_line(ui: &mut egui::Ui, theme: &Theme, text: &str, warn: bool) {
+    ui.horizontal(|ui| {
+        let width = ui.available_width();
+        ui.add_space((width - 280.0).max(0.0) / 2.0);
+        if !warn {
+            dot(ui, theme.dot, 4.0);
+            ui.add_space(6.0);
+        }
+        let color = if warn { theme.leave_fg } else { theme.muted };
+        ui.label(egui::RichText::new(text).size(12.0).color(color));
+    });
+}
+
+fn dot(ui: &mut egui::Ui, color: egui::Color32, radius: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(radius * 2.0, radius * 2.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), radius, color);
+}
+
+fn glyph(painter: &egui::Painter, rect: egui::Rect, glyph: Glyph, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.6_f32, color);
+    match glyph {
+        Glyph::Mic => {
+            let head = egui::Rect::from_center_size(rect.center() - egui::vec2(0.0, 2.0), egui::vec2(6.0, 9.0));
+            painter.rect_stroke(head, 3.0, stroke, egui::StrokeKind::Middle);
+            painter.line_segment([head.center_bottom(), head.center_bottom() + egui::vec2(0.0, 4.0)], stroke);
+            painter.line_segment([
+                head.center_bottom() + egui::vec2(-4.0, 4.0),
+                head.center_bottom() + egui::vec2(4.0, 4.0),
+            ], stroke);
+        }
+        Glyph::Share => {
+            let screen = egui::Rect::from_center_size(rect.center() + egui::vec2(0.0, 1.0), egui::vec2(12.0, 8.5));
+            painter.rect_stroke(screen, 1.5, stroke, egui::StrokeKind::Inside);
+            let tip = egui::pos2(screen.center().x, screen.top() + 1.6);
+            let tail = egui::pos2(screen.center().x, screen.bottom() - 1.6);
+            painter.line_segment([tail, tip], stroke);
+            painter.line_segment([tip, tip + egui::vec2(-2.8, 2.8)], stroke);
+            painter.line_segment([tip, tip + egui::vec2(2.8, 2.8)], stroke);
+        }
+        Glyph::Expand => {
+            let a = rect.left_top() + egui::vec2(1.0, 1.0);
+            let b = rect.right_bottom() - egui::vec2(1.0, 1.0);
+            painter.line_segment([a, a + egui::vec2(5.0, 0.0)], stroke);
+            painter.line_segment([a, a + egui::vec2(0.0, 5.0)], stroke);
+            painter.line_segment([b, b - egui::vec2(5.0, 0.0)], stroke);
+            painter.line_segment([b, b - egui::vec2(0.0, 5.0)], stroke);
+            painter.line_segment([egui::pos2(b.x, a.y), egui::pos2(b.x - 5.0, a.y)], stroke);
+            painter.line_segment([egui::pos2(b.x, a.y), egui::pos2(b.x, a.y + 5.0)], stroke);
+            painter.line_segment([egui::pos2(a.x, b.y), egui::pos2(a.x + 5.0, b.y)], stroke);
+            painter.line_segment([egui::pos2(a.x, b.y), egui::pos2(a.x, b.y - 5.0)], stroke);
+        }
+        Glyph::Leave => {
+            painter.line_segment([rect.left_center() + egui::vec2(2.0, -5.0), rect.left_center() + egui::vec2(2.0, 5.0)], stroke);
+            painter.line_segment([rect.left_center() + egui::vec2(2.0, -5.0), rect.center() + egui::vec2(-1.0, -5.0)], stroke);
+            painter.line_segment([rect.left_center() + egui::vec2(2.0, 5.0), rect.center() + egui::vec2(-1.0, 5.0)], stroke);
+            painter.line_segment([rect.center() + egui::vec2(-2.0, 0.0), rect.right_center() - egui::vec2(1.0, 0.0)], stroke);
+            painter.line_segment([rect.right_center() - egui::vec2(4.0, 3.0), rect.right_center() - egui::vec2(1.0, 0.0)], stroke);
+            painter.line_segment([rect.right_center() - egui::vec2(4.0, -3.0), rect.right_center() - egui::vec2(1.0, 0.0)], stroke);
+        }
+        Glyph::Monitor => {
+            let screen = egui::Rect::from_center_size(rect.center() - egui::vec2(0.0, 3.0), egui::vec2(28.0, 18.0));
+            painter.rect_stroke(screen, 3.0, egui::Stroke::new(1.8_f32, color), egui::StrokeKind::Middle);
+            painter.line_segment([screen.center_bottom(), screen.center_bottom() + egui::vec2(0.0, 6.0)], egui::Stroke::new(1.8_f32, color));
+            painter.line_segment([
+                screen.center_bottom() + egui::vec2(-6.0, 6.0),
+                screen.center_bottom() + egui::vec2(6.0, 6.0),
+            ], egui::Stroke::new(1.8_f32, color));
+        }
+        Glyph::Sun => {
+            painter.circle_filled(rect.center(), 2.6, color);
+            for index in 0..8 {
+                let angle = index as f32 * std::f32::consts::TAU / 8.0;
+                let dir = egui::vec2(angle.cos(), angle.sin());
+                painter.line_segment([rect.center() + dir * 4.6, rect.center() + dir * 6.8], stroke);
+            }
+        }
+    }
 }
 
 async fn session(
@@ -997,6 +1705,7 @@ struct Saved {
     resolution: usize,
     fps: u32,
     bitrate: u32,
+    dark: bool,
 }
 
 fn note_log(line: &str) {
@@ -1030,6 +1739,7 @@ fn remember() -> Saved {
         resolution: 1,
         fps: 60,
         bitrate: 80_000,
+        dark: false,
     };
     let Some(path) = settings_path() else {
         return saved;
@@ -1064,15 +1774,27 @@ fn remember() -> Saved {
             saved.bitrate = bitrate;
         }
     }
+    if let Some(theme) = lines.next() {
+        saved.dark = theme == "dark";
+    }
     saved
 }
 
-fn store(name: &str, room: &str, invite: Option<&str>, resolution: usize, fps: u32, bitrate: u32) {
+fn store(
+    name: &str,
+    room: &str,
+    invite: Option<&str>,
+    resolution: usize,
+    fps: u32,
+    bitrate: u32,
+    dark: bool,
+) {
     let Some(path) = settings_path() else {
         return;
     };
+    let theme = if dark { "dark" } else { "light" };
     let body = format!(
-        "{name}\n{room}\n{}\n{resolution}\n{fps}\n{bitrate}\n",
+        "{name}\n{room}\n{}\n{resolution}\n{fps}\n{bitrate}\n{theme}\n",
         invite.unwrap_or("")
     );
     let _ = std::fs::write(path, body);
