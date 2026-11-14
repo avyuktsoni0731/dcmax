@@ -71,6 +71,7 @@ struct Shared {
 
 pub struct PictureSender {
     tx: SyncSender<Outgoing>,
+    audio_tx: SyncSender<Outgoing>,
     shared: Arc<Shared>,
     join: Option<JoinHandle<()>>,
 }
@@ -91,6 +92,9 @@ impl PictureSender {
 
     fn spawn(dial: Dial) -> Result<Self> {
         let (tx, rx) = sync_channel(8);
+        // Sound has its own lane. A full picture queue used to reject every
+        // audio packet, so the watcher saw the screen and heard nothing.
+        let (audio_tx, audio_rx) = sync_channel(64);
         let shared = Arc::new(Shared {
             sent: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
@@ -100,10 +104,11 @@ impl PictureSender {
         let counters = Arc::clone(&shared);
         let join = thread::Builder::new()
             .name("picture-tcp".to_string())
-            .spawn(move || send_loop(dial, rx, counters))
+            .spawn(move || send_loop(dial, rx, audio_rx, counters))
             .context("failed to start the picture sender")?;
         Ok(Self {
             tx,
+            audio_tx,
             shared,
             join: Some(join),
         })
@@ -139,7 +144,7 @@ impl PictureSender {
             payload: payload.to_vec(),
             timestamp_us,
         };
-        let _ = self.tx.try_send(frame);
+        let _ = self.audio_tx.try_send(frame);
     }
 
     pub fn sent(&self) -> u64 {
@@ -159,25 +164,38 @@ impl Drop for PictureSender {
     fn drop(&mut self) {
         let (tx, _) = sync_channel(1);
         let _ = std::mem::replace(&mut self.tx, tx);
+        let (audio_tx, _) = sync_channel(1);
+        let _ = std::mem::replace(&mut self.audio_tx, audio_tx);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
     }
 }
 
-fn send_loop(dial: Dial, rx: Receiver<Outgoing>, shared: Arc<Shared>) {
+fn send_loop(
+    dial: Dial,
+    rx: Receiver<Outgoing>,
+    audio_rx: Receiver<Outgoing>,
+    shared: Arc<Shared>,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
     let mut stream = Some(connect_picture(&dial, Arc::clone(&shared)));
     let mut frame_id = 0u32;
     let mut audio_id = 0u32;
     let mut announced = false;
     let mut retry = None::<Outgoing>;
     loop {
+        let broken = drain_audio(&mut stream, &audio_rx, &shared, &dial, &mut audio_id);
+        if broken {
+            thread::sleep(Duration::from_millis(200));
+        }
         let frame = if let Some(frame) = retry.take() {
             frame
         } else {
-            match rx.recv() {
+            match rx.recv_timeout(Duration::from_millis(4)) {
                 Ok(frame) => frame,
-                Err(_) => return,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return,
             }
         };
         let video_key = matches!(frame, Outgoing::Video { keyframe: true, .. });
@@ -202,12 +220,7 @@ fn send_loop(dial: Dial, rx: Receiver<Outgoing>, shared: Arc<Shared>) {
             }
         }
         let socket = stream.as_mut().unwrap();
-        let id = if matches!(frame, Outgoing::Audio { .. }) {
-            audio_id
-        } else {
-            frame_id
-        };
-        if write_frame(socket, id, &frame).is_err() {
+        if write_frame(socket, frame_id, &frame).is_err() {
             shared.need_key.store(true, Ordering::Release);
             shared.want_idr.store(true, Ordering::Release);
             let _ = socket.shutdown(Shutdown::Both);
@@ -218,23 +231,46 @@ fn send_loop(dial: Dial, rx: Receiver<Outgoing>, shared: Arc<Shared>) {
             thread::sleep(Duration::from_millis(200));
             continue;
         }
-        match &frame {
-            Outgoing::Video { keyframe, payload, .. } => {
-                if *keyframe {
-                    shared.need_key.store(false, Ordering::Release);
-                }
-                shared.sent.fetch_add(1, Ordering::Relaxed);
-                if !announced {
-                    announced = true;
-                    println!("picture tcp: first frame {} bytes", payload.len());
-                }
-                frame_id = frame_id.wrapping_add(1);
+        if let Outgoing::Video { keyframe, payload, .. } = &frame {
+            if *keyframe {
+                shared.need_key.store(false, Ordering::Release);
             }
-            Outgoing::Audio { .. } => {
-                audio_id = audio_id.wrapping_add(1);
+            shared.sent.fetch_add(1, Ordering::Relaxed);
+            if !announced {
+                announced = true;
+                println!("picture tcp: first frame {} bytes", payload.len());
             }
+            frame_id = frame_id.wrapping_add(1);
         }
     }
+}
+
+fn drain_audio(
+    stream: &mut Option<TcpStream>,
+    audio_rx: &Receiver<Outgoing>,
+    shared: &Arc<Shared>,
+    dial: &Dial,
+    audio_id: &mut u32,
+) -> bool {
+    let mut broke = false;
+    while let Ok(frame) = audio_rx.try_recv() {
+        if stream.is_none() {
+            *stream = Some(connect_picture(dial, Arc::clone(shared)));
+        }
+        let Some(socket) = stream.as_mut() else {
+            continue;
+        };
+        if write_frame(socket, *audio_id, &frame).is_err() {
+            shared.need_key.store(true, Ordering::Release);
+            shared.want_idr.store(true, Ordering::Release);
+            let _ = socket.shutdown(Shutdown::Both);
+            *stream = None;
+            broke = true;
+            break;
+        }
+        *audio_id = audio_id.wrapping_add(1);
+    }
+    broke
 }
 
 fn connect_picture(dial: &Dial, shared: Arc<Shared>) -> TcpStream {
@@ -564,17 +600,29 @@ mod tests {
         };
         sender.offer(&[1, 2, 3, 4], true, 1000, Some(cursor));
         sender.offer(&[9, 9, 9], false, 2000, None);
-        let first = reader.read_frame().unwrap().unwrap();
-        let second = reader.read_frame().unwrap().unwrap();
-        assert_eq!(first.payload, vec![1, 2, 3, 4]);
-        assert!(first.keyframe);
-        assert_eq!(first.timestamp_us, 1000);
-        assert_eq!(first.cursor, cursor);
-        assert_eq!(first.frame_id, 0);
-        assert!(!first.audio);
-        assert_eq!(second.payload, vec![9, 9, 9]);
-        assert!(!second.keyframe);
-        assert_eq!(second.timestamp_us, 2000);
-        assert_eq!(second.frame_id, 1);
+        sender.offer_audio(&[7, 7], 3000);
+        let mut videos = Vec::new();
+        let mut sound = None;
+        for _ in 0..3 {
+            let frame = reader.read_frame().unwrap().unwrap();
+            if frame.audio {
+                sound = Some(frame);
+            } else {
+                videos.push(frame);
+            }
+        }
+        assert_eq!(videos.len(), 2);
+        assert_eq!(videos[0].payload, vec![1, 2, 3, 4]);
+        assert!(videos[0].keyframe);
+        assert_eq!(videos[0].timestamp_us, 1000);
+        assert_eq!(videos[0].cursor, cursor);
+        assert_eq!(videos[0].frame_id, 0);
+        assert_eq!(videos[1].payload, vec![9, 9, 9]);
+        assert!(!videos[1].keyframe);
+        assert_eq!(videos[1].timestamp_us, 2000);
+        assert_eq!(videos[1].frame_id, 1);
+        let sound = sound.expect("desktop audio packet");
+        assert_eq!(sound.payload, vec![7, 7]);
+        assert_eq!(sound.timestamp_us, 3000);
     }
 }

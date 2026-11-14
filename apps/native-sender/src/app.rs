@@ -1470,6 +1470,7 @@ async fn share_loop(
     let mut need_key = true;
     let mut last_timestamp_us = 0i64;
     let mut audio_open = true;
+    let mut audio_noted = false;
     loop {
         if *stop.borrow() {
             break;
@@ -1520,9 +1521,14 @@ async fn share_loop(
             }
             audio = encoder.audio.recv(), if audio_open => {
                 if let Some(audio) = audio {
+                    if !audio_noted {
+                        audio_noted = true;
+                        note_log("desktop audio captured");
+                    }
                     picture.offer_audio(&audio.payload, audio.timestamp_us);
                 } else {
                     audio_open = false;
+                    note_log("desktop audio capture ended");
                 }
             }
         }
@@ -1564,8 +1570,21 @@ fn call_config(settings: &CallSettings, picture: &PictureSettings) -> AppConfig 
 }
 
 fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<AtomicBool>) {
-    let player = AudioPlayer::start(Arc::new(AtomicBool::new(false))).ok();
-    let mut opus = opus_decoder().ok();
+    let player = match AudioPlayer::start(Arc::new(AtomicBool::new(false))) {
+        Ok(player) => Some(player),
+        Err(err) => {
+            note_log(&format!("desktop audio player: {err:#}"));
+            None
+        }
+    };
+    let mut opus = match opus_decoder() {
+        Ok(decoder) => Some(decoder),
+        Err(err) => {
+            note_log(&format!("desktop audio decoder: {err:#}"));
+            None
+        }
+    };
+    let mut heard = false;
     while !stop.load(Ordering::Acquire) {
         let stream = match accept_picture(&listener) {
             Ok(Some(stream)) => stream,
@@ -1587,8 +1606,19 @@ fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<At
             match reader.read_frame() {
                 Ok(Some(frame)) if frame.audio => {
                     if let (Some(player), Some(opus)) = (player.as_ref(), opus.as_mut()) {
-                        if let Ok(pcm) = decode_packet(opus, &frame.payload) {
-                            player.push(&pcm);
+                        match decode_packet(opus, &frame.payload) {
+                            Ok(pcm) => {
+                                if !heard {
+                                    heard = true;
+                                    note_log("desktop audio playing");
+                                }
+                                player.push(&pcm);
+                            }
+                            Err(err) if !heard => {
+                                heard = true;
+                                note_log(&format!("desktop audio decode: {err:#}"));
+                            }
+                            Err(_) => {}
                         }
                     }
                 }
@@ -1709,19 +1739,7 @@ struct Saved {
 }
 
 fn note_log(line: &str) {
-    let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) else {
-        return;
-    };
-    let path = std::path::PathBuf::from(home).join(".mycord.log");
-    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
-        return;
-    };
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|time| time.as_secs())
-        .unwrap_or(0);
-    use std::io::Write;
-    let _ = writeln!(file, "{secs} {line}");
+    crate::audio::session_log(line);
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {

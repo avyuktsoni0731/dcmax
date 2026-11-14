@@ -15,6 +15,8 @@ use tokio::sync::mpsc;
 /// Minimum time between requested keyframes. The regular group of pictures
 /// stays one second; this only limits an extra keyframe after a lost frame.
 const KEYFRAME_GAP: Duration = Duration::from_millis(32);
+static AUDIO_SENT: AtomicBool = AtomicBool::new(false);
+static AUDIO_MISS: AtomicBool = AtomicBool::new(false);
 
 struct Controls {
     force_keyframe: Arc<AtomicBool>,
@@ -439,6 +441,7 @@ fn open_stream(
         .with_minimum_frame_interval(&interval)
         .with_queue_depth(3)
         .with_captures_audio(true)
+        .with_excludes_current_process_audio(true)
         .with_sample_rate(48_000)
         .with_channel_count(2);
     if let Err(err) = stream_config.set_preserves_aspect_ratio(true) {
@@ -457,7 +460,7 @@ fn open_stream(
     stream
         .add_output_handler(handler, SCStreamOutputType::Screen)
         .map_err(|err| anyhow!("failed to attach the screen handler: {err}"))?;
-    let (audio_tx, audio_rx) = mpsc::channel(32);
+    let (audio_tx, audio_rx) = mpsc::channel(128);
     match SystemAudio::new() {
         Ok(codec) => {
             let audio = AudioHandler {
@@ -465,12 +468,12 @@ fn open_stream(
                 tx: audio_tx,
             };
             if let Err(err) = stream.add_output_handler(audio, SCStreamOutputType::Audio) {
-                eprintln!("system audio: {err}");
+                crate::audio::session_log(&format!("system audio: {err}"));
             } else {
-                println!("system audio: screencapturekit 48 kHz");
+                crate::audio::session_log("system audio: screencapturekit 48 kHz");
             }
         }
-        Err(err) => eprintln!("system audio: {err:#}"),
+        Err(err) => crate::audio::session_log(&format!("system audio: {err:#}")),
     }
     stream
         .start_capture()
@@ -489,12 +492,18 @@ impl SCStreamOutputTrait for AudioHandler {
             return;
         }
         let Some((pcm, channels, rate)) = pcm_from_sample(&sample) else {
+            if !AUDIO_MISS.swap(true, Ordering::Relaxed) {
+                crate::audio::session_log("system audio: a buffer arrived but had no pcm");
+            }
             return;
         };
         let Ok(mut codec) = self.codec.lock() else {
             return;
         };
         for payload in codec.push(&pcm, channels, rate) {
+            if !AUDIO_SENT.swap(true, Ordering::Relaxed) {
+                crate::audio::session_log("system audio: first packet captured");
+            }
             let _ = self.tx.try_send(EncodedAudio {
                 payload,
                 timestamp_us: unix_us_now(),
@@ -541,8 +550,8 @@ fn pcm_from_sample(sample: &CMSampleBuffer) -> Option<(Vec<f32>, usize, u32)> {
     Some((interleaved, planes.len().max(1), rate.max(1)))
 }
 
-fn bytes_to_f32(data: &[u8], float: bool, bits: u32) -> Vec<f32> {
-    if float && bits == 32 {
+fn bytes_to_f32(data: &[u8], _float: bool, bits: u32) -> Vec<f32> {
+    if bits == 32 {
         data.chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect()

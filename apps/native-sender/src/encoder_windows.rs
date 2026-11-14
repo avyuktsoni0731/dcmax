@@ -391,7 +391,7 @@ impl NvencEncoder {
 }
 
 fn desktop_sound() -> (mpsc::Receiver<EncodedAudio>, DesktopAudio) {
-    let (tx, rx) = mpsc::channel(32);
+    let (tx, rx) = mpsc::channel(128);
     (rx, DesktopAudio::start(tx))
 }
 

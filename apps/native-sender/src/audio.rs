@@ -19,6 +19,22 @@ const RATE: u32 = 48_000;
 const FRAME: usize = 960;
 const STEREO: usize = FRAME * 2;
 
+pub fn session_log(line: &str) {
+    let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) else {
+        return;
+    };
+    let path = std::path::PathBuf::from(home).join(".mycord.log");
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|time| time.as_secs())
+        .unwrap_or(0);
+    use std::io::Write;
+    let _ = writeln!(file, "{secs} {line}");
+}
+
 struct OpusEnc {
     raw: *mut opusic_sys::OpusEncoder,
 }
@@ -348,7 +364,7 @@ impl DesktopAudio {
             .name("system-audio".to_string())
             .spawn(move || {
                 if let Err(err) = capture_loopback(tx.clone(), &stop_thread) {
-                    eprintln!("system audio: {err:#}");
+                    session_log(&format!("system audio: {err:#}"));
                 }
                 while !stop_thread.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(200));
@@ -424,7 +440,16 @@ fn capture_loopback(
         CoTaskMemFree(Some(mix.cast()));
         let capture: IAudioCaptureClient = client.GetService().context("capture client")?;
         client.Start().context("loopback start")?;
-        println!("system audio: wasapi loopback {rate} Hz {channels} ch {bits}-bit");
+        let mut float = is_float(format);
+        if !float && bits == 32 {
+            // The shared mix format is 32-bit float. The extensible GUID sits at
+            // byte 24; reading it with the padded Rust struct size used to miss
+            // it and throw every sample away.
+            float = true;
+        }
+        session_log(&format!(
+            "system audio: wasapi loopback {rate} Hz {channels} ch {bits}-bit float={float}"
+        ));
         let mut codec = SystemAudio::new()?;
         let mut scratch = Vec::new();
         while !stop.load(Ordering::Acquire) {
@@ -491,10 +516,12 @@ fn is_float(format: &windows::Win32::Media::Audio::WAVEFORMATEX) -> bool {
     if format.wFormatTag != WAVE_FORMAT_EXTENSIBLE as u16 || format.cbSize < 22 {
         return false;
     }
-    // SubFormat GUID Data1 sits 8 bytes after the WAVEFORMATEX (Samples + mask).
+    // WAVEFORMATEXTENSIBLE: samples (2) + channel mask (4), then the GUID.
+    // Data1 of a float subtype is 3, at byte 24. sizeof(WAVEFORMATEX) in Rust
+    // is padded, so adding it lands past the GUID.
     let header = format as *const windows::Win32::Media::Audio::WAVEFORMATEX as *const u8;
-    let data1 = unsafe { std::ptr::read_unaligned(header.add(std::mem::size_of::<windows::Win32::Media::Audio::WAVEFORMATEX>() + 8) as *const u32) };
-    data1 == WAVE_FORMAT_IEEE_FLOAT as u32
+    let data1 = unsafe { std::ptr::read_unaligned(header.add(24) as *const u32) };
+    data1 == u32::from(WAVE_FORMAT_IEEE_FLOAT)
 }
 
 #[cfg(test)]
