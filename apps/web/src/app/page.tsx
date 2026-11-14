@@ -9,7 +9,6 @@ import {
   Room,
   RoomEvent,
   Track,
-  VideoPresets
 } from "livekit-client";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -19,7 +18,19 @@ import {
   detectOs,
   getSystemAudioSupportMessage
 } from "@/lib/capabilities";
-import { QUALITY_PROFILES, QualityMode, resolveCodecPreference } from "@/lib/quality";
+import {
+  BITRATES,
+  DEFAULT_PICTURE,
+  PICTURE_STORAGE_KEY,
+  pictureConfig,
+  PictureSettings,
+  readStoredPicture,
+  REFRESH_RATES,
+  RESOLUTIONS,
+  ResolutionId,
+  RefreshRate,
+  resolveCodecPreference
+} from "@/lib/quality";
 
 type CallState = "idle" | "connecting" | "connected" | "reconnecting" | "ended";
 
@@ -101,14 +112,10 @@ type ScreenCaptureStats = {
   frameRate: number;
 };
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:4000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "https://dcmax-token.soniavyukt.workers.dev";
 const IS_NGROK_API = API_BASE.includes("ngrok-free.app");
 const NATIVE_CONTROL_SECRET = process.env.NEXT_PUBLIC_NATIVE_CONTROL_SECRET ?? "";
 const NATIVE_EXPERIMENTAL_ENABLED = process.env.NEXT_PUBLIC_ENABLE_NATIVE_EXPERIMENTAL === "true";
-
-function classNames(...parts: Array<string | false | null | undefined>) {
-  return parts.filter(Boolean).join(" ");
-}
 
 function qualityText(q: ConnectionQuality): "good" | "fair" | "poor" {
   if (q === ConnectionQuality.Excellent) return "good";
@@ -152,7 +159,10 @@ export default function HomePage() {
   const [room, setRoom] = useState<Room | null>(null);
   const [isMuted, setIsMuted] = useState(false);
   const [isSharingScreen, setIsSharingScreen] = useState(false);
-  const [qualityMode, setQualityMode] = useState<QualityMode>("balanced");
+  const [picture, setPicture] = useState<PictureSettings>(DEFAULT_PICTURE);
+  const [pictureBusy, setPictureBusy] = useState(false);
+  const [nameError, setNameError] = useState("");
+  const [roomError, setRoomError] = useState("");
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
   const [selectedMicId, setSelectedMicId] = useState<string>("");
   const [remoteIdentity, setRemoteIdentity] = useState("Waiting for participant");
@@ -164,6 +174,7 @@ export default function HomePage() {
   const [connectedAt, setConnectedAt] = useState<number | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [isRemoteFullscreen, setIsRemoteFullscreen] = useState(false);
+  const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [screenCaptureStats, setScreenCaptureStats] = useState<ScreenCaptureStats | null>(null);
   const [nativeSession, setNativeSession] = useState<NativeSession | null>(null);
@@ -189,11 +200,25 @@ export default function HomePage() {
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteAudioContainerRef = useRef<HTMLDivElement | null>(null);
+  const nameRef = useRef<HTMLInputElement | null>(null);
+  const roomRef = useRef<HTMLInputElement | null>(null);
+  const remoteTrackId = useRef<string | null>(null);
 
   function showToast(text: string, tone: ToastTone = "neutral") {
     setToastText(text);
     setToastTone(tone);
   }
+
+  useEffect(() => {
+    const stored = readStoredPicture();
+    if (stored) setPicture(stored);
+    const roomParam = new URLSearchParams(window.location.search).get("room");
+    if (roomParam) setRoomName(roomParam);
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(PICTURE_STORAGE_KEY, JSON.stringify(picture));
+  }, [picture]);
 
   useEffect(() => {
     const browser = detectBrowser(window.navigator.userAgent);
@@ -456,9 +481,8 @@ export default function HomePage() {
     const camPub = publications.find((p) => p.track?.kind === Track.Kind.Video);
     const targetPub = screenPub ?? camPub;
     const videoTrack = targetPub?.videoTrack;
-    if (videoTrack && remoteVideoRef.current) {
-      videoTrack.attach(remoteVideoRef.current);
-    }
+    setHasRemoteVideo(Boolean(videoTrack));
+    attachVideoOnce(videoTrack);
     if (remoteAudioContainerRef.current) {
       remoteAudioContainerRef.current.innerHTML = "";
       const audioPublications = publications.filter((pub) => pub.track?.kind === Track.Kind.Audio);
@@ -489,13 +513,31 @@ export default function HomePage() {
     });
 
     if (!res.ok) {
-      throw new Error("Token request failed");
+      let message = "Could not join this room.";
+      try {
+        const body = (await res.json()) as { error?: string };
+        if (body.error) message = body.error;
+      } catch {
+        message = `Could not join this room (${res.status}).`;
+      }
+      throw new Error(message);
     }
     const contentType = res.headers.get("content-type") ?? "";
     if (!contentType.includes("application/json")) {
       throw new Error("Token API returned non-JSON response. Check ngrok tunnel/warning page.");
     }
     return (await res.json()) as TokenResponse;
+  }
+
+  function attachVideoOnce(track: { mediaStreamTrack: MediaStreamTrack; attach: (element: HTMLVideoElement) => void } | undefined) {
+    const element = remoteVideoRef.current;
+    if (!track || !element) {
+      remoteTrackId.current = null;
+      return;
+    }
+    if (remoteTrackId.current === track.mediaStreamTrack.id) return;
+    track.attach(element);
+    remoteTrackId.current = track.mediaStreamTrack.id;
   }
 
   function attachRemoteTrack(participant: Participant) {
@@ -506,9 +548,8 @@ export default function HomePage() {
     const camPub = publications.find((p) => p.track?.kind === Track.Kind.Video);
     const targetPub = screenPub ?? camPub;
     const track = targetPub?.videoTrack;
-    if (track && remoteVideoRef.current) {
-      track.attach(remoteVideoRef.current);
-    }
+    setHasRemoteVideo(Boolean(track));
+    attachVideoOnce(track);
   }
 
   function pickPreferredParticipant(roomInstance: Room): Participant | null {
@@ -525,6 +566,8 @@ export default function HomePage() {
     if (!preferred) {
       setRemoteIdentity("Waiting for participant");
       setRemoteIsSpeaking(false);
+      setHasRemoteVideo(false);
+      remoteTrackId.current = null;
       setSelectedSourceLabel("none");
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
       if (remoteAudioContainerRef.current) remoteAudioContainerRef.current.innerHTML = "";
@@ -580,6 +623,7 @@ export default function HomePage() {
   async function joinCall() {
     setToastText("");
     setCallState("connecting");
+    let roomInstance: Room | null = null;
     try {
       if (!window.navigator?.mediaDevices) {
         const secureHint = window.isSecureContext
@@ -591,28 +635,48 @@ export default function HomePage() {
       }
 
       const identity = username.trim().replace(/\s+/g, "_");
-      if (!identity) throw new Error("Please enter a username");
       const sanitizedRoom = roomName.trim().replace(/\s+/g, "_");
-      if (!sanitizedRoom) throw new Error("Please enter a room name");
+      if (!identity || !sanitizedRoom) {
+        setCallState("idle");
+        if (!identity) {
+          setNameError("Enter your name.");
+          nameRef.current?.focus();
+        } else {
+          setNameError("");
+        }
+        if (!sanitizedRoom) {
+          setRoomError("Enter a room code.");
+          if (identity) roomRef.current?.focus();
+        } else {
+          setRoomError("");
+        }
+        return;
+      }
+      setNameError("");
+      setRoomError("");
 
       const tokenData = await requestToken(identity, sanitizedRoom);
       const codecOrder = resolveCodecPreference();
-      const quality = QUALITY_PROFILES[qualityMode];
+      const quality = pictureConfig(picture);
 
-      const roomInstance = new Room({
-        adaptiveStream: true,
-        dynacast: true,
+      const call = new Room({
+        adaptiveStream: false,
+        dynacast: false,
         publishDefaults: {
-          videoSimulcastLayers: [VideoPresets.h180, VideoPresets.h360, VideoPresets.h720],
+          simulcast: false,
+          backupCodec: false,
+          degradationPreference: "maintain-framerate",
           videoCodec: codecOrder[0],
           screenShareEncoding: {
             maxBitrate: quality.maxBitrate,
-            maxFramerate: quality.frameRate
+            maxFramerate: quality.frameRate,
+            priority: "high"
           }
         }
       });
+      roomInstance = call;
 
-      roomInstance.on(RoomEvent.ConnectionStateChanged, (state) => {
+      call.on(RoomEvent.ConnectionStateChanged, (state) => {
         if (state === ConnectionState.Connected) {
           setCallState("connected");
           setConnectedAt(Date.now());
@@ -622,48 +686,58 @@ export default function HomePage() {
           setConnectedAt(null);
         }
       });
-      roomInstance.on(RoomEvent.Reconnecting, () => setCallState("reconnecting"));
-      roomInstance.on(RoomEvent.Reconnected, () => setCallState("connected"));
-      roomInstance.on(RoomEvent.ParticipantConnected, (participant) => {
+      call.on(RoomEvent.Reconnecting, () => setCallState("reconnecting"));
+      call.on(RoomEvent.Reconnected, () => setCallState("connected"));
+      call.on(RoomEvent.ParticipantConnected, (participant) => {
         setRemoteIsSpeaking(participant.isSpeaking);
-        refreshPreferredRemote(roomInstance);
+        refreshPreferredRemote(call);
       });
-      roomInstance.on(RoomEvent.ParticipantDisconnected, () => {
-        refreshPreferredRemote(roomInstance);
+      call.on(RoomEvent.ParticipantDisconnected, () => {
+        refreshPreferredRemote(call);
       });
-      roomInstance.on(RoomEvent.TrackSubscribed, () => {
-        refreshPreferredRemote(roomInstance);
+      call.on(RoomEvent.TrackSubscribed, () => {
+        refreshPreferredRemote(call);
       });
-      roomInstance.on(RoomEvent.LocalTrackPublished, () => {
-        attachLocalScreen(roomInstance);
+      call.on(RoomEvent.LocalTrackPublished, () => {
+        attachLocalScreen(call);
       });
-      roomInstance.on(RoomEvent.ConnectionQualityChanged, (qualityValue, participant) => {
-        if (participant.identity === roomInstance.localParticipant.identity) {
+      call.on(RoomEvent.ConnectionQualityChanged, (qualityValue, participant) => {
+        if (participant.identity === call.localParticipant.identity) {
           setConnectionPill(qualityText(qualityValue));
         }
       });
 
-      await roomInstance.connect(tokenData.url, tokenData.token, { autoSubscribe: true });
+      await call.connect(tokenData.url, tokenData.token, { autoSubscribe: true });
 
-      if (selectedMicId) {
-        await roomInstance.switchActiveDevice("audioinput", selectedMicId);
+      try {
+        if (selectedMicId) {
+          await call.switchActiveDevice("audioinput", selectedMicId);
+        }
+        await call.localParticipant.setMicrophoneEnabled(true, {
+          echoCancellation: true,
+          noiseSuppression: true
+        });
+      } catch (micError) {
+        showToast(
+          micError instanceof Error
+            ? `Joined without a microphone. ${micError.message}`
+            : "Joined without a microphone. Allow microphone access, then pick one below.",
+          "warning"
+        );
       }
-      await roomInstance.localParticipant.setMicrophoneEnabled(true, {
-        echoCancellation: true,
-        noiseSuppression: true
-      });
 
-      const localParticipant = roomInstance.localParticipant;
+      const localParticipant = call.localParticipant;
       setLocalIsSpeaking(localParticipant.isSpeaking);
       localParticipant.on(ParticipantEvent.IsSpeakingChanged, () => {
         setLocalIsSpeaking(localParticipant.isSpeaking);
       });
 
-      setRoom(roomInstance);
+      setRoom(call);
       setCallState("connected");
       setConnectedAt(Date.now());
-      showToast("Joined room successfully.", "success");
+      showToast("You’re in.", "success");
     } catch (err) {
+      roomInstance?.disconnect();
       setCallState("idle");
       showToast(err instanceof Error ? err.message : "Failed to join call", "error");
     }
@@ -679,6 +753,8 @@ export default function HomePage() {
     setIsRemoteFullscreen(false);
     setRemoteIsSpeaking(false);
     setRemoteIdentity("Waiting for participant");
+    setHasRemoteVideo(false);
+    remoteTrackId.current = null;
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     if (localVideoRef.current) localVideoRef.current.srcObject = null;
     showToast("Call ended.", "neutral");
@@ -698,6 +774,57 @@ export default function HomePage() {
     await room.switchActiveDevice("audioinput", micId);
   }
 
+  async function publishScreen(roomInstance: Room, settings: PictureSettings) {
+    const quality = pictureConfig(settings);
+    const audioConstraints: MediaTrackConstraints = {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false
+    };
+    await roomInstance.localParticipant.setScreenShareEnabled(
+      true,
+      {
+        audio: audioConstraints as unknown as DisplayMediaStreamOptions["audio"],
+        video: {
+          width: { ideal: quality.width },
+          height: { ideal: quality.height },
+          frameRate: { ideal: quality.frameRate, max: quality.frameRate }
+        } as { displaySurface?: "monitor" | "window" | "browser" },
+        contentHint: "motion",
+        selfBrowserSurface: "include",
+        systemAudio: "include"
+      },
+      {
+        simulcast: false,
+        screenShareSimulcastLayers: [],
+        degradationPreference: "maintain-framerate",
+        screenShareEncoding: {
+          maxBitrate: quality.maxBitrate,
+          maxFramerate: quality.frameRate,
+          priority: "high"
+        }
+      }
+    );
+    setIsSharingScreen(true);
+    attachLocalScreen(roomInstance);
+  }
+
+  async function updatePicture(next: PictureSettings) {
+    setPicture(next);
+    if (!room || !isSharingScreen) return;
+    setPictureBusy(true);
+    try {
+      await room.localParticipant.setScreenShareEnabled(false);
+      await publishScreen(room, next);
+      showToast(`Picture set to ${pictureConfig(next).summary}.`, "success");
+    } catch (err) {
+      setIsSharingScreen(false);
+      showToast(err instanceof Error ? err.message : "Could not apply the new picture settings.", "warning");
+    } finally {
+      setPictureBusy(false);
+    }
+  }
+
   async function toggleScreenShare() {
     if (!room) return;
     if (!window.navigator?.mediaDevices?.getDisplayMedia) {
@@ -705,7 +832,6 @@ export default function HomePage() {
       return;
     }
 
-    const quality = QUALITY_PROFILES[qualityMode];
     try {
       if (isSharingScreen) {
         await room.localParticipant.setScreenShareEnabled(false);
@@ -715,42 +841,8 @@ export default function HomePage() {
         return;
       }
 
-      const localParticipant = room.localParticipant;
-      const publishOptions = {
-        screenShareEncoding: {
-          maxBitrate: quality.maxBitrate,
-          maxFramerate: quality.frameRate
-        }
-      };
-      const audioConstraints: MediaTrackConstraints = {
-        // Keep shared-system audio raw to preserve source volume dynamics.
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false
-      };
-
-      await localParticipant.setScreenShareEnabled(
-        true,
-        {
-          audio: audioConstraints as unknown as DisplayMediaStreamOptions["audio"],
-          video: true,
-          resolution: {
-            width: quality.width,
-            height: quality.height,
-            frameRate: quality.frameRate
-          },
-          contentHint: "motion",
-          selfBrowserSurface: "include",
-          systemAudio: "include"
-        },
-        publishOptions
-      );
-      setIsSharingScreen(true);
-      attachLocalScreen(room);
-      showToast(
-        `Screen share started. Target ${quality.width}x${quality.height} @ ${quality.frameRate}fps.`,
-        "success"
-      );
+      await publishScreen(room, picture);
+      showToast(`Sharing at ${pictureConfig(picture).summary}.`, "success");
     } catch (err) {
       showToast(
         err instanceof Error
@@ -865,14 +957,17 @@ export default function HomePage() {
 
   const statusLabel =
     callState === "connected"
-      ? "Connected"
+      ? "In the room"
       : callState === "connecting"
-        ? "Connecting"
+        ? "Joining…"
         : callState === "reconnecting"
-          ? "Reconnecting"
+          ? "Reconnecting…"
           : callState === "ended"
             ? "Ended"
             : "Idle";
+  const otherLabel =
+    remoteIdentity === "Waiting for participant" ? "No one else yet" : remoteIdentity.replace(/_/g, " ");
+  const capture = pictureConfig(picture);
   const onCall = Boolean(room);
   const nativeSessionState = getNativeSessionState(nativeSession);
   const nativeUpdatedSeconds = nativeSession
@@ -886,371 +981,359 @@ export default function HomePage() {
     : null;
 
   return (
-    <main className="min-h-screen bg-[#050608] font-mono text-[#F2F5F8]">
-      <div className="flex min-h-screen">
-        <aside className="hidden w-60 shrink-0 border-r border-[#1C2129] bg-[#07090C] p-4 md:flex md:flex-col">
-          <h1 className="mb-1 text-lg font-semibold tracking-tight">MyCord</h1>
-          <p className="mb-6 text-xs text-[#8E99A8]">Realtime collaboration console</p>
-          <nav className="space-y-1 text-sm">
-            <div className="rounded-sm border-l-2 border-[#22D3EE] bg-[#10141A] px-3 py-2 text-[#F2F5F8]">Sessions</div>
-            <div className="rounded-sm px-3 py-2 text-[#8E99A8]">Overview</div>
-            <div className="rounded-sm px-3 py-2 text-[#8E99A8]">Participants</div>
-            <div className="rounded-sm px-3 py-2 text-[#8E99A8]">Settings</div>
-          </nav>
-        </aside>
+    <main className="app">
+      <a className="skip" href={onCall ? "#stage" : "#entry"}>
+        Skip to content
+      </a>
 
-        <div className="flex-1 p-4 md:p-6">
-          <header className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-[#1C2129] bg-[#0B0E12] px-4 py-3">
-            <div>
-              <h2 className="text-base font-semibold">Room Dashboard</h2>
-              <p className="text-xs text-[#8E99A8]">Low-latency voice and screen sessions</p>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {NATIVE_EXPERIMENTAL_ENABLED && nativeSession && (
-                <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-1 text-xs text-cyan-300">
-                  Native {nativeSession.backend} • {nativeSession.achievedFps.toFixed(1)}fps • {nativeSessionState}
-                  {nativeUpdatedSeconds !== null ? ` • ${nativeUpdatedSeconds}s ago` : ""}
-                </div>
-              )}
-              {NATIVE_EXPERIMENTAL_ENABLED && nativePublisher && (
-                <div className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-1 text-xs text-[#A3ACB8]">
-                  Publisher {nativePublisher.state}
-                  {nativePublisherAgeSeconds !== null ? ` • ${nativePublisherAgeSeconds}s ago` : ""}
-                </div>
-              )}
-              {NATIVE_EXPERIMENTAL_ENABLED && nativeRuntime && (
-                <div className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-1 text-xs text-[#A3ACB8]">
-                  Runtime {nativeRuntime.status}
-                  {nativeRuntimeAgeSeconds !== null ? ` • ${nativeRuntimeAgeSeconds}s ago` : ""}
-                </div>
-              )}
-              <button
-                onClick={copyInviteLink}
-                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-xs text-[#F2F5F8] transition duration-150 ease-out hover:bg-[#11161F]"
-              >
-                {copiedInvite ? "Copied" : "Copy Invite"}
-              </button>
-              <div
-                className={classNames(
-                  "rounded-lg border px-3 py-1 text-xs font-medium uppercase tracking-wide",
-                  connectionPill === "good" && "border-emerald-500/50 bg-emerald-500/20 text-emerald-300",
-                  connectionPill === "fair" && "border-amber-500/50 bg-amber-500/20 text-amber-300",
-                  connectionPill === "poor" && "border-red-500/50 bg-red-500/20 text-red-300"
+      {!onCall && (
+        <section className="lobby">
+          <p className="lobby-mark word" translate="no">
+            MyCord
+          </p>
+          <div className="lobby-main" id="entry" tabIndex={-1}>
+            <h1>Open a room</h1>
+            <p className="lede">Voice in the room. The other person’s screen on the stage. A room code is the whole invitation.</p>
+            <form
+              className="entry"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void joinCall();
+              }}
+            >
+              <label className="field">
+                <span>Your name</span>
+                <input
+                  ref={nameRef}
+                  name="name"
+                  autoComplete="name"
+                  spellCheck={false}
+                  placeholder="Ava…"
+                  value={username}
+                  aria-invalid={nameError ? true : undefined}
+                  aria-describedby={nameError ? "name-error" : undefined}
+                  onChange={(event) => {
+                    setUsername(event.target.value);
+                    if (nameError) setNameError("");
+                  }}
+                />
+                {nameError && (
+                  <span id="name-error" className="field-error">
+                    {nameError}
+                  </span>
                 )}
-              >
-                {connectionPill}
+              </label>
+              <label className="field">
+                <span>Room code</span>
+                <input
+                  ref={roomRef}
+                  name="room"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="mycord-room"
+                  value={roomName}
+                  aria-invalid={roomError ? true : undefined}
+                  aria-describedby={roomError ? "room-error" : undefined}
+                  onChange={(event) => {
+                    setRoomName(event.target.value);
+                    if (roomError) setRoomError("");
+                  }}
+                />
+                {roomError && (
+                  <span id="room-error" className="field-error">
+                    {roomError}
+                  </span>
+                )}
+              </label>
+              <label className="field">
+                <span>Invite, if this room uses one</span>
+                <input
+                  name="invite"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="Leave blank if you have none"
+                  value={invite}
+                  onChange={(event) => setInvite(event.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>Microphone</span>
+                <select
+                  name="microphone"
+                  value={selectedMicId}
+                  onChange={(event) => void switchMic(event.target.value)}
+                >
+                  {audioInputs.length === 0 && <option value="">No microphone found</option>}
+                  {audioInputs.map((mic) => (
+                    <option key={mic.deviceId} value={mic.deviceId}>
+                      {mic.label || `Microphone ${mic.deviceId.slice(0, 8)}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="actions">
+                <button className="btn btn-brass" type="submit" disabled={callState === "connecting"} aria-busy={callState === "connecting"}>
+                  {callState === "connecting" ? "Joining…" : "Join Room"}
+                </button>
+                <p className="note">{uaInfo.message}</p>
               </div>
+            </form>
+          </div>
+        </section>
+      )}
+
+      {onCall && (
+        <section className="call">
+          <header className="call-bar">
+            <div className="who">
+              <span className="word" translate="no">
+                MyCord
+              </span>
+              <strong>{otherLabel}</strong>
+              {remoteIsSpeaking && <span className="speaking">Speaking</span>}
+            </div>
+            <div className="meta">
+              <span>{roomName}</span>
+              <span>{formatElapsed(elapsedMs)}</span>
+              <span>{statusLabel}</span>
+              <span>{connectionPill === "good" ? "Good" : connectionPill === "fair" ? "Fair" : "Poor"}</span>
+              <button type="button" className="btn" onClick={() => void toggleRemoteFullscreen()}>
+                {isRemoteFullscreen ? "Exit Full Screen" : "Full Screen"}
+              </button>
             </div>
           </header>
 
-          {!onCall && (
-            <section className="grid gap-4 rounded-md border border-[#1C2129] bg-[#0B0E12] p-4 md:grid-cols-5 md:p-6">
-              <input
-                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out placeholder:text-[#667185] focus:border-[#22D3EE] md:col-span-5"
-                placeholder="Invite code"
-                value={invite}
-                onChange={(e) => setInvite(e.target.value)}
-              />
-              <input
-                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out placeholder:text-[#667185] focus:border-[#22D3EE]"
-                placeholder="Your name"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-              />
-              <input
-                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out placeholder:text-[#667185] focus:border-[#22D3EE]"
-                placeholder="Room ID"
-                value={roomName}
-                onChange={(e) => setRoomName(e.target.value)}
-              />
-              <select
-                value={qualityMode}
-                onChange={(e) => setQualityMode(e.target.value as QualityMode)}
-                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
-              >
-                <option value="smooth">Smooth (720p60)</option>
-                <option value="balanced">Balanced (1080p60)</option>
-                <option value="sharp">Sharp (1440p60)</option>
-              </select>
-              <select
-                className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
-                value={selectedMicId}
-                onChange={(e) => void switchMic(e.target.value)}
-              >
-                {audioInputs.length === 0 && <option value="">No microphone found</option>}
-                {audioInputs.map((mic) => (
-                  <option key={mic.deviceId} value={mic.deviceId}>
-                    {mic.label || `Microphone ${mic.deviceId.slice(0, 8)}`}
-                  </option>
-                ))}
-              </select>
-              <button
-                onClick={joinCall}
-                className="rounded-sm bg-[#22D3EE] px-4 py-2 text-sm font-medium text-[#050608] transition duration-150 ease-out hover:bg-[#67E8F9]"
-              >
-                {callState === "connecting" ? "Joining..." : "Join Room"}
-              </button>
-            </section>
-          )}
-
-          {onCall && (
-            <div className="grid gap-4 md:grid-cols-12">
-              <section className="rounded-md border border-[#1C2129] bg-[#0B0E12] p-3 md:col-span-8">
-                <div className="mb-2 flex items-center justify-between px-1">
-                  <p className="text-sm font-medium text-[#DCE3EA]">
-                    {remoteIdentity} {remoteIsSpeaking ? "is speaking" : ""}
-                  </p>
-                  <div className="flex items-center gap-2 text-xs text-[#8E99A8]">
-                    <span>{statusLabel}</span>
-                    <span>•</span>
-                    <span>{formatElapsed(elapsedMs)}</span>
-                  </div>
-                </div>
-                <video
-                  ref={remoteVideoRef}
-                  autoPlay
-                  playsInline
-                  className={classNames(
-                    "aspect-video w-full rounded-sm bg-[#0A0D12] object-contain",
-                    remoteIsSpeaking && "ring-1 ring-cyan-400/70"
-                  )}
-                />
-                <button
-                  onClick={toggleRemoteFullscreen}
-                  className="mt-3 rounded-sm border border-[#2A313D] bg-[#0D1117] px-3 py-2 text-xs text-[#DCE3EA] transition duration-150 ease-out hover:bg-[#151A23]"
-                >
-                  {isRemoteFullscreen ? "Exit Fullscreen (F)" : "Fullscreen (F)"}
-                </button>
-              </section>
-
-              <section className="rounded-md border border-[#1C2129] bg-[#0B0E12] p-3 md:col-span-4">
-                <p className="mb-2 px-1 text-sm font-medium text-[#DCE3EA]">Your share preview</p>
-                <video
-                  ref={localVideoRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  className={classNames(
-                    "aspect-video w-full rounded-sm bg-[#0A0D12] object-contain",
-                    localIsSpeaking && "ring-1 ring-cyan-400/70"
-                  )}
-                />
-                <p className="mt-2 px-1 text-xs text-[#8E99A8]">
-                  {isSharingScreen ? "Screen share active" : "Not sharing your screen"}
+          <div className="stage" id="stage" tabIndex={-1}>
+            <video ref={remoteVideoRef} className="remote" autoPlay playsInline />
+            {!hasRemoteVideo && (
+              <div className="empty">
+                <h2>{remoteIdentity === "Waiting for participant" ? "The screen shows up here." : otherLabel}</h2>
+                <p>
+                  {remoteIdentity === "Waiting for participant"
+                    ? "When the other person shares, it fills this stage."
+                    : "Waiting for their screen."}
                 </p>
-                {screenCaptureStats && (
-                  <p className="mt-1 px-1 text-xs text-[#667185]">
-                    Capturing: {screenCaptureStats.width}x{screenCaptureStats.height} @ {screenCaptureStats.frameRate}fps
-                  </p>
+              </div>
+            )}
+            <video
+              ref={localVideoRef}
+              className={isSharingScreen ? "pip" : "pip parked"}
+              autoPlay
+              playsInline
+              muted
+            />
+          </div>
+
+          <footer className="dock">
+            <div className="dock-buttons">
+              <button
+                type="button"
+                className={isMuted ? "btn btn-danger" : "btn"}
+                aria-pressed={isMuted}
+                onClick={() => void toggleMute()}
+              >
+                {isMuted ? "Unmute" : "Mute"}
+              </button>
+              <button
+                type="button"
+                className={isSharingScreen ? "btn btn-live" : "btn"}
+                aria-pressed={isSharingScreen}
+                onClick={() => void toggleScreenShare()}
+              >
+                {isSharingScreen ? "Stop Sharing" : "Share Screen"}
+              </button>
+              <button type="button" className="btn" onClick={() => void copyInviteLink()}>
+                {copiedInvite ? "Copied" : "Copy Link"}
+              </button>
+              <button type="button" className="btn btn-danger" onClick={() => void leaveCall()}>
+                Leave
+              </button>
+            </div>
+            <div className="choices">
+              <label className="choice">
+                <span>Resolution</span>
+                <select
+                  name="resolution"
+                  value={picture.resolutionId}
+                  disabled={pictureBusy}
+                  onChange={(event) =>
+                    void updatePicture({ ...picture, resolutionId: event.target.value as ResolutionId })
+                  }
+                >
+                  {RESOLUTIONS.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="choice">
+                <span>Refresh rate</span>
+                <select
+                  name="refresh"
+                  value={picture.refreshRate}
+                  disabled={pictureBusy}
+                  onChange={(event) =>
+                    void updatePicture({ ...picture, refreshRate: Number(event.target.value) as RefreshRate })
+                  }
+                >
+                  {REFRESH_RATES.map((rate) => (
+                    <option key={rate} value={rate}>
+                      {rate} Hz
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="choice">
+                <span>Bitrate</span>
+                <select
+                  name="bitrate"
+                  value={picture.bitrateKbps}
+                  disabled={pictureBusy}
+                  onChange={(event) => void updatePicture({ ...picture, bitrateKbps: Number(event.target.value) })}
+                >
+                  {BITRATES.map((item) => (
+                    <option key={item.kbps} value={item.kbps}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="choice">
+                <span>Microphone</span>
+                <select name="microphone" value={selectedMicId} onChange={(event) => void switchMic(event.target.value)}>
+                  {audioInputs.length === 0 && <option value="">No microphone found</option>}
+                  {audioInputs.map((mic) => (
+                    <option key={mic.deviceId} value={mic.deviceId}>
+                      {mic.label || `Microphone ${mic.deviceId.slice(0, 8)}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <p className="note">
+              {screenCaptureStats
+                ? `Capturing ${screenCaptureStats.width}×${screenCaptureStats.height} at ${screenCaptureStats.frameRate} fps. Cap ${capture.summary}.`
+                : `Picture cap ${capture.summary}. It applies when you share.`}
+            </p>
+          </footer>
+
+          {NATIVE_EXPERIMENTAL_ENABLED && (
+            <details className="native-fold">
+              <summary>
+                Native sender
+                {nativeRuntime ? ` · ${nativeRuntime.status}` : ""}
+                {nativeSession ? ` · ${nativeSession.achievedFps.toFixed(1)} fps · ${nativeSessionState}` : ""}
+              </summary>
+              <div className="native-grid">
+                <input
+                  aria-label="Native identity"
+                  value={nativeRuntimeIdentity}
+                  onChange={(event) => setNativeRuntimeIdentity(event.target.value.replace(/\s+/g, "_"))}
+                  placeholder="Native identity"
+                />
+                <select
+                  aria-label="Capture mode"
+                  value={nativeCaptureMode}
+                  onChange={(event) => setNativeCaptureMode(event.target.value as NativeCaptureMode)}
+                >
+                  <option value="auto">Capture: auto</option>
+                  <option value="scrap">Capture: scrap</option>
+                  <option value="ffmpeg-ddagrab">Capture: ffmpeg ddagrab</option>
+                </select>
+                <select
+                  aria-label="Encoder"
+                  value={nativeEncoderMode}
+                  onChange={(event) => setNativeEncoderMode(event.target.value as NativeEncoderMode)}
+                >
+                  <option value="ffmpeg-h264-nvenc">NVENC</option>
+                  <option value="ffmpeg-libx264">libx264</option>
+                  <option value="fast">Fast</option>
+                </select>
+                <label>
+                  <input type="checkbox" checked={nativeDryRun} onChange={(event) => setNativeDryRun(event.target.checked)} /> Dry run
+                </label>
+                <input
+                  aria-label="Target frames per second"
+                  type="number"
+                  min={24}
+                  max={240}
+                  value={nativeTargetFps}
+                  onChange={(event) => setNativeTargetFps(Math.min(240, Math.max(24, Number(event.target.value) || 60)))}
+                />
+                <input
+                  aria-label="Probe seconds"
+                  type="number"
+                  min={1}
+                  max={60}
+                  value={nativeProbeSeconds}
+                  onChange={(event) => setNativeProbeSeconds(Math.min(60, Math.max(1, Number(event.target.value) || 3)))}
+                />
+                <input
+                  aria-label="Heartbeat seconds"
+                  type="number"
+                  min={1}
+                  max={60}
+                  value={nativeHeartbeatSeconds}
+                  onChange={(event) =>
+                    setNativeHeartbeatSeconds(Math.min(60, Math.max(1, Number(event.target.value) || 1)))
+                  }
+                />
+                <button type="button" className="btn btn-live" onClick={() => setPreferNativeSource((value) => !value)}>
+                  {preferNativeSource ? "Prefer the native picture" : "Prefer the browser picture"}
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => void startNativeRuntime()}
+                  disabled={nativeRuntimeBusy || nativeRuntime?.status === "running" || nativeRuntime?.status === "starting"}
+                >
+                  {nativeRuntimeBusy ? "Working…" : "Start Native Sender"}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-danger"
+                  onClick={() => void stopNativeRuntime()}
+                  disabled={nativeRuntimeBusy || !nativeRuntime || nativeRuntime.status === "idle"}
+                >
+                  Stop Native Sender
+                </button>
+                <p>
+                  {nativePublisher
+                    ? `Publisher ${nativePublisher.state}${nativePublisherAgeSeconds !== null ? `, ${nativePublisherAgeSeconds}s ago` : ""}`
+                    : "No publisher yet."}
+                  {nativeUpdatedSeconds !== null ? ` Session ${nativeUpdatedSeconds}s ago.` : ""}
+                  {nativeRuntimeAgeSeconds !== null ? ` Runtime ${nativeRuntimeAgeSeconds}s ago.` : ""}
+                  {selectedSourceLabel ? ` Source ${selectedSourceLabel}.` : ""}
+                </p>
+                <p>{nativeRuntime?.lastError ? nativeRuntime.lastError : "No runtime error."}</p>
+              </div>
+              <div className="native-grid">
+                {nativeRuntimeLogs.length === 0 ? (
+                  <p>No runtime logs yet.</p>
+                ) : (
+                  nativeRuntimeLogs.map((log, index) => (
+                    <p key={`${log.ts}-${index}`}>
+                      {new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" }).format(
+                        new Date(log.ts)
+                      )}{" "}
+                      [{log.stream}] {log.message}
+                    </p>
+                  ))
                 )}
-              </section>
-
-              <section className="rounded-md border border-[#1C2129] bg-[#0B0E12] p-4 md:col-span-12">
-                <div className="grid gap-3 md:grid-cols-6">
-                  <button
-                    onClick={toggleMute}
-                    className={classNames(
-                      "rounded-lg border px-3 py-2 text-sm transition duration-150 ease-out",
-                      isMuted
-                        ? "border-red-500/50 bg-red-500/20 text-red-300 hover:bg-red-500/25"
-                        : "border-[#1C2129] bg-[#090C11] text-[#F2F5F8] hover:bg-[#11161F]"
-                    )}
-                  >
-                    {isMuted ? "Unmute (M)" : "Mute (M)"}
-                  </button>
-                  <button
-                    onClick={toggleScreenShare}
-                    className={classNames(
-                      "rounded-lg border px-3 py-2 text-sm transition duration-150 ease-out",
-                      isSharingScreen
-                        ? "border-emerald-500/50 bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/25"
-                        : "border-[#1C2129] bg-[#090C11] text-[#F2F5F8] hover:bg-[#11161F]"
-                    )}
-                  >
-                    {isSharingScreen ? "Stop Share (S)" : "Share Screen (S)"}
-                  </button>
-                  <select
-                    className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
-                    value={selectedMicId}
-                    onChange={(e) => void switchMic(e.target.value)}
-                  >
-                    {audioInputs.length === 0 && <option value="">No microphone found</option>}
-                    {audioInputs.map((mic) => (
-                      <option key={mic.deviceId} value={mic.deviceId}>
-                        {mic.label || `Microphone ${mic.deviceId.slice(0, 8)}`}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    onClick={copyInviteLink}
-                    className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] transition duration-150 ease-out hover:bg-[#11161F]"
-                  >
-                    {copiedInvite ? "Copied link" : "Copy invite"}
-                  </button>
-                  {NATIVE_EXPERIMENTAL_ENABLED && (
-                    <button
-                      onClick={() => setPreferNativeSource((v) => !v)}
-                      className={classNames(
-                        "rounded-lg border px-3 py-2 text-sm transition duration-150 ease-out",
-                        preferNativeSource
-                          ? "border-cyan-500/50 bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/25"
-                          : "border-[#1C2129] bg-[#090C11] text-[#F2F5F8] hover:bg-[#11161F]"
-                      )}
-                    >
-                      {preferNativeSource ? "Prefer Native: ON" : "Prefer Native: OFF"}
-                    </button>
-                  )}
-                  <button
-                    onClick={leaveCall}
-                    className="rounded-sm border border-red-500/50 bg-red-500/20 px-3 py-2 text-sm text-red-300 transition duration-150 ease-out hover:bg-red-500/25"
-                  >
-                    End Call
-                  </button>
-                </div>
-              </section>
-
-              {NATIVE_EXPERIMENTAL_ENABLED && (
-              <section className="rounded-md border border-[#1C2129] bg-[#0B0E12] p-4 md:col-span-12">
-                  <div className="grid gap-3 md:grid-cols-4">
-                    <input
-                      value={nativeRuntimeIdentity}
-                      onChange={(e) => setNativeRuntimeIdentity(e.target.value.replace(/\s+/g, "_"))}
-                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
-                      placeholder="Native identity"
-                    />
-                    <select
-                      value={nativeCaptureMode}
-                      onChange={(e) => setNativeCaptureMode(e.target.value as NativeCaptureMode)}
-                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
-                    >
-                      <option value="auto">Capture: auto (DXGI to scrap fallback)</option>
-                      <option value="scrap">Capture: scrap (stable)</option>
-                      <option value="ffmpeg-ddagrab">Capture: ffmpeg-ddagrab (DXGI)</option>
-                    </select>
-                    <select
-                      value={nativeEncoderMode}
-                      onChange={(e) => setNativeEncoderMode(e.target.value as NativeEncoderMode)}
-                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
-                    >
-                      <option value="ffmpeg-h264-nvenc">Encoder: ffmpeg-h264-nvenc</option>
-                      <option value="ffmpeg-libx264">Encoder: ffmpeg-libx264</option>
-                      <option value="fast">Encoder: fast (placeholder)</option>
-                    </select>
-                    <label className="flex items-center gap-2 rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8]">
-                      <input type="checkbox" checked={nativeDryRun} onChange={(e) => setNativeDryRun(e.target.checked)} />
-                      Dry run
-                    </label>
-                    <input
-                      type="number"
-                      min={24}
-                      max={240}
-                      value={nativeTargetFps}
-                      onChange={(e) => setNativeTargetFps(Math.min(240, Math.max(24, Number(e.target.value) || 60)))}
-                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
-                      placeholder="Target FPS"
-                    />
-                    <input
-                      type="number"
-                      min={1}
-                      max={60}
-                      value={nativeProbeSeconds}
-                      onChange={(e) => setNativeProbeSeconds(Math.min(60, Math.max(1, Number(e.target.value) || 3)))}
-                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
-                      placeholder="Probe seconds"
-                    />
-                    <input
-                      type="number"
-                      min={1}
-                      max={60}
-                      value={nativeHeartbeatSeconds}
-                      onChange={(e) => setNativeHeartbeatSeconds(Math.min(60, Math.max(1, Number(e.target.value) || 1)))}
-                      className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-sm text-[#F2F5F8] outline-none transition duration-150 ease-out focus:border-[#22D3EE]"
-                      placeholder="Heartbeat seconds"
-                    />
-                    <div className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-xs text-[#A3ACB8]">
-                      Runtime identity: <span className="text-[#DCE3EA]">{nativeRuntime?.identity ?? "native-sender"}</span>
-                    </div>
-                    <button
-                      onClick={startNativeRuntime}
-                      disabled={nativeRuntimeBusy || nativeRuntime?.status === "running" || nativeRuntime?.status === "starting"}
-                      className={classNames(
-                        "rounded-lg border px-3 py-2 text-sm transition duration-150 ease-out",
-                        nativeRuntimeBusy || nativeRuntime?.status === "running" || nativeRuntime?.status === "starting"
-                          ? "cursor-not-allowed border-[#1C2129] bg-[#090C11] text-[#667185]"
-                          : "border-emerald-500/50 bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/25"
-                      )}
-                    >
-                      {nativeRuntimeBusy ? "Working..." : "Start Native Runtime"}
-                    </button>
-                    <button
-                      onClick={stopNativeRuntime}
-                      disabled={nativeRuntimeBusy || !nativeRuntime || nativeRuntime.status === "idle"}
-                      className={classNames(
-                        "rounded-lg border px-3 py-2 text-sm transition duration-150 ease-out",
-                        nativeRuntimeBusy || !nativeRuntime || nativeRuntime.status === "idle"
-                          ? "cursor-not-allowed border-[#1C2129] bg-[#090C11] text-[#667185]"
-                          : "border-red-500/50 bg-red-500/20 text-red-300 hover:bg-red-500/25"
-                      )}
-                    >
-                      {nativeRuntimeBusy ? "Working..." : "Stop Native Runtime"}
-                    </button>
-                    <div className="rounded-sm border border-[#1C2129] bg-[#090C11] px-3 py-2 text-xs text-[#A3ACB8]">
-                      {nativeRuntime?.lastError ? `Last runtime error: ${nativeRuntime.lastError}` : "Last runtime error: none"}
-                    </div>
-                  </div>
-                </section>
-              )}
-
-              {NATIVE_EXPERIMENTAL_ENABLED && (
-              <section className="rounded-md border border-[#1C2129] bg-[#0B0E12] p-4 md:col-span-12">
-                  <p className="mb-2 text-xs uppercase tracking-wide text-[#667185]">Native runtime logs</p>
-                  {nativeRuntimeLogs.length === 0 ? (
-                    <p className="text-xs text-[#667185]">No runtime logs yet.</p>
-                  ) : (
-                    <div className="space-y-1 text-xs">
-                      {nativeRuntimeLogs.map((log, idx) => (
-                        <p key={`${log.ts}-${idx}`} className="rounded-sm bg-[#090C11] px-2 py-1 text-[#A3ACB8]">
-                          <span className="text-[#667185]">{new Date(log.ts).toLocaleTimeString()} </span>
-                          <span className="text-cyan-300/70">[{log.stream}] </span>
-                          {log.message}
-                        </p>
-                      ))}
-                    </div>
-                  )}
-                </section>
-              )}
-            </div>
+              </div>
+            </details>
           )}
+        </section>
+      )}
 
-          <section className="mt-4 rounded-md border border-[#1C2129] bg-[#0B0E12] px-4 py-3 text-sm text-[#A3ACB8]">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <p>
-                Browser: <span className="text-[#DCE3EA]">{uaInfo.browser}</span> | OS:{" "}
-                <span className="text-[#DCE3EA]">{uaInfo.os}</span>
-              </p>
-              <p className="text-xs">
-                Selected source: <span className="text-[#DCE3EA]">{selectedSourceLabel}</span>
-              </p>
-              <p className="text-xs text-[#667185]">{uaInfo.message}</p>
-            </div>
-            <div ref={remoteAudioContainerRef} />
-          </section>
+      <div className="audio-sink" ref={remoteAudioContainerRef} />
 
-          {toastText && (
-            <section
-              className={classNames(
-                "fixed bottom-4 right-4 z-50 max-w-md rounded-sm border px-4 py-3 text-sm",
-                toastTone === "error" && "border-red-500/50 bg-red-500/20 text-red-300",
-                toastTone === "warning" && "border-amber-500/50 bg-amber-500/20 text-amber-300",
-                toastTone === "success" && "border-emerald-500/50 bg-emerald-500/20 text-emerald-300",
-                toastTone === "neutral" && "border-[#1C2129] bg-[#0B0E12] text-[#F2F5F8]"
-              )}
-            >
-              {toastText}
-            </section>
-          )}
-        </div>
-      </div>
+      {toastText && (
+        <p className={toastTone === "error" ? "toast error" : toastTone === "success" ? "toast success" : "toast"} role="status" aria-live="polite">
+          {toastText}
+        </p>
+      )}
     </main>
   );
 }
