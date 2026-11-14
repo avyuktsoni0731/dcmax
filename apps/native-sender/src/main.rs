@@ -1,4 +1,7 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod api;
+mod app;
 mod audio;
 mod config;
 mod direct;
@@ -20,6 +23,11 @@ use reqwest::Client;
 
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+    // A double-clicked app has no flags. The command line still starts the
+    // capture tools the desktop script already uses.
+    if std::env::args().len() == 1 {
+        return app::run();
+    }
     let args = CliArgs::parse();
     if args.relay {
         let addr = args

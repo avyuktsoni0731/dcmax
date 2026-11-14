@@ -12,7 +12,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-const KEYFRAME_GAP: Duration = Duration::from_secs(1);
+/// Minimum time between requested keyframes. The regular group of pictures
+/// stays one second; this only limits an extra keyframe after a lost frame.
+const KEYFRAME_GAP: Duration = Duration::from_millis(32);
 
 struct Controls {
     force_keyframe: Arc<AtomicBool>,

@@ -191,6 +191,15 @@ fn send_loop(dial: Dial, rx: Receiver<Outgoing>, shared: Arc<Shared>) {
             frame_id = 0;
             audio_id = 0;
             announced = false;
+            // Frames queued before the watcher was reading belong to a gap.
+            // Sending them would show one old picture and then nothing the
+            // watcher can decode until the next keyframe.
+            if shared.need_key.load(Ordering::Acquire) {
+                while rx.try_recv().is_ok() {}
+                if !video_key {
+                    continue;
+                }
+            }
         }
         let socket = stream.as_mut().unwrap();
         let id = if matches!(frame, Outgoing::Audio { .. }) {

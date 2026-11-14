@@ -314,6 +314,80 @@ fn note_once(message: &str) {
     eprintln!("{message}");
 }
 
+/// Packed RGBA for the app window. The Metal presenter still owns the fast path
+/// in the watch window; this copy is only for the in-app stage.
+pub fn rgba(buffer: &CVPixelBuffer, full_range: bool) -> Option<(u32, u32, Vec<u8>)> {
+    let width = u32::try_from(buffer.width()).ok()?;
+    let height = u32::try_from(buffer.height()).ok()?;
+    let guard = buffer.lock_read_only().ok()?;
+    let y = plane(&guard, 0, height as usize)?;
+    let uv = plane(&guard, 1, ((height as usize) + 1) / 2)?;
+    let stride_y = u32::try_from(guard.bytes_per_row_of_plane(0)).ok()?;
+    let stride_uv = u32::try_from(guard.bytes_per_row_of_plane(1)).ok()?;
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+    for row in 0..height {
+        for col in 0..width {
+            let luma = y
+                .get((row * stride_y + col) as usize)
+                .copied()
+                .unwrap_or(16);
+            let chroma = ((row / 2) * stride_uv + (col / 2) * 2) as usize;
+            let chroma_u = uv.get(chroma).copied().unwrap_or(128);
+            let chroma_v = uv.get(chroma + 1).copied().unwrap_or(128);
+            let (r, g, b) = yuv(luma, chroma_u, chroma_v, full_range);
+            let at = ((row * width + col) * 4) as usize;
+            rgba[at] = r;
+            rgba[at + 1] = g;
+            rgba[at + 2] = b;
+            rgba[at + 3] = 255;
+        }
+    }
+    Some((width, height, rgba))
+}
+
+fn plane<'a>(
+    guard: &'a screencapturekit::cv::CVPixelBufferLockGuard<'a>,
+    index: usize,
+    rows: usize,
+) -> Option<&'a [u8]> {
+    let ptr = guard.base_address_of_plane(index)?;
+    if ptr.is_null() {
+        return None;
+    }
+    let stride = guard.bytes_per_row_of_plane(index);
+    if stride == 0 {
+        return None;
+    }
+    let len = stride.checked_mul(rows)?;
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+fn yuv(y: u8, u: u8, v: u8, full_range: bool) -> (u8, u8, u8) {
+    let (c, d, e) = if full_range {
+        (i32::from(y), i32::from(u) - 128, i32::from(v) - 128)
+    } else {
+        (i32::from(y) - 16, i32::from(u) - 128, i32::from(v) - 128)
+    };
+    let (r, g, b) = if full_range {
+        (
+            ((c << 8) + 359 * e + 128) >> 8,
+            ((c << 8) - 88 * d - 183 * e + 128) >> 8,
+            ((c << 8) + 454 * d + 128) >> 8,
+        )
+    } else {
+        (
+            (298 * c + 409 * e + 128) >> 8,
+            (298 * c - 100 * d - 208 * e + 128) >> 8,
+            (298 * c + 516 * d + 128) >> 8,
+        )
+    };
+    (
+        r.clamp(0, 255) as u8,
+        g.clamp(0, 255) as u8,
+        b.clamp(0, 255) as u8,
+    )
+}
+
 unsafe extern "C" fn on_decoded(
     refcon: *mut c_void,
     _source: *mut c_void,

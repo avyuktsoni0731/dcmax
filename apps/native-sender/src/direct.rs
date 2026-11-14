@@ -20,6 +20,9 @@ const PUNCH: &[u8] = b"dcmax-punch";
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Card {
     id: String,
+    /// "host" publishes the picture. "watch" receives it. Empty means an older app.
+    #[serde(default)]
+    role: String,
     #[serde(default)]
     addr: String,
     #[serde(default)]
@@ -51,7 +54,7 @@ struct Identity {
 pub async fn host(
     participant: LocalParticipant,
     identity: &str,
-    mut incoming: UnboundedReceiver<Vec<u8>>,
+    incoming: UnboundedReceiver<Vec<u8>>,
 ) -> Result<SocketAddr> {
     let (socket, candidates) = tokio::task::spawn_blocking(prepare)
         .await
@@ -62,48 +65,73 @@ pub async fn host(
     println!("picture direct: listening");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let local = listener.local_addr()?;
-    tokio::spawn(async move {
-        let accepted = listener.accept();
-        let quic = async {
-            let incoming = endpoint
-                .accept()
-                .await
-                .context("picture direct: the watcher did not connect")?;
-            let connection = incoming.await.context("picture direct: handshake failed")?;
-            // The sender opens the stream. Quinn does not tell the watcher a
-            // stream exists until this side writes, and the watcher has nothing
-            // to write until a frame has already arrived.
-            connection
-                .open_bi()
-                .await
-                .context("picture direct: no stream")
-        };
-        let (tcp, streams) = tokio::join!(accepted, quic);
-        match (tcp, streams) {
-            (Ok((tcp, _)), Ok((send, recv))) => {
-                println!("picture direct: carrying the picture");
-                bridge(tcp, send, recv).await;
-                println!("picture direct: picture stopped");
-            }
-            (Err(err), _) => eprintln!("picture direct: local pipe {err}"),
-            (_, Err(err)) => eprintln!("picture direct: {err:#}"),
-        }
-    });
     let card = Card {
         id: identity.to_string(),
+        role: "host".to_string(),
         addr: candidates.first().map(|addr| addr.to_string()).unwrap_or_default(),
         addrs: candidates.iter().map(|addr| addr.to_string()).collect(),
         cert: hex(&mine.cert),
     };
+    let payload = serde_json::to_vec(&card)?;
+    let (alive_tx, alive_rx) = tokio::sync::watch::channel(true);
     tokio::spawn(async move {
-        match exchange(&participant, &card, &mut incoming, false).await {
-            Ok(peer) => {
-                println!(
-                    "picture direct: other app is at {}",
-                    join_addrs(&peer.targets())
-                );
+        let mut incoming = incoming;
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let _ = participant
+                        .publish_data(DataPacket {
+                            payload: payload.clone(),
+                            topic: Some(TOPIC.to_string()),
+                            reliable: true,
+                            destination_identities: Vec::new(),
+                        })
+                        .await;
+                }
+                message = incoming.recv() => {
+                    if message.is_none() {
+                        let _ = alive_tx.send(false);
+                        break;
+                    }
+                }
             }
-            Err(err) => eprintln!("picture direct: {err:#}"),
+        }
+    });
+    tokio::spawn(async move {
+        let mut alive_rx = alive_rx;
+        loop {
+            if !*alive_rx.borrow() {
+                break;
+            }
+            let connecting = tokio::select! {
+                _ = alive_rx.changed() => break,
+                conn = endpoint.accept() => conn,
+            };
+            let Some(connecting) = connecting else {
+                break;
+            };
+            let Ok(connection) = connecting.await else {
+                continue;
+            };
+            // The sender opens the stream. Quinn does not tell the watcher a
+            // stream exists until this side writes, and the watcher has nothing
+            // to write until a frame has already arrived.
+            let Ok((send, recv)) = connection.open_bi().await else {
+                continue;
+            };
+            // Accept the local sender only once the watcher is on this stream.
+            // Accepting earlier fills the socket with frames, the queue then
+            // drops the rest, and the watcher is left with a single frame.
+            let Ok(accepted) = tokio::time::timeout(Duration::from_secs(30), listener.accept()).await else {
+                continue;
+            };
+            let Ok((tcp, _)) = accepted else {
+                break;
+            };
+            println!("picture direct: carrying the picture");
+            bridge(tcp, send, recv).await;
+            println!("picture direct: picture stopped");
         }
     });
     Ok(local)
@@ -128,7 +156,7 @@ pub async fn join_watch(config: crate::config::AppConfig, playback: SocketAddr) 
     let (room, mut events) = Room::connect(&token.url, &token.token, options)
         .await
         .context("LiveKit room connect failed")?;
-    let (tx, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, incoming) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             if let RoomEvent::DataReceived { payload, topic, .. } = event {
@@ -138,17 +166,30 @@ pub async fn join_watch(config: crate::config::AppConfig, playback: SocketAddr) 
             }
         }
     });
+    let participant = room.local_participant();
+    follow(participant, &config.identity, incoming, playback).await
+}
+
+/// Watch side on a room that is already connected. `playback` is the local
+/// picture listener. A host card from the same identity is ignored, so this
+/// can run beside [`host`] in one process.
+pub async fn follow(
+    participant: LocalParticipant,
+    identity: &str,
+    mut incoming: UnboundedReceiver<Vec<u8>>,
+    playback: SocketAddr,
+) -> Result<()> {
     let (socket, candidates) = tokio::task::spawn_blocking(prepare)
         .await
         .context("address lookup")??;
     println!("picture direct: this app is at {}", join_addrs(&candidates));
     let card = Card {
-        id: config.identity.clone(),
+        id: identity.to_string(),
+        role: "watch".to_string(),
         addr: candidates.first().map(|addr| addr.to_string()).unwrap_or_default(),
         addrs: candidates.iter().map(|addr| addr.to_string()).collect(),
         cert: String::new(),
     };
-    let participant = room.local_participant();
     let peer = exchange(&participant, &card, &mut incoming, true).await?;
     let targets = peer.targets();
     let expected = unhex(&peer.cert)?;
@@ -207,6 +248,9 @@ async fn exchange(
                     continue;
                 };
                 if card.id == me.id || card.targets().is_empty() {
+                    continue;
+                }
+                if !me.role.is_empty() && card.role == me.role {
                     continue;
                 }
                 if want_cert && card.cert.is_empty() {
