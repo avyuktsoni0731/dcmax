@@ -28,12 +28,21 @@ pub async fn run(
         .context("LiveKit room connect failed")?;
 
     let (disconnect_tx, mut disconnect_rx) = tokio::sync::watch::channel(false);
+    let (direct_tx, mut direct_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
-            if let RoomEvent::Disconnected { reason } = event {
-                eprintln!("livekit disconnected: {reason:?}");
-                let _ = disconnect_tx.send(true);
-                break;
+            match event {
+                RoomEvent::Disconnected { reason } => {
+                    eprintln!("livekit disconnected: {reason:?}");
+                    let _ = disconnect_tx.send(true);
+                    break;
+                }
+                RoomEvent::DataReceived { payload, topic, .. }
+                    if topic.as_deref() == Some(crate::direct::TOPIC) =>
+                {
+                    let _ = direct_tx.send(payload.to_vec());
+                }
+                _ => {}
             }
         }
     });
@@ -73,7 +82,7 @@ pub async fn run(
         "native session heartbeat started (every {}s). Press Ctrl+C to stop.",
         config.heartbeat_seconds
     );
-    api::report_native_publisher_event(
+    if let Err(err) = api::report_native_publisher_event(
         http,
         &config.api_base_url,
         &config.room_name,
@@ -85,7 +94,9 @@ pub async fn run(
         None,
     )
     .await
-    .context("failed to report publisher running")?;
+    {
+        eprintln!("publisher status was not recorded: {err:#}");
+    }
 
     let mut ticker = interval(Duration::from_secs(config.heartbeat_seconds));
     ticker.tick().await;
@@ -106,7 +117,27 @@ pub async fn run(
     let mut late_drops: u64 = 0;
     let mut need_key = true;
     let mut last_timestamp_us: i64 = 0;
-    let picture = if let Some(addr) = config.picture_relay {
+    let (pipe_tx, mut pipe_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut waiting_for_direct = config.picture_direct;
+    if config.picture_direct {
+        let participant = room.local_participant();
+        let identity = config.identity.clone();
+        println!("picture direct: looking for the other app");
+        tokio::spawn(async move {
+            match crate::direct::host(participant, &identity, &mut direct_rx).await {
+                Ok(addr) => {
+                    let _ = pipe_tx.send(addr);
+                }
+                Err(err) => {
+                    eprintln!("picture direct: {err:#}");
+                    eprintln!("picture direct: the LiveKit picture stays on");
+                }
+            }
+        });
+    } else {
+        drop(direct_rx);
+    }
+    let mut picture = if let Some(addr) = config.picture_relay {
         let invite = config
             .invite
             .as_deref()
@@ -151,6 +182,18 @@ pub async fn run(
             changed = disconnect_rx.changed() => {
                 if changed.is_err() || *disconnect_rx.borrow() {
                     anyhow::bail!("LiveKit room disconnected");
+                }
+            }
+            addr = pipe_rx.recv(), if waiting_for_direct => {
+                waiting_for_direct = false;
+                if let Some(addr) = addr {
+                    match PictureSender::connect(addr) {
+                        Ok(sender) => {
+                            println!("picture direct: sending to the other app");
+                            picture = Some(sender);
+                        }
+                        Err(err) => eprintln!("picture direct: {err:#}"),
+                    }
                 }
             }
             _ = ticker.tick() => {

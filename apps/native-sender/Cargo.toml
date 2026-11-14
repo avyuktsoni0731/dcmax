@@ -9,6 +9,9 @@ clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 livekit = { version = "0.10", features = ["rustls-tls-native-roots"] }
+quinn = "0.11"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 softbuffer = "0.4"
 winit = "0.30"
 cpal = "0.15"
@@ -17,7 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.5"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "io-util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

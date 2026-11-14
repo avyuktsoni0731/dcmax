@@ -1,6 +1,7 @@
 mod api;
 mod audio;
 mod config;
+mod direct;
 #[cfg(target_os = "macos")]
 mod decode_macos;
 mod encoder;
@@ -69,7 +70,11 @@ async fn run_sender(mut config: AppConfig) -> Result<()> {
         config.invite.as_deref(),
     )
     .await?;
-    if config.picture_to.is_none() && config.picture_relay.is_none() && config.invite.is_some() {
+    if config.picture_to.is_none()
+        && config.picture_relay.is_none()
+        && !config.picture_direct
+        && config.invite.is_some()
+    {
         if let Some(relay) = token.relay.as_deref() {
             config.picture_relay = Some(
                 relay

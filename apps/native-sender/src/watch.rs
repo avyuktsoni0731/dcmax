@@ -227,12 +227,37 @@ pub fn run(config: &AppConfig) -> Result<()> {
     let task_mute = Arc::clone(&mute);
     let _runtime;
     let picture_thread;
-    let link = picture_link(config);
+    let mut direct_runtime = None;
+    let link = if config.picture_direct {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("failed to start the watch runtime")?;
+        let task_config = config.clone();
+        runtime.spawn(async move {
+            let addr = match rx.recv() {
+                Ok(addr) => addr,
+                Err(_) => return,
+            };
+            if let Err(err) = crate::direct::join_watch(task_config, addr).await {
+                eprintln!("picture direct: {err:#}");
+            }
+        });
+        direct_runtime = Some(runtime);
+        Some(PictureLink::Local(tx))
+    } else {
+        picture_link(config)
+    };
     if let Some(link) = link {
         match &link {
             PictureLink::Listen(addr) => println!("watch picture: direct tcp {addr}"),
             PictureLink::Relay { addr, .. } => {
                 println!("watch picture: relay {addr}");
+                println!("call: picture and system audio. Press m to mute.");
+            }
+            PictureLink::Local(_) => {
+                println!("watch picture: direct");
                 println!("call: picture and system audio. Press m to mute.");
             }
         }
@@ -248,7 +273,7 @@ pub fn run(config: &AppConfig) -> Result<()> {
                 })
                 .context("failed to start the picture receiver")?,
         );
-        _runtime = None;
+        _runtime = direct_runtime;
     } else {
         picture_thread = None;
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -304,6 +329,8 @@ enum PictureLink {
         room: String,
         invite: String,
     },
+    /// Bind a local playback port and hand that port to the direct connection.
+    Local(std::sync::mpsc::SyncSender<std::net::SocketAddr>),
 }
 
 fn picture_link(config: &AppConfig) -> Option<PictureLink> {
@@ -384,6 +411,12 @@ fn picture_watch_macos(
 
     let listener = match &link {
         PictureLink::Listen(addr) => Some(listen(*addr)?),
+        PictureLink::Local(bound) => {
+            let listener = listen("127.0.0.1:0".parse().expect("local address"))?;
+            let addr = listener.local_addr()?;
+            let _ = bound.send(addr);
+            Some(listener)
+        }
         PictureLink::Relay { .. } => None,
     };
     let (tx, rx) = sync_channel(8);

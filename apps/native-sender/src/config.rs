@@ -54,6 +54,9 @@ pub struct CliArgs {
     /// Invite code from POST /invites. Required once the API has INVITE_REQUIRED=true.
     #[arg(long)]
     pub invite: Option<String>,
+    /// Send the picture straight to the other app. LiveKit is only the room and voice.
+    #[arg(long, default_value_t = false)]
+    pub picture_direct: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +112,7 @@ pub struct AppConfig {
     pub picture_listen: Option<SocketAddr>,
     pub picture_relay: Option<SocketAddr>,
     pub invite: Option<String>,
+    pub picture_direct: bool,
 }
 
 impl AppConfig {
@@ -190,6 +194,13 @@ impl AppConfig {
         {
             bail!("--picture-relay needs --invite");
         }
+        if args.picture_direct
+            && (args.picture_to.is_some()
+                || args.picture_relay.is_some()
+                || args.picture_listen.is_some())
+        {
+            bail!("--picture-direct replaces --picture-to, --picture-listen, and --picture-relay");
+        }
 
         Ok(Self {
             api_base_url,
@@ -211,6 +222,7 @@ impl AppConfig {
             picture_listen: parse_addr(args.picture_listen.as_deref(), "--picture-listen")?,
             picture_relay: parse_addr(args.picture_relay.as_deref(), "--picture-relay")?,
             invite: args.invite.clone().filter(|invite| !invite.trim().is_empty()),
+            picture_direct: args.picture_direct,
         })
     }
 
