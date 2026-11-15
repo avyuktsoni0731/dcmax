@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>MyCord uses the microphone for the voice call.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>MyCord captures the screen when you share it.</string>
+</dict>
+</plist>

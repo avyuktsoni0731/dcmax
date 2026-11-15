@@ -117,29 +117,175 @@ struct Joined {
     playback_stop: Arc<AtomicBool>,
 }
 
-pub fn run() -> Result<()> {
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (note_tx, note_rx) = std::sync::mpsc::channel();
-    let stage = Arc::new(Stage {
-        frames: Mutex::new(VecDeque::new()),
-        ended: AtomicBool::new(false),
-        clock: PlayClock::new(),
-        stats: PictureStats::new(),
-    });
-    let stage_thread = Arc::clone(&stage);
-    std::thread::Builder::new()
-        .name("mycord".to_string())
-        .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-                Ok(runtime) => runtime,
-                Err(err) => {
-                    let _ = note_tx.send(Note::Status(format!("Could not start the call runtime: {err}")));
-                    return;
-                }
-            };
-            runtime.block_on(session(cmd_rx, note_tx, stage_thread));
+pub struct CallRequest {
+    pub name: String,
+    pub room: String,
+    pub invite: Option<String>,
+}
+
+pub struct ShareRequest {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_kbps: u32,
+}
+
+pub enum EngineNote {
+    Status(String),
+    Joined,
+    Left,
+    Sharing(bool),
+}
+
+/// The call thread the window talks to. Voice, capture, and the picture stay
+/// in this process. The window only sends these small commands.
+pub struct Engine {
+    commands: tokio::sync::mpsc::UnboundedSender<Cmd>,
+    notes: Mutex<Option<std::sync::mpsc::Receiver<Note>>>,
+    stage: Arc<Stage>,
+}
+
+impl Engine {
+    pub fn start() -> Result<Self> {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (note_tx, note_rx) = std::sync::mpsc::channel();
+        let stage = Arc::new(Stage {
+            frames: Mutex::new(VecDeque::new()),
+            ended: AtomicBool::new(false),
+            clock: PlayClock::new(),
+            stats: PictureStats::new(),
+        });
+        let stage_thread = Arc::clone(&stage);
+        std::thread::Builder::new()
+            .name("mycord".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        let _ = note_tx.send(Note::Status(format!("Could not start the call runtime: {err}")));
+                        return;
+                    }
+                };
+                runtime.block_on(session(cmd_rx, note_tx, stage_thread));
+            })
+            .context("failed to start the call thread")?;
+        Ok(Self {
+            commands: cmd_tx,
+            notes: Mutex::new(Some(note_rx)),
+            stage,
         })
-        .context("failed to start the call thread")?;
+    }
+
+    pub fn join(&self, request: CallRequest) -> Result<()> {
+        let name = request.name.trim();
+        let room = request.room.trim();
+        if name.is_empty() || name.len() > 64 {
+            anyhow::bail!("enter a display name");
+        }
+        if room.is_empty() || room.len() > 64 {
+            anyhow::bail!("enter a room name");
+        }
+        let invite = request.invite.and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+        self.commands
+            .send(Cmd::Join(CallSettings {
+                name: name.to_string(),
+                room: room.to_string(),
+                invite,
+            }))
+            .map_err(|_| anyhow!("the call runtime stopped"))?;
+        Ok(())
+    }
+
+    pub fn leave(&self) -> Result<()> {
+        self.commands
+            .send(Cmd::Leave)
+            .map_err(|_| anyhow!("the call runtime stopped"))?;
+        Ok(())
+    }
+
+    pub fn share(&self, request: ShareRequest) -> Result<()> {
+        self.commands
+            .send(Cmd::Share(picture_settings(request)?))
+            .map_err(|_| anyhow!("the call runtime stopped"))?;
+        Ok(())
+    }
+
+    pub fn stop_share(&self) -> Result<()> {
+        self.commands
+            .send(Cmd::StopShare)
+            .map_err(|_| anyhow!("the call runtime stopped"))?;
+        Ok(())
+    }
+
+    pub fn tune(&self, request: ShareRequest) -> Result<()> {
+        self.commands
+            .send(Cmd::Tune(picture_settings(request)?))
+            .map_err(|_| anyhow!("the call runtime stopped"))?;
+        Ok(())
+    }
+
+    pub fn set_muted(&self, muted: bool) -> Result<()> {
+        self.commands
+            .send(Cmd::Mute(muted))
+            .map_err(|_| anyhow!("the call runtime stopped"))?;
+        Ok(())
+    }
+
+    pub fn poll(&self) -> Option<EngineNote> {
+        let guard = self.notes.lock().ok()?;
+        let note = guard.as_ref()?.try_recv().ok()?;
+        Some(match note {
+            Note::Status(text) => EngineNote::Status(text),
+            Note::Joined => EngineNote::Joined,
+            Note::Left => EngineNote::Left,
+            Note::Sharing(on) => EngineNote::Sharing(on),
+        })
+    }
+
+    /// One decoded picture, if the playback clock says it is time. The caller
+    /// draws it on the native surface. The bytes are not sent anywhere else.
+    pub fn with_picture<R>(&self, draw: impl FnOnce(&crate::present_gl::Picture) -> R) -> Option<R> {
+        let frame = take_frame(&self.stage)?;
+        self.stage.stats.shown.fetch_add(1, Ordering::Relaxed);
+        Some(draw(frame.pixels.as_ref()))
+    }
+}
+
+fn picture_settings(request: ShareRequest) -> Result<PictureSettings> {
+    if request.width < 2 || request.height < 2 || request.width > 7680 || request.height > 4320 {
+        anyhow::bail!("that resolution is not available");
+    }
+    if request.fps < 15 || request.fps > 240 {
+        anyhow::bail!("that frame rate is not available");
+    }
+    if request.bitrate_kbps < 800 || request.bitrate_kbps > 100_000 {
+        anyhow::bail!("that bitrate is not available");
+    }
+    Ok(PictureSettings {
+        width: request.width,
+        height: request.height,
+        fps: request.fps,
+        bitrate_kbps: request.bitrate_kbps,
+    })
+}
+
+pub fn run() -> Result<()> {
+    let engine = Engine::start()?;
+    let cmd_tx = engine.commands.clone();
+    let stage = Arc::clone(&engine.stage);
+    let note_rx = engine
+        .notes
+        .lock()
+        .map_err(|_| anyhow!("call notes lock poisoned"))?
+        .take()
+        .context("call notes were already taken")?;
 
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

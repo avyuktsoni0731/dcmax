@@ -26,8 +26,9 @@ const envSchema = z.object({
 });
 
 const env = envSchema.parse(process.env);
-if (env.NODE_ENV === "production" && !env.NATIVE_CONTROL_SECRET) {
-  throw new Error("NATIVE_CONTROL_SECRET is required in production.");
+const remoteNativeRuntime = process.env.ENABLE_REMOTE_NATIVE_RUNTIME === "1";
+if (env.NODE_ENV === "production" && remoteNativeRuntime && !env.NATIVE_CONTROL_SECRET) {
+  throw new Error("NATIVE_CONTROL_SECRET is required when the remote native runtime is enabled.");
 }
 if (env.NODE_ENV === "production" && !(env.WEB_ORIGINS ?? env.WEB_ORIGIN)) {
   throw new Error("WEB_ORIGINS or WEB_ORIGIN must be set in production.");
@@ -272,7 +273,14 @@ const nativeRuntimeStopSchema = z.object({
   roomName: z.string().min(2).max(64).regex(/^[a-zA-Z0-9_-]+$/)
 });
 
+function remoteNativeDisabled(res: express.Response) {
+  if (env.NODE_ENV !== "production" || remoteNativeRuntime) return false;
+  res.status(410).json({ error: "Screen capture runs in the desktop app on this computer." });
+  return true;
+}
+
 app.post("/native/runtime/start", (req, res) => {
+  if (remoteNativeDisabled(res)) return;
   if (!requireNativeControl(req, res)) return;
   const parsed = nativeRuntimeStartSchema.safeParse(req.body);
   if (!parsed.success) {
