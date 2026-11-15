@@ -1,6 +1,7 @@
 //! The window people open. No flags: a name, a room code, then voice and the
 //! native picture. The command-line tools stay available when arguments are set.
 
+use crate::adapt::PictureAdapt;
 use crate::audio::{decode_packet, decoder as opus_decoder, AudioPlayer, PlayClock};
 use crate::config::{AppConfig, CaptureBackend, EncoderBackend, TargetPlatform};
 use crate::direct::{self, TOPIC};
@@ -16,25 +17,55 @@ use livekit::prelude::*;
 use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
 use livekit::webrtc::video_source::{native::NativeVideoSource, RtcVideoSource, VideoResolution};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const WORKER: &str = "https://dcmax-token.soniavyukt.workers.dev";
+/// One keyframe request while the picture pipe is behind. A request on every
+/// skipped frame turned the stall into a run of the largest packets.
+const KEY_REQUEST_GAP: Duration = Duration::from_millis(800);
 
 struct Frame {
     width: usize,
     height: usize,
-    rgba: Vec<u8>,
+    pixels: Arc<crate::present_gl::Picture>,
 }
 
 /// A few frames, released on the same clock as the desktop audio.
-/// Eight frames is about 130 ms. Anything older is dropped so a burst
-/// cannot turn into a multi-second delay.
+/// Ten frames is about 160 ms at 60 fps. A burst older than that is
+/// trimmed so a stall cannot replay itself.
 struct Stage {
     frames: Mutex<VecDeque<TimedFrame>>,
     ended: AtomicBool,
     clock: Arc<PlayClock>,
+    stats: PictureStats,
+}
+
+/// Counters for one watched picture. The play thread and the window both
+/// update them; a once-a-second line reports the deltas.
+struct PictureStats {
+    received: AtomicU64,
+    decoded: AtomicU64,
+    decode_fail: AtomicU64,
+    shown: AtomicU64,
+    queue_drop: AtomicU64,
+    late_drop: AtomicU64,
+    audio: AtomicU64,
+    video_bytes: AtomicU64,
+    audio_bytes: AtomicU64,
+}
+
+struct RateSample {
+    received: u64,
+    decoded: u64,
+    decode_fail: u64,
+    shown: u64,
+    queue_drop: u64,
+    late_drop: u64,
+    audio: u64,
+    video_bytes: u64,
+    audio_bytes: u64,
 }
 
 struct TimedFrame {
@@ -89,6 +120,7 @@ pub fn run() -> Result<()> {
         frames: Mutex::new(VecDeque::new()),
         ended: AtomicBool::new(false),
         clock: PlayClock::new(),
+        stats: PictureStats::new(),
     });
     let stage_thread = Arc::clone(&stage);
     std::thread::Builder::new()
@@ -140,8 +172,7 @@ struct MyCord {
     dark: bool,
     window_for_call: bool,
     status: String,
-    picture: Option<egui::TextureHandle>,
-    shown: Instant,
+    frame: Option<Arc<Frame>>,
     pointer_at: Option<egui::Pos2>,
     controls_until: Instant,
 }
@@ -194,8 +225,7 @@ impl MyCord {
             dark: saved.dark,
             window_for_call: false,
             status: String::new(),
-            picture: None,
-            shown: Instant::now(),
+            frame: None,
             pointer_at: None,
             controls_until: Instant::now(),
         };
@@ -279,7 +309,7 @@ impl MyCord {
                     self.leaving = false;
                     self.sharing = false;
                     self.muted = false;
-                    self.picture = None;
+                    self.frame = None;
                     if self.fullscreen {
                         self.set_fullscreen(ctx, false);
                     }
@@ -296,41 +326,23 @@ impl MyCord {
             }
         }
         if self.stage.ended.swap(false, Ordering::AcqRel) {
-            self.picture = None;
+            self.frame = None;
             if let Ok(mut frames) = self.stage.frames.lock() {
                 frames.clear();
             }
         }
-        // One upload per refresh. The play clock releases the frame that
-        // belongs to this moment, and drops a frame that is already late.
-        let ready = self.picture.is_none() || self.shown.elapsed() >= Duration::from_millis(16);
-        if ready {
-            if let Some(frame) = take_frame(&self.stage) {
-                let pixels = frame.width.saturating_mul(frame.height).saturating_mul(4);
-                if frame.width == 0 || frame.height == 0 || frame.rgba.len() != pixels {
-                    note_log(&format!(
-                        "rejected a picture frame {}x{} ({} bytes)",
-                        frame.width,
-                        frame.height,
-                        frame.rgba.len()
-                    ));
-                } else {
-                    let image = egui::ColorImage::from_rgba_unmultiplied(
-                        [frame.width, frame.height],
-                        &frame.rgba,
-                    );
-                    if let Some(texture) = &mut self.picture {
-                        texture.set(image, egui::TextureOptions::LINEAR);
-                    } else {
-                        self.picture =
-                            Some(ctx.load_texture("picture", image, egui::TextureOptions::LINEAR));
-                    }
-                    self.shown = Instant::now();
-                }
+        // One frame per display refresh, in order. The gpu draw is cheap
+        // enough to make that refresh, so a 60 fps stream stays 60 fps.
+        if let Some(frame) = take_frame(&self.stage) {
+            if frame.width == 0 || frame.height == 0 {
+                note_log("rejected a picture frame with no size");
+            } else {
+                self.frame = Some(Arc::new(frame));
+                self.stage.stats.shown.fetch_add(1, Ordering::Relaxed);
             }
         }
         if self.joined {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            ctx.request_repaint();
         }
     }
 
@@ -566,17 +578,19 @@ impl MyCord {
 
     fn stage_view(&mut self, ui: &mut egui::Ui, theme: &Theme, rect: egui::Rect, radius: u8) {
         ui.painter().rect_filled(rect, radius, theme.stage);
-        if let Some(texture) = &self.picture {
+        if let Some(frame) = &self.frame {
             let inset = if radius == 0 { 0.0 } else { 8.0 };
             let available = rect.shrink(inset);
-            let sized = texture.size_vec2();
-            let scale = (available.width() / sized.x).min(available.height() / sized.y);
-            let size = sized * scale;
+            let scale = (available.width() / frame.width as f32).min(available.height() / frame.height as f32);
+            let size = egui::vec2(frame.width as f32 * scale, frame.height as f32 * scale);
             let image_rect = egui::Rect::from_center_size(available.center(), size);
-            ui.put(
-                image_rect,
-                egui::Image::new((texture.id(), size)).corner_radius(egui::CornerRadius::same(radius.saturating_sub(2))),
-            );
+            let shown = Arc::clone(frame);
+            ui.painter().add(egui::PaintCallback {
+                rect: image_rect,
+                callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |_info, painter| {
+                    crate::present_gl::draw(painter.gl(), &shown.pixels);
+                })),
+            });
         } else {
             let icon = egui::Rect::from_center_size(rect.center() - egui::vec2(0.0, 42.0), egui::vec2(42.0, 34.0));
             let icon_color = if theme.text.r() > 180 { theme.accent } else { theme.text };
@@ -1484,9 +1498,24 @@ async fn share_loop(
         .await
         .context("Could not publish the screen")?;
     let mut need_key = true;
+    let mut last_key = Instant::now() - KEY_REQUEST_GAP;
+    let mut adapt = PictureAdapt::new(config.bitrate_kbps, config.target_fps);
     let mut last_timestamp_us = 0i64;
     let mut audio_open = true;
     let mut audio_noted = false;
+    let mut window = Instant::now();
+    let mut encoded = 0u64;
+    let mut video_bytes = 0u64;
+    let mut audio_pkts = 0u64;
+    let mut audio_bytes = 0u64;
+    let mut late = 0u64;
+    let mut keys = 0u64;
+    let mut last_sent = picture.sent();
+    let mut last_skipped = picture.skipped();
+    note_log(&format!(
+        "share started: {}x{} target {}fps cap {}kbps",
+        config.width, config.height, config.target_fps, config.bitrate_kbps
+    ));
     loop {
         if *stop.borrow() {
             break;
@@ -1508,17 +1537,23 @@ async fn share_loop(
                     }
                 };
                 last_timestamp_us = last_timestamp_us.max(timestamp_us);
+                encoded += 1;
+                video_bytes += unit.payload.len() as u64;
+                if unit.keyframe {
+                    keys += 1;
+                }
                 if picture.take_keyframe() {
-                    encoder.request_keyframe();
+                    request_key(&encoder, &mut last_key);
                 }
                 picture.offer(&unit.payload, unit.keyframe, timestamp_us, unit.cursor);
                 if unit.captured_at.elapsed() > MAX_FRAME_AGE {
+                    late += 1;
                     need_key = true;
-                    encoder.request_keyframe();
+                    request_key(&encoder, &mut last_key);
                     continue;
                 }
                 if need_key && !unit.keyframe {
-                    encoder.request_keyframe();
+                    request_key(&encoder, &mut last_key);
                     continue;
                 }
                 need_key = false;
@@ -1532,7 +1567,24 @@ async fn share_loop(
                 };
                 let _ = source.capture_encoded_frame(&frame);
                 if source.take_keyframe_request() {
-                    encoder.request_keyframe();
+                    request_key(&encoder, &mut last_key);
+                }
+                if window.elapsed() >= Duration::from_secs(1) {
+                    apply_pace(
+                        &encoder,
+                        &mut adapt,
+                        &picture,
+                        window.elapsed(),
+                        &mut encoded,
+                        &mut video_bytes,
+                        &mut audio_pkts,
+                        &mut audio_bytes,
+                        &mut late,
+                        &mut keys,
+                        &mut last_sent,
+                        &mut last_skipped,
+                    );
+                    window = Instant::now();
                 }
             }
             audio = encoder.audio.recv(), if audio_open => {
@@ -1541,10 +1593,31 @@ async fn share_loop(
                         audio_noted = true;
                         note_log("desktop audio captured");
                     }
+                    audio_pkts += 1;
+                    audio_bytes += audio.payload.len() as u64;
                     picture.offer_audio(&audio.payload, audio.timestamp_us);
                 } else {
                     audio_open = false;
                     note_log("desktop audio capture ended");
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                if window.elapsed() >= Duration::from_secs(1) {
+                    apply_pace(
+                        &encoder,
+                        &mut adapt,
+                        &picture,
+                        window.elapsed(),
+                        &mut encoded,
+                        &mut video_bytes,
+                        &mut audio_pkts,
+                        &mut audio_bytes,
+                        &mut late,
+                        &mut keys,
+                        &mut last_sent,
+                        &mut last_skipped,
+                    );
+                    window = Instant::now();
                 }
             }
         }
@@ -1553,6 +1626,56 @@ async fn share_loop(
     let _ = participant.unpublish_track(&publication.sid()).await;
     drop(picture);
     Ok(())
+}
+
+fn request_key(encoder: &ScreenEncoder, last_key: &mut Instant) {
+    if last_key.elapsed() >= KEY_REQUEST_GAP {
+        encoder.request_keyframe();
+        *last_key = Instant::now();
+    }
+}
+
+fn apply_pace(
+    encoder: &ScreenEncoder,
+    adapt: &mut PictureAdapt,
+    picture: &PictureSender,
+    elapsed: Duration,
+    encoded: &mut u64,
+    video_bytes: &mut u64,
+    audio_pkts: &mut u64,
+    audio_bytes: &mut u64,
+    late: &mut u64,
+    keys: &mut u64,
+    last_sent: &mut u64,
+    last_skipped: &mut u64,
+) {
+    let sent = picture.sent().saturating_sub(*last_sent);
+    let skipped = picture.skipped().saturating_sub(*last_skipped);
+    let pace = adapt.observe(*encoded, sent, skipped);
+    if pace.changed {
+        encoder.set_bitrate_bps(pace.bps);
+        encoder.set_fps(pace.fps);
+        note_log(&format!(
+            "share pace: {} {}kbps {}fps",
+            pace.reason,
+            pace.bps / 1000,
+            pace.fps
+        ));
+    }
+    log_share(
+        picture,
+        elapsed,
+        encoded,
+        video_bytes,
+        audio_pkts,
+        audio_bytes,
+        late,
+        keys,
+        last_sent,
+        last_skipped,
+        pace.bps,
+        pace.fps,
+    );
 }
 
 fn call_config(settings: &CallSettings, picture: &PictureSettings) -> AppConfig {
@@ -1614,13 +1737,21 @@ fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<At
         let mut decoder = PictureDecoder::new();
         let mut saw_video = false;
         let mut logged = Instant::now();
+        let mut previous = RateSample::default();
+        let mut clock_ms = 0i64;
         note_log("picture connected");
         loop {
             if stop.load(Ordering::Acquire) {
                 return;
             }
+            if logged.elapsed() >= Duration::from_secs(1) {
+                log_watch(&stage, logged.elapsed(), &mut previous, clock_ms);
+                logged = Instant::now();
+            }
             match reader.read_frame() {
                 Ok(Some(frame)) if frame.audio => {
+                    stage.stats.audio.fetch_add(1, Ordering::Relaxed);
+                    stage.stats.audio_bytes.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
                     if let (Some(player), Some(opus)) = (player.as_ref(), opus.as_mut()) {
                         match decode_packet(opus, &frame.payload) {
                             Ok(pcm) => {
@@ -1639,21 +1770,22 @@ fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<At
                     }
                 }
                 Ok(Some(frame)) => {
+                    stage.stats.received.fetch_add(1, Ordering::Relaxed);
+                    stage.stats.video_bytes.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
+                    let now_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|time| time.as_micros() as i64)
+                        .unwrap_or(frame.timestamp_us);
+                    clock_ms = now_us.saturating_sub(frame.timestamp_us) / 1000;
                     if let Some(decoded) = decoder.decode(&frame.payload) {
+                        stage.stats.decoded.fetch_add(1, Ordering::Relaxed);
                         if !saw_video {
                             saw_video = true;
                             note_log(&format!("picture {}x{}", decoded.width, decoded.height));
                         }
-                        if logged.elapsed() >= Duration::from_secs(1) {
-                            let now_us = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|time| time.as_micros() as i64)
-                                .unwrap_or(frame.timestamp_us);
-                            let late_ms = now_us.saturating_sub(frame.timestamp_us) / 1000;
-                            note_log(&format!("picture late {late_ms}ms"));
-                            logged = Instant::now();
-                        }
                         store_frame(&stage, decoded, frame.timestamp_us);
+                    } else {
+                        stage.stats.decode_fail.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Ok(None) => {
@@ -1680,22 +1812,33 @@ fn store_frame(stage: &Stage, frame: Frame, timestamp_us: i64) {
         return;
     };
     frames.push_back(TimedFrame { timestamp_us, frame });
-    while frames.len() > 8 {
+    let mut dropped = 0u64;
+    while frames.len() > 10 {
         frames.pop_front();
+        dropped += 1;
+    }
+    if dropped > 0 {
+        stage.stats.queue_drop.fetch_add(dropped, Ordering::Relaxed);
     }
 }
 
 fn take_frame(stage: &Stage) -> Option<Frame> {
     let now = stage.clock.now_us()?;
     let mut frames = stage.frames.lock().ok()?;
-    while frames.len() >= 2 {
-        let late = frames[0].timestamp_us.saturating_add(40_000) < now;
-        let next_due = frames[1].timestamp_us <= now;
-        if late && next_due {
-            frames.pop_front();
-        } else {
+    let mut dropped = 0u64;
+    // Play frames in order. Drop only when the queued pictures span more
+    // than half a second, which is a backlog rather than a smooth buffer.
+    while frames.len() > 3 {
+        let oldest = frames.front().map(|frame| frame.timestamp_us).unwrap_or(0);
+        let newest = frames.back().map(|frame| frame.timestamp_us).unwrap_or(0);
+        if newest.saturating_sub(oldest) <= 500_000 {
             break;
         }
+        frames.pop_front();
+        dropped += 1;
+    }
+    if dropped > 0 {
+        stage.stats.late_drop.fetch_add(dropped, Ordering::Relaxed);
     }
     if frames.front().is_some_and(|frame| frame.timestamp_us <= now) {
         return frames.pop_front().map(|timed| timed.frame);
@@ -1737,11 +1880,18 @@ impl PictureDecoder {
         #[cfg(target_os = "macos")]
         {
             let decoded = self.inner.decode(payload)?;
-            let (width, height, rgba) = crate::decode_macos::rgba(&decoded.buffer, decoded.full_range)?;
+            let width = decoded.buffer.width();
+            let height = decoded.buffer.height();
+            if width == 0 || height == 0 {
+                return None;
+            }
             return Some(Frame {
-                width: width as usize,
-                height: height as usize,
-                rgba,
+                width,
+                height,
+                pixels: Arc::new(crate::present_gl::Picture::Nv12 {
+                    buffer: decoded.buffer,
+                    full_range: decoded.full_range,
+                }),
             });
         }
         #[cfg(target_os = "windows")]
@@ -1758,7 +1908,11 @@ impl PictureDecoder {
             return Some(Frame {
                 width,
                 height,
-                rgba,
+                pixels: Arc::new(crate::present_gl::Picture::Rgba {
+                    width: width as i32,
+                    height: height as i32,
+                    pixels: rgba,
+                }),
             });
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1777,6 +1931,118 @@ struct Saved {
     fps: u32,
     bitrate: u32,
     dark: bool,
+}
+
+impl PictureStats {
+    fn new() -> Self {
+        Self {
+            received: AtomicU64::new(0),
+            decoded: AtomicU64::new(0),
+            decode_fail: AtomicU64::new(0),
+            shown: AtomicU64::new(0),
+            queue_drop: AtomicU64::new(0),
+            late_drop: AtomicU64::new(0),
+            audio: AtomicU64::new(0),
+            video_bytes: AtomicU64::new(0),
+            audio_bytes: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for RateSample {
+    fn default() -> Self {
+        Self {
+            received: 0,
+            decoded: 0,
+            decode_fail: 0,
+            shown: 0,
+            queue_drop: 0,
+            late_drop: 0,
+            audio: 0,
+            video_bytes: 0,
+            audio_bytes: 0,
+        }
+    }
+}
+
+fn sample_stats(stage: &Stage) -> RateSample {
+    let stats = &stage.stats;
+    RateSample {
+        received: stats.received.load(Ordering::Relaxed),
+        decoded: stats.decoded.load(Ordering::Relaxed),
+        decode_fail: stats.decode_fail.load(Ordering::Relaxed),
+        shown: stats.shown.load(Ordering::Relaxed),
+        queue_drop: stats.queue_drop.load(Ordering::Relaxed),
+        late_drop: stats.late_drop.load(Ordering::Relaxed),
+        audio: stats.audio.load(Ordering::Relaxed),
+        video_bytes: stats.video_bytes.load(Ordering::Relaxed),
+        audio_bytes: stats.audio_bytes.load(Ordering::Relaxed),
+    }
+}
+
+fn per_sec(count: u64, secs: f64) -> f64 {
+    count as f64 / secs
+}
+
+fn log_share(
+    picture: &PictureSender,
+    elapsed: Duration,
+    encoded: &mut u64,
+    video_bytes: &mut u64,
+    audio_pkts: &mut u64,
+    audio_bytes: &mut u64,
+    late: &mut u64,
+    keys: &mut u64,
+    last_sent: &mut u64,
+    last_skipped: &mut u64,
+    pace_bps: u64,
+    pace_fps: u32,
+) {
+    let secs = elapsed.as_secs_f64().max(0.001);
+    let sent = picture.sent();
+    let skipped = picture.skipped();
+    note_log(&format!(
+        "share: encoded={:.0} sent={:.0} skipped={:.0} late={} key={} audio={:.0} video_kbps={:.0} audio_kbps={:.0} pace_kbps={} pace_fps={}",
+        per_sec(*encoded, secs),
+        per_sec(sent.saturating_sub(*last_sent), secs),
+        per_sec(skipped.saturating_sub(*last_skipped), secs),
+        *late,
+        *keys,
+        per_sec(*audio_pkts, secs),
+        per_sec(*video_bytes * 8 / 1000, secs),
+        per_sec(*audio_bytes * 8 / 1000, secs),
+        pace_bps / 1000,
+        pace_fps,
+    ));
+    *encoded = 0;
+    *video_bytes = 0;
+    *audio_pkts = 0;
+    *audio_bytes = 0;
+    *late = 0;
+    *keys = 0;
+    *last_sent = sent;
+    *last_skipped = skipped;
+}
+
+fn log_watch(stage: &Stage, elapsed: Duration, previous: &mut RateSample, clock_ms: i64) {
+    let secs = elapsed.as_secs_f64().max(0.001);
+    let now = sample_stats(stage);
+    let held = stage.frames.lock().map(|frames| frames.len()).unwrap_or(0);
+    note_log(&format!(
+        "watch: received={:.0} decoded={:.0} shown={:.0} queue_drop={} late_drop={} decode_fail={} audio={:.0} video_kbps={:.0} audio_kbps={:.0} held={} clock_ms={}",
+        per_sec(now.received.saturating_sub(previous.received), secs),
+        per_sec(now.decoded.saturating_sub(previous.decoded), secs),
+        per_sec(now.shown.saturating_sub(previous.shown), secs),
+        now.queue_drop.saturating_sub(previous.queue_drop),
+        now.late_drop.saturating_sub(previous.late_drop),
+        now.decode_fail.saturating_sub(previous.decode_fail),
+        per_sec(now.audio.saturating_sub(previous.audio), secs),
+        per_sec(now.video_bytes.saturating_sub(previous.video_bytes) * 8 / 1000, secs),
+        per_sec(now.audio_bytes.saturating_sub(previous.audio_bytes) * 8 / 1000, secs),
+        held,
+        clock_ms,
+    ));
+    *previous = now;
 }
 
 fn note_log(line: &str) {
@@ -1869,13 +2135,18 @@ mod tests {
             frames: Mutex::new(VecDeque::new()),
             ended: AtomicBool::new(false),
             clock: PlayClock::new(),
+            stats: PictureStats::new(),
         };
         store_frame(
             &stage,
             Frame {
                 width: 1,
                 height: 1,
-                rgba: vec![1, 0, 0, 255],
+                pixels: Arc::new(crate::present_gl::Picture::Rgba {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![1, 0, 0, 255],
+                }),
             },
             5_000_000,
         );
@@ -1886,11 +2157,15 @@ mod tests {
                 Frame {
                     width: 1,
                     height: 1,
-                    rgba: vec![index, 0, 0, 255],
+                    pixels: Arc::new(crate::present_gl::Picture::Rgba {
+                        width: 1,
+                        height: 1,
+                        pixels: vec![index, 0, 0, 255],
+                    }),
                 },
                 8_000_000 + i64::from(index) * 16_000,
             );
         }
-        assert!(queued(&stage) <= 8, "a burst must not rebuild a long delay");
+        assert!(queued(&stage) <= 10, "a burst must not rebuild a long delay");
     }
 }

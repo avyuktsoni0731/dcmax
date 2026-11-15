@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod adapt;
 mod api;
 mod app;
 mod audio;
@@ -10,6 +11,7 @@ mod decode_macos;
 mod encoder;
 mod h264;
 mod picture;
+mod present_gl;
 #[cfg(target_os = "macos")]
 mod present_macos;
 mod publish;

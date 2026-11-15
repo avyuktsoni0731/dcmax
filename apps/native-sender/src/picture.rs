@@ -134,6 +134,10 @@ impl PictureSender {
         if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) = self.tx.try_send(frame)
         {
             self.shared.skipped.fetch_add(1, Ordering::Relaxed);
+            // The watcher never saw this frame, so the next picture it can
+            // decode is a keyframe. The flag stays up until that keyframe is
+            // asked for. Setting it on every skipped frame used to turn a full
+            // queue into a stream of keyframes, which are the largest packets.
             self.shared.need_key.store(true, Ordering::Release);
             self.shared.want_idr.store(true, Ordering::Release);
         }

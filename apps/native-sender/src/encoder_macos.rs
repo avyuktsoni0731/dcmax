@@ -21,6 +21,7 @@ static AUDIO_MISS: AtomicBool = AtomicBool::new(false);
 struct Controls {
     force_keyframe: Arc<AtomicBool>,
     bitrate_bps: AtomicU64,
+    interval_us: AtomicU64,
 }
 
 struct Clock {
@@ -130,6 +131,7 @@ impl ScreenEncoder {
         let controls = Arc::new(Controls {
             force_keyframe: Arc::new(AtomicBool::new(false)),
             bitrate_bps: AtomicU64::new(bitrate_bps),
+            interval_us: AtomicU64::new(frame_interval_us(config.target_fps)),
         });
         let session = VtSession::create(
             width,
@@ -155,7 +157,6 @@ impl ScreenEncoder {
             Arc::clone(&fatal),
             Arc::clone(&flight),
             Arc::clone(&stale_skips),
-            frame_interval(config.target_fps),
         );
         let (stream, audio) = match open_stream(
             config,
@@ -226,6 +227,12 @@ impl ScreenEncoder {
         self.controls.bitrate_bps.store(bps, Ordering::Relaxed);
     }
 
+    pub fn set_fps(&self, fps: u32) {
+        self.controls
+            .interval_us
+            .store(frame_interval_us(fps), Ordering::Relaxed);
+    }
+
     pub fn queue_drops(&self) -> u64 {
         self.queue_drops.load(Ordering::Relaxed)
     }
@@ -265,7 +272,6 @@ fn spawn_encode_thread(
     fatal: Arc<Mutex<Option<String>>>,
     flight: Arc<Flight>,
     stale_skips: Arc<AtomicU64>,
-    interval: Duration,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("screen-encode".to_string())
@@ -323,7 +329,8 @@ fn spawn_encode_thread(
                     }
                     break;
                 }
-                next_at = Instant::now() + interval;
+                let interval_us = controls.interval_us.load(Ordering::Relaxed).max(1);
+                next_at = Instant::now() + Duration::from_micros(interval_us);
             }
         })
         .expect("failed to start the screen encode thread")
@@ -359,8 +366,8 @@ fn wait_for_newest(pending: &Pending, earliest: Instant) -> Option<PendingFrame>
     }
 }
 
-fn frame_interval(fps: u32) -> Duration {
-    Duration::from_nanos(1_000_000_000 / u64::from(fps.max(1)))
+fn frame_interval_us(fps: u32) -> u64 {
+    1_000_000 / u64::from(fps.clamp(15, 240))
 }
 
 fn set_encode_priority() {

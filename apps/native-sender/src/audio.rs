@@ -258,8 +258,9 @@ fn float_to_i16(sample: f32) -> i16 {
 }
 
 /// Sender-clock playout. A picture frame and the sound captured with it
-/// share one timestamp, and this clock releases both 70 ms after the first
-/// frame so a small arrival gap does not put them on different timelines.
+/// share one timestamp. Both wait a short beat after the first frame so a
+/// small arrival gap stays on one timeline. A much newer frame pulls the
+/// clock forward, which drops a stall instead of replaying it.
 pub struct PlayClock {
     state: Mutex<ClockState>,
 }
@@ -270,8 +271,8 @@ struct ClockState {
     primed: bool,
 }
 
-const TARGET_US: i64 = 70_000;
-const MAX_AHEAD_US: i64 = 140_000;
+const TARGET_US: i64 = 120_000;
+const MAX_AHEAD_US: i64 = 400_000;
 
 impl PlayClock {
     pub fn new() -> Arc<Self> {

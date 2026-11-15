@@ -78,6 +78,7 @@ struct Shared {
     fatal: Mutex<Option<String>>,
     force_keyframe: AtomicBool,
     bitrate_bps: AtomicU64,
+    interval_us: AtomicU64,
     queue_drops: AtomicU64,
     stale_skips: AtomicU64,
     width: u32,
@@ -252,6 +253,16 @@ impl ScreenEncoder {
         }
     }
 
+    pub fn set_fps(&self, fps: u32) {
+        let interval_us = 1_000_000 / u64::from(fps.clamp(15, 240));
+        if let Inner::Nvenc(encoder) = &self.inner {
+            encoder
+                .shared
+                .interval_us
+                .store(interval_us, Ordering::Relaxed);
+        }
+    }
+
     pub fn queue_drops(&self) -> u64 {
         match &self.inner {
             Inner::Nvenc(encoder) => encoder.shared.queue_drops.load(Ordering::Relaxed),
@@ -318,6 +329,7 @@ fn start_nvenc(config: &AppConfig) -> Result<ScreenEncoder> {
         fatal: Mutex::new(None),
         force_keyframe: AtomicBool::new(false),
         bitrate_bps: AtomicU64::new(bitrate_bps),
+        interval_us: AtomicU64::new(frame_interval(config.target_fps).as_micros() as u64),
         queue_drops: AtomicU64::new(0),
         stale_skips: AtomicU64::new(0),
         width,
@@ -349,7 +361,7 @@ fn start_nvenc(config: &AppConfig) -> Result<ScreenEncoder> {
     }
 
     let (tx, rx) = mpsc::channel(4);
-    let worker = spawn_encode_thread(Arc::clone(&shared), tx, frame_interval(config.target_fps));
+    let worker = spawn_encode_thread(Arc::clone(&shared), tx);
     let (audio, desktop_audio) = desktop_sound();
     Ok(ScreenEncoder {
         inner: Inner::Nvenc(NvencEncoder {
@@ -395,11 +407,7 @@ fn desktop_sound() -> (mpsc::Receiver<EncodedAudio>, DesktopAudio) {
     (rx, DesktopAudio::start(tx))
 }
 
-fn spawn_encode_thread(
-    shared: Arc<Shared>,
-    tx: mpsc::Sender<AccessUnit>,
-    interval: Duration,
-) -> JoinHandle<()> {
+fn spawn_encode_thread(shared: Arc<Shared>, tx: mpsc::Sender<AccessUnit>) -> JoinHandle<()> {
     thread::Builder::new()
         .name("screen-encode".to_string())
         .spawn(move || {
@@ -484,6 +492,7 @@ fn spawn_encode_thread(
                 // The interval starts when the frame is taken. Adding it after
                 // the encode stacks the encode time on top and caps the rate
                 // below the target.
+                let interval = Duration::from_micros(shared.interval_us.load(Ordering::Relaxed).max(1));
                 next_at = frame_started + interval;
                 if next_at < Instant::now() {
                     next_at = Instant::now();
