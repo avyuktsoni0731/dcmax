@@ -11,9 +11,18 @@ fn main() {
             .flag("/EHsc")
             .flag("/std:c++17")
             .compile("nvenc_session");
+        cc::Build::new()
+            .cpp(true)
+            .file("native/mf/mf_decode.cpp")
+            .flag("/EHsc")
+            .flag("/std:c++17")
+            .compile("mf_decode");
         println!("cargo:rustc-link-lib=d3d11");
         println!("cargo:rustc-link-lib=dxgi");
         println!("cargo:rustc-link-lib=ole32");
+        println!("cargo:rustc-link-lib=mfplat");
+        println!("cargo:rustc-link-lib=mfuuid");
+        println!("cargo:rerun-if-changed=native/mf/mf_decode.cpp");
         println!("cargo:rerun-if-changed=native/nvenc/nvenc_session.cpp");
         println!("cargo:rerun-if-changed=native/nvenc/nvenc_session.h");
         println!("cargo:rerun-if-changed=native/nvenc/nvEncodeAPI.h");

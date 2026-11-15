@@ -1863,7 +1863,7 @@ struct PictureDecoder {
     #[cfg(target_os = "macos")]
     inner: crate::decode_macos::Decoder,
     #[cfg(target_os = "windows")]
-    inner: Option<openh264::decoder::Decoder>,
+    inner: crate::decode_windows::Decoder,
 }
 
 impl PictureDecoder {
@@ -1872,7 +1872,7 @@ impl PictureDecoder {
             #[cfg(target_os = "macos")]
             inner: crate::decode_macos::Decoder::new(),
             #[cfg(target_os = "windows")]
-            inner: openh264::decoder::Decoder::new().ok(),
+            inner: crate::decode_windows::Decoder::new(),
         }
     }
 
@@ -1896,23 +1896,18 @@ impl PictureDecoder {
         }
         #[cfg(target_os = "windows")]
         {
-            use openh264::formats::YUVSource;
-            let yuv = self.inner.as_mut()?.decode(payload).ok()??;
-            let (width, height) = yuv.dimensions();
-            if width == 0 || height == 0 || width > 7680 || height > 4320 {
+            let picture = self.inner.decode(payload)?;
+            let (width, height) = match &picture {
+                crate::present_gl::Picture::Nv12Bytes { width, height, .. } => (*width as usize, *height as usize),
+                crate::present_gl::Picture::Rgba { width, height, .. } => (*width as usize, *height as usize),
+            };
+            if width == 0 || height == 0 {
                 return None;
             }
-            let bytes = width.checked_mul(height)?.checked_mul(4)?;
-            let mut rgba = vec![0u8; bytes];
-            yuv.write_rgba8(&mut rgba);
             return Some(Frame {
                 width,
                 height,
-                pixels: Arc::new(crate::present_gl::Picture::Rgba {
-                    width: width as i32,
-                    height: height as i32,
-                    pixels: rgba,
-                }),
+                pixels: Arc::new(picture),
             });
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]

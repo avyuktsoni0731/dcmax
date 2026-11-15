@@ -22,6 +22,16 @@ pub enum Picture {
         height: i32,
         pixels: Vec<u8>,
     },
+    /// Tightly packed NV12. The fragment shader applies the same limited-range
+    /// conversion as the Mac path, so studio-swing H.264 does not look washed out.
+    #[cfg(target_os = "windows")]
+    Nv12Bytes {
+        width: i32,
+        height: i32,
+        y: Vec<u8>,
+        uv: Vec<u8>,
+        full_range: bool,
+    },
 }
 
 pub fn draw(gl: &glow::Context, picture: &Picture) {
@@ -33,12 +43,18 @@ pub fn draw(gl: &glow::Context, picture: &Picture) {
             Picture::Rgba { width, height, pixels } => {
                 draw_rgba(gl, &mut state, *width, *height, pixels, picture as *const Picture as usize)
             }
+            #[cfg(target_os = "windows")]
+            Picture::Nv12Bytes { width, height, y, uv, full_range } => {
+                draw_nv12_bytes(gl, &mut state, *width, *height, y, uv, *full_range, picture as *const Picture as usize)
+            }
         }
     });
 }
 
 struct State {
     nv12: Option<Program>,
+    #[cfg(target_os = "windows")]
+    nv12_bytes: Option<Program>,
     rgba: Option<Program>,
     uploaded: usize,
     noted: bool,
@@ -57,10 +73,71 @@ struct Program {
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State {
         nv12: None,
+        #[cfg(target_os = "windows")]
+        nv12_bytes: None,
         rgba: None,
         uploaded: 0,
         noted: false,
     });
+}
+
+#[cfg(target_os = "windows")]
+fn draw_nv12_bytes(
+    gl: &glow::Context,
+    state: &mut State,
+    width: i32,
+    height: i32,
+    y: &[u8],
+    uv: &[u8],
+    full_range: bool,
+    id: usize,
+) {
+    if width <= 0 || height <= 1 || width % 2 != 0 || height % 2 != 0 {
+        return;
+    }
+    let y_bytes = (width as usize).saturating_mul(height as usize);
+    let uv_bytes = y_bytes / 2;
+    if y.len() != y_bytes || uv.len() != uv_bytes {
+        return;
+    }
+    let Some(program) = program(gl, &mut state.nv12_bytes, NV12_FRAG_2D, false) else {
+        return;
+    };
+    unsafe {
+        if state.uploaded != id {
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(program.y));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::R8 as i32,
+                width,
+                height,
+                0,
+                glow::RED,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(y)),
+            );
+            gl.bind_texture(glow::TEXTURE_2D, Some(program.c));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RG8 as i32,
+                width / 2,
+                height / 2,
+                0,
+                glow::RG,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(uv)),
+            );
+            state.uploaded = id;
+        }
+        paint(gl, &program, width as f32, height as f32, full_range);
+        if !state.noted {
+            state.noted = true;
+            crate::audio::session_log("watch picture: showing nv12 on the gpu");
+        }
+    }
 }
 
 fn draw_rgba(gl: &glow::Context, state: &mut State, width: i32, height: i32, pixels: &[u8], id: usize) {
@@ -279,6 +356,25 @@ out vec4 color;
 void main() {
     float y = texture(y_tex, uv).r;
     vec2 c = texture(c_tex, uv * 0.5).rg - vec2(0.5);
+    if (full_range < 0.5) {
+        y = (y - 0.062745) * 1.164384;
+    }
+    float r = y + 1.792741 * c.y;
+    float g = y - 0.213249 * c.x - 0.532909 * c.y;
+    float b = y + 2.112402 * c.x;
+    color = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);
+}";
+
+#[cfg(target_os = "windows")]
+const NV12_FRAG_2D: &str = "#version 150
+uniform sampler2D y_tex;
+uniform sampler2D c_tex;
+uniform float full_range;
+in vec2 uv;
+out vec4 color;
+void main() {
+    float y = texture(y_tex, uv).r;
+    vec2 c = texture(c_tex, uv).rg - vec2(0.5);
     if (full_range < 0.5) {
         y = (y - 0.062745) * 1.164384;
     }

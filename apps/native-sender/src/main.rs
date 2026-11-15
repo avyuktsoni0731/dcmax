@@ -8,6 +8,8 @@ mod config;
 mod direct;
 #[cfg(target_os = "macos")]
 mod decode_macos;
+#[cfg(target_os = "windows")]
+mod decode_windows;
 mod encoder;
 mod h264;
 mod picture;
