@@ -196,7 +196,7 @@ fn watch_notes(handle: AppHandle) {
         .ok();
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn watch_picture(handle: AppHandle) {
     static QUEUED: AtomicBool = AtomicBool::new(false);
     std::thread::Builder::new()
@@ -354,6 +354,121 @@ fn present_on_main(handle: &AppHandle) {
     });
 }
 
+#[cfg(target_os = "windows")]
+fn present_on_main(handle: &AppHandle) {
+    use native_sender::Picture;
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+
+    struct Surface {
+        window: *mut c_void,
+    }
+    thread_local! {
+        static SURFACE: RefCell<Surface> = RefCell::new(Surface { window: std::ptr::null_mut() });
+        static SHOWING: Cell<bool> = const { Cell::new(false) };
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+    extern "C" {
+        fn dcmax_stage_place(
+            owner: *mut c_void,
+            existing: *mut c_void,
+            x: f64,
+            y: f64,
+            w: f64,
+            h: f64,
+            visible: i32,
+        ) -> *mut c_void;
+        fn dcmax_stage_ready(window: *mut c_void) -> i32;
+        fn dcmax_stage_draw_nv12(
+            window: *mut c_void,
+            y: *const u8,
+            uv: *const u8,
+            width: i32,
+            height: i32,
+            full_range: i32,
+        ) -> i32;
+    }
+
+    let Some(window) = handle.get_webview_window("main") else {
+        return;
+    };
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
+    let rect = {
+        let state = handle.state::<DesktopState>();
+        let Ok(rect) = state.rect.lock() else {
+            return;
+        };
+        Rect {
+            x: rect.x * scale,
+            y: rect.y * scale,
+            width: rect.width * scale,
+            height: rect.height * scale,
+            visible: rect.visible,
+        }
+    };
+    SURFACE.with(|slot| {
+        let mut surface = slot.borrow_mut();
+        let place = |existing: *mut c_void, on: bool| unsafe {
+            dcmax_stage_place(
+                hwnd.0,
+                existing,
+                rect.x,
+                rect.y,
+                rect.width.max(2.0),
+                rect.height.max(2.0),
+                i32::from(on && rect.width >= 2.0 && rect.height >= 2.0),
+            )
+        };
+        if !rect.visible {
+            surface.window = place(surface.window, false);
+            SHOWING.with(|slot| slot.set(false));
+            ARMED.with(|slot| slot.set(false));
+            return;
+        }
+        let state = handle.state::<DesktopState>();
+        let Ok(engine) = state.engine.lock() else {
+            return;
+        };
+        let Some(engine) = engine.as_ref() else {
+            return;
+        };
+        if engine.picture_ended() {
+            SHOWING.with(|slot| slot.set(false));
+            ARMED.with(|slot| slot.set(false));
+        }
+        let showing = SHOWING.with(|slot| slot.get());
+        let want = showing || engine.picture_ready();
+        surface.window = place(surface.window, want);
+        if !want || surface.window.is_null() {
+            ARMED.with(|slot| slot.set(false));
+            return;
+        }
+        let armed = ARMED.with(|slot| slot.get());
+        if !armed {
+            ARMED.with(|slot| slot.set(true));
+            return;
+        }
+        if unsafe { dcmax_stage_ready(surface.window) } == 0 {
+            return;
+        }
+        let view = surface.window;
+        let drew = engine
+            .with_picture(|picture| match picture {
+                Picture::Nv12Bytes { width, height, y, uv, full_range } => unsafe {
+                    dcmax_stage_draw_nv12(view, y.as_ptr(), uv.as_ptr(), *width, *height, i32::from(*full_range)) == 0
+                },
+                Picture::Rgba { .. } => false,
+            })
+            .unwrap_or(false);
+        if drew {
+            SHOWING.with(|slot| slot.set(true));
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -387,7 +502,7 @@ pub fn run() {
                 .map_err(|_| "the call runtime is unavailable".to_string())? = Some(engine);
             let handle = app.handle().clone();
             watch_notes(handle.clone());
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             watch_picture(handle);
             Ok(())
         })

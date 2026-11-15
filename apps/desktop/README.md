@@ -10,7 +10,7 @@ Quit the current MyCord on the Mac first, so two apps do not join as the same pe
 
 Open `~/Desktop/MyCord Shell.app`.
 
-The room screen is filled from `~/.mycord` when that file exists. Use a different display name from the other computer, and the same room name. On Windows, keep using the existing `MyCord.exe` for this test. The Windows build of this shell does not draw the screen yet.
+The room screen is filled from `~/.mycord` when that file exists. Use a different display name from the other computer, and the same room name. On Windows, open `MyCord Shell.exe` on the Desktop. Leave the existing `MyCord.exe` where it is.
 
 The first launch asks for the microphone. The first share asks for screen recording. Both prompts belong to MyCord Shell, which is a different app from MyCord, so macOS asks again.
 
@@ -43,6 +43,21 @@ This Mac build is Apple Silicon only. It is ad-hoc signed, so it is for this com
 - `npm run tauri build` on this Mac: the app bundled and launched to the room screen.
 - The first Join aborted inside WebRTC because the shell link dropped `NSString(StdString)`. The desktop link now passes `-ObjC`, the same flag the working app uses, and that category is in the binary.
 
-The first Windows-to-Mac watch decoded the picture and then dropped every frame. The shell only created the picture window after a successful draw, and Metal will not draw into a window that does not exist yet. The window is now opened when a frame is waiting, and the frame is drawn on the next tick.
+The first Windows-to-Mac watch decoded the picture and then dropped every frame. The shell only created the picture window after a successful draw, and Metal will not draw into a window that does not exist yet. The window is now opened when a frame is waiting, and the frame is drawn on the next tick. A later call showed that direction in this window.
 
-Not tested after that display fix: a completed watch of a Windows share in this window, microphone audio, leave during a call, reconnect, sleep, or any Windows build of this shell.
+## Windows
+
+The Windows shell is a separate program, `MyCord Shell.exe`, next to the existing `MyCord.exe`. The build uses the engine already on that machine:
+
+```bat
+set CARGO_TARGET_DIR=C:\t
+set RUSTFLAGS=-C target-feature=+crt-static
+cd apps\desktop
+npm install
+npm run tauri build -- --no-bundle
+copy /Y C:\t\release\mycord-desktop.exe "%USERPROFILE%\Desktop\MyCord Shell.exe"
+```
+
+`--no-bundle` avoids an installer. WebView2, which Windows 11 already has, draws the controls. The picture is a separate window above that view. This executable is not signed, so SmartScreen can warn on another computer.
+
+Not tested from here: microphone audio, mute, leave and rejoin, sleep, or a call inside the Windows shell.
