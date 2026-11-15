@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "windows")]
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 #[cfg(target_os = "windows")]
 use std::time::Duration;
 
@@ -143,6 +144,7 @@ pub struct SystemAudio {
     pending: Vec<i16>,
     phase: f64,
     prev: Option<[f32; 2]>,
+    packet_us: i64,
 }
 
 impl SystemAudio {
@@ -152,17 +154,34 @@ impl SystemAudio {
             pending: Vec::with_capacity(STEREO * 2),
             phase: 0.0,
             prev: None,
+            packet_us: 0,
         })
     }
 
     /// Interleaved PCM in, zero or more Opus packets out.
-    pub fn push(&mut self, interleaved: &[f32], channels: usize, sample_rate: u32) -> Vec<Vec<u8>> {
+    ///
+    /// `first_sample_us` is the sender clock time of the first new sample.
+    /// Each packet is 20 ms and gets its own timestamp, so the viewer can
+    /// play it against the picture instead of whenever the packet arrives.
+    pub fn push(
+        &mut self,
+        interleaved: &[f32],
+        channels: usize,
+        sample_rate: u32,
+        first_sample_us: i64,
+    ) -> Vec<(i64, Vec<u8>)> {
+        if self.pending.is_empty() {
+            self.packet_us = first_sample_us;
+        }
         self.collect(interleaved, channels, sample_rate);
         let mut packets = Vec::new();
         while self.pending.len() >= STEREO {
             let frame: Vec<i16> = self.pending.drain(..STEREO).collect();
             match self.encoder.encode(&frame) {
-                Ok(packet) => packets.push(packet),
+                Ok(packet) => {
+                    packets.push((self.packet_us, packet));
+                    self.packet_us = self.packet_us.saturating_add(20_000);
+                }
                 Err(err) => {
                     eprintln!("system audio: opus encode failed: {err}");
                     break;
@@ -238,16 +257,97 @@ fn float_to_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * 32767.0) as i16
 }
 
+/// Sender-clock playout. A picture frame and the sound captured with it
+/// share one timestamp, and this clock releases both 70 ms after the first
+/// frame so a small arrival gap does not put them on different timelines.
+pub struct PlayClock {
+    state: Mutex<ClockState>,
+}
+
+struct ClockState {
+    origin_remote: i64,
+    origin_local: Instant,
+    primed: bool,
+}
+
+const TARGET_US: i64 = 70_000;
+const MAX_AHEAD_US: i64 = 140_000;
+
+impl PlayClock {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ClockState {
+                origin_remote: 0,
+                origin_local: Instant::now(),
+                primed: false,
+            }),
+        })
+    }
+
+    pub fn note_video(&self, timestamp_us: i64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        if !state.primed {
+            state.origin_remote = timestamp_us.saturating_sub(TARGET_US);
+            state.origin_local = now;
+            state.primed = true;
+            return;
+        }
+        let playout = state.origin_remote + state.origin_local.elapsed().as_micros() as i64;
+        let ahead = timestamp_us.saturating_sub(playout);
+        if ahead > MAX_AHEAD_US {
+            state.origin_remote = timestamp_us.saturating_sub(TARGET_US);
+            state.origin_local = now;
+        }
+    }
+
+    pub fn now_us(&self) -> Option<i64> {
+        let state = self.state.lock().ok()?;
+        if !state.primed {
+            return None;
+        }
+        Some(state.origin_remote + state.origin_local.elapsed().as_micros() as i64)
+    }
+
+    pub fn reset(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.primed = false;
+        }
+    }
+}
+
+struct AudioChunk {
+    timestamp_us: i64,
+    samples: Vec<f32>,
+    cursor: usize,
+}
+
+struct OutputQueue {
+    chunks: VecDeque<AudioChunk>,
+    timed: bool,
+}
+
 /// Plays 48 kHz stereo packets on the default output. `mute` replaces the
 /// sound with silence and drops anything already queued.
 pub struct AudioPlayer {
-    queue: Arc<Mutex<VecDeque<f32>>>,
+    queue: Arc<Mutex<OutputQueue>>,
     mute: Arc<AtomicBool>,
     _stream: Stream,
 }
 
 impl AudioPlayer {
     pub fn start(mute: Arc<AtomicBool>) -> Result<Self> {
+        Self::open(mute, None)
+    }
+
+    /// Play each packet when the shared picture clock reaches its timestamp.
+    pub fn start_synced(mute: Arc<AtomicBool>, clock: Arc<PlayClock>) -> Result<Self> {
+        Self::open(mute, Some(clock))
+    }
+
+    fn open(mute: Arc<AtomicBool>, clock: Option<Arc<PlayClock>>) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -257,11 +357,23 @@ impl AudioPlayer {
             sample_rate: cpal::SampleRate(RATE),
             buffer_size: cpal::BufferSize::Default,
         };
-        let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let queue = Arc::new(Mutex::new(OutputQueue {
+            chunks: VecDeque::new(),
+            timed: clock.is_some(),
+        }));
         let stream = match device.default_output_config() {
             Ok(config) if config.sample_format() == SampleFormat::F32 => {
-                build_f32(&device, &wanted, Arc::clone(&queue), Arc::clone(&mute))
-                    .or_else(|_| build_f32(&device, &config.into(), Arc::clone(&queue), Arc::clone(&mute)))?
+                let fallback = clock.clone();
+                build_f32(
+                    &device,
+                    &wanted,
+                    Arc::clone(&queue),
+                    Arc::clone(&mute),
+                    clock.clone(),
+                )
+                .or_else(|_| {
+                    build_f32(&device, &config.into(), Arc::clone(&queue), Arc::clone(&mute), fallback)
+                })?
             }
             Ok(config) => {
                 anyhow::bail!(
@@ -281,9 +393,17 @@ impl AudioPlayer {
     }
 
     pub fn push(&self, pcm: &[i16]) {
+        self.enqueue(pcm, 0);
+    }
+
+    pub fn push_at(&self, pcm: &[i16], timestamp_us: i64) {
+        self.enqueue(pcm, timestamp_us);
+    }
+
+    fn enqueue(&self, pcm: &[i16], timestamp_us: i64) {
         if self.mute.load(Ordering::Relaxed) {
             if let Ok(mut queue) = self.queue.lock() {
-                queue.clear();
+                queue.chunks.clear();
             }
             return;
         }
@@ -291,21 +411,37 @@ impl AudioPlayer {
             Ok(queue) => queue,
             Err(_) => return,
         };
+        let mut samples = Vec::with_capacity(pcm.len());
         for sample in pcm {
-            queue.push_back(f32::from(*sample) / 32768.0);
+            samples.push(f32::from(*sample) / 32768.0);
         }
-        let cap = RATE as usize * 2;
-        while queue.len() > cap {
-            queue.pop_front();
+        queue.chunks.push_back(AudioChunk {
+            timestamp_us,
+            samples,
+            cursor: 0,
+        });
+        let mut duration = 0i64;
+        for chunk in &queue.chunks {
+            duration += frames_to_us(((chunk.samples.len() - chunk.cursor) / 2) as i64);
+        }
+        while duration > 200_000 && queue.chunks.len() > 1 {
+            if let Some(dropped) = queue.chunks.pop_front() {
+                duration -= frames_to_us(((dropped.samples.len() - dropped.cursor) / 2) as i64);
+            }
         }
     }
+}
+
+fn frames_to_us(frames: i64) -> i64 {
+    frames.saturating_mul(1_000_000) / i64::from(RATE)
 }
 
 fn build_f32(
     device: &cpal::Device,
     config: &StreamConfig,
-    queue: Arc<Mutex<VecDeque<f32>>>,
+    queue: Arc<Mutex<OutputQueue>>,
     mute: Arc<AtomicBool>,
+    clock: Option<Arc<PlayClock>>,
 ) -> Result<Stream> {
     let channels = config.channels as usize;
     let stream = device
@@ -315,7 +451,7 @@ fn build_f32(
                 if mute.load(Ordering::Relaxed) {
                     output.fill(0.0);
                     if let Ok(mut queue) = queue.lock() {
-                        queue.clear();
+                        queue.chunks.clear();
                     }
                     return;
                 }
@@ -326,9 +462,17 @@ fn build_f32(
                         return;
                     }
                 };
+                let playout = if queue.timed {
+                    clock.as_ref().and_then(|clock| clock.now_us())
+                } else {
+                    Some(i64::MAX)
+                };
+                let Some(playout) = playout else {
+                    output.fill(0.0);
+                    return;
+                };
                 for frame in output.chunks_mut(channels.max(1)) {
-                    let left = queue.pop_front().unwrap_or(0.0);
-                    let right = queue.pop_front().unwrap_or(left);
+                    let (left, right) = take_sample(&mut queue, playout);
                     if let Some(slot) = frame.first_mut() {
                         *slot = left;
                     }
@@ -345,6 +489,48 @@ fn build_f32(
         )
         .map_err(|err| anyhow::anyhow!("audio output stream: {err}"))?;
     Ok(stream)
+}
+
+fn take_sample(queue: &mut OutputQueue, playout: i64) -> (f32, f32) {
+    if !queue.timed {
+        let Some(chunk) = queue.chunks.front_mut() else {
+            return (0.0, 0.0);
+        };
+        let left = chunk.samples.get(chunk.cursor).copied().unwrap_or(0.0);
+        let right = chunk.samples.get(chunk.cursor + 1).copied().unwrap_or(left);
+        chunk.cursor += 2;
+        if chunk.cursor >= chunk.samples.len() {
+            queue.chunks.pop_front();
+        }
+        return (left, right);
+    }
+    while let Some(chunk) = queue.chunks.front() {
+        let frames_left = (chunk.samples.len().saturating_sub(chunk.cursor)) / 2;
+        if frames_left == 0 {
+            queue.chunks.pop_front();
+            continue;
+        }
+        let head_us = chunk.timestamp_us + frames_to_us((chunk.cursor / 2) as i64);
+        let end_us = head_us + frames_to_us(frames_left as i64);
+        if end_us + 5_000 < playout.saturating_sub(30_000) {
+            queue.chunks.pop_front();
+            continue;
+        }
+        if head_us > playout || frames_left == 0 {
+            return (0.0, 0.0);
+        }
+        break;
+    }
+    let Some(chunk) = queue.chunks.front_mut() else {
+        return (0.0, 0.0);
+    };
+    let left = chunk.samples.get(chunk.cursor).copied().unwrap_or(0.0);
+    let right = chunk.samples.get(chunk.cursor + 1).copied().unwrap_or(left);
+    chunk.cursor += 2;
+    if chunk.cursor >= chunk.samples.len() {
+        queue.chunks.pop_front();
+    }
+    (left, right)
 }
 
 /// Reads PCM out of a Windows render endpoint in loopback, so the picture
@@ -426,7 +612,13 @@ fn capture_loopback(
         let channels = format.nChannels as usize;
         let bits = format.wBitsPerSample;
         let block = format.nBlockAlign as usize;
-        let float = is_float(format);
+        let mut float = is_float(format);
+        if !float && bits == 32 {
+            // The shared mix format is 32-bit float. The extensible GUID sits at
+            // byte 24; reading it with the padded Rust struct size used to miss
+            // it and throw every sample away.
+            float = true;
+        }
         client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
@@ -440,13 +632,6 @@ fn capture_loopback(
         CoTaskMemFree(Some(mix.cast()));
         let capture: IAudioCaptureClient = client.GetService().context("capture client")?;
         client.Start().context("loopback start")?;
-        let mut float = is_float(format);
-        if !float && bits == 32 {
-            // The shared mix format is 32-bit float. The extensible GUID sits at
-            // byte 24; reading it with the padded Rust struct size used to miss
-            // it and throw every sample away.
-            float = true;
-        }
         session_log(&format!(
             "system audio: wasapi loopback {rate} Hz {channels} ch {bits}-bit float={float}"
         ));
@@ -475,12 +660,16 @@ fn capture_loopback(
                         }
                     }
                     let _ = capture.ReleaseBuffer(frames);
-                    // Use wall clock at capture time (same as video path in encoder_windows.rs)
-                    let timestamp_us = crate::h264::unix_us_now();
-                    for packet in codec.push(&scratch, channels, rate) {
+                    // The buffer ends as we read it. Stamp the first sample
+                    // back by the buffer's own length so it lines up with the
+                    // frame captured at the same moment.
+                    let now = crate::h264::unix_us_now();
+                    let duration_us = (frames as i64).saturating_mul(1_000_000) / rate.max(1) as i64;
+                    let start_us = now.saturating_sub(duration_us);
+                    for (timestamp_us, payload) in codec.push(&scratch, channels, rate, start_us) {
                         if tx
                             .try_send(EncodedAudio {
-                                payload: packet,
+                                payload,
                                 timestamp_us,
                             })
                             .is_err()
@@ -538,10 +727,11 @@ mod tests {
             samples[frame * 2] = tone;
             samples[frame * 2 + 1] = tone;
         }
-        let packets = audio.push(&samples, 2, 48_000);
+        let packets = audio.push(&samples, 2, 48_000, 1_000_000);
         assert_eq!(packets.len(), 1, "20 ms of audio is one Opus packet");
+        assert_eq!(packets[0].0, 1_000_000);
         let mut decoder = decoder().unwrap();
-        let pcm = decode_packet(&mut decoder, &packets[0]).unwrap();
+        let pcm = decode_packet(&mut decoder, &packets[0].1).unwrap();
         let energy: f64 = pcm.iter().map(|sample| f64::from(*sample).powi(2)).sum();
         assert!(energy > 1_000_000.0, "decoded tone was silent ({energy})");
     }

@@ -1,7 +1,7 @@
 //! The window people open. No flags: a name, a room code, then voice and the
 //! native picture. The command-line tools stay available when arguments are set.
 
-use crate::audio::{decode_packet, decoder as opus_decoder, AudioPlayer};
+use crate::audio::{decode_packet, decoder as opus_decoder, AudioPlayer, PlayClock};
 use crate::config::{AppConfig, CaptureBackend, EncoderBackend, TargetPlatform};
 use crate::direct::{self, TOPIC};
 use crate::encoder::ScreenEncoder;
@@ -15,6 +15,7 @@ use livekit::options::{
 use livekit::prelude::*;
 use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
 use livekit::webrtc::video_source::{native::NativeVideoSource, RtcVideoSource, VideoResolution};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -27,11 +28,18 @@ struct Frame {
     rgba: Vec<u8>,
 }
 
-/// The newest picture only. A queue of older frames is what made the share
-/// play several seconds behind live video.
+/// A few frames, released on the same clock as the desktop audio.
+/// Eight frames is about 130 ms. Anything older is dropped so a burst
+/// cannot turn into a multi-second delay.
 struct Stage {
-    latest: Mutex<Option<Frame>>,
+    frames: Mutex<VecDeque<TimedFrame>>,
     ended: AtomicBool,
+    clock: Arc<PlayClock>,
+}
+
+struct TimedFrame {
+    timestamp_us: i64,
+    frame: Frame,
 }
 
 enum Cmd {
@@ -78,8 +86,9 @@ pub fn run() -> Result<()> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (note_tx, note_rx) = std::sync::mpsc::channel();
     let stage = Arc::new(Stage {
-        latest: Mutex::new(None),
+        frames: Mutex::new(VecDeque::new()),
         ended: AtomicBool::new(false),
+        clock: PlayClock::new(),
     });
     let stage_thread = Arc::clone(&stage);
     std::thread::Builder::new()
@@ -288,13 +297,13 @@ impl MyCord {
         }
         if self.stage.ended.swap(false, Ordering::AcqRel) {
             self.picture = None;
-            if let Ok(mut latest) = self.stage.latest.lock() {
-                *latest = None;
+            if let Ok(mut frames) = self.stage.frames.lock() {
+                frames.clear();
             }
         }
-        // One upload per refresh. Anything newer that arrived in between
-        // replaces this frame, so a burst cannot pile up into a delay.
-        let ready = self.picture.is_none() || self.shown.elapsed() >= Duration::from_millis(12);
+        // One upload per refresh. The play clock releases the frame that
+        // belongs to this moment, and drops a frame that is already late.
+        let ready = self.picture.is_none() || self.shown.elapsed() >= Duration::from_millis(16);
         if ready {
             if let Some(frame) = take_frame(&self.stage) {
                 let pixels = frame.width.saturating_mul(frame.height).saturating_mul(4);
@@ -321,7 +330,7 @@ impl MyCord {
             }
         }
         if self.joined {
-            ctx.request_repaint_after(Duration::from_millis(8));
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
@@ -487,8 +496,11 @@ impl MyCord {
                 ),
             );
             self.stage_view(ui, theme, stage, 16);
-            // Reserve space for dock at bottom
-            ui.allocate_space(egui::vec2(1.0, dock_height));
+            // stage_view paints into `stage` and does not move the cursor,
+            // so the dock used to land on top of "Waiting for a screen"
+            // and, once a picture existed, below the window.
+            ui.allocate_rect(stage, egui::Sense::hover());
+            ui.add_space(12.0);
             self.dock(ui, ctx, theme);
             ui.add_space(bottom_pad);
         });
@@ -1574,7 +1586,7 @@ fn call_config(settings: &CallSettings, picture: &PictureSettings) -> AppConfig 
 }
 
 fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<AtomicBool>) {
-    let player = match AudioPlayer::start(Arc::new(AtomicBool::new(false))) {
+    let player = match AudioPlayer::start_synced(Arc::new(AtomicBool::new(false)), Arc::clone(&stage.clock)) {
         Ok(player) => Some(player),
         Err(err) => {
             note_log(&format!("desktop audio player: {err:#}"));
@@ -1616,7 +1628,7 @@ fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<At
                                     heard = true;
                                     note_log("desktop audio playing");
                                 }
-                                player.push(&pcm);
+                                player.push_at(&pcm, frame.timestamp_us);
                             }
                             Err(err) if !heard => {
                                 heard = true;
@@ -1641,7 +1653,7 @@ fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<At
                             note_log(&format!("picture late {late_ms}ms"));
                             logged = Instant::now();
                         }
-                        store_frame(&stage, decoded);
+                        store_frame(&stage, decoded, frame.timestamp_us);
                     }
                 }
                 Ok(None) => {
@@ -1662,20 +1674,45 @@ fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<At
     }
 }
 
-fn store_frame(stage: &Stage, frame: Frame) {
-    if let Ok(mut latest) = stage.latest.lock() {
-        *latest = Some(frame);
+fn store_frame(stage: &Stage, frame: Frame, timestamp_us: i64) {
+    stage.clock.note_video(timestamp_us);
+    let Ok(mut frames) = stage.frames.lock() else {
+        return;
+    };
+    frames.push_back(TimedFrame { timestamp_us, frame });
+    while frames.len() > 8 {
+        frames.pop_front();
     }
 }
 
 fn take_frame(stage: &Stage) -> Option<Frame> {
-    stage.latest.lock().ok().and_then(|mut latest| latest.take())
+    let now = stage.clock.now_us()?;
+    let mut frames = stage.frames.lock().ok()?;
+    while frames.len() >= 2 {
+        let late = frames[0].timestamp_us.saturating_add(40_000) < now;
+        let next_due = frames[1].timestamp_us <= now;
+        if late && next_due {
+            frames.pop_front();
+        } else {
+            break;
+        }
+    }
+    if frames.front().is_some_and(|frame| frame.timestamp_us <= now) {
+        return frames.pop_front().map(|timed| timed.frame);
+    }
+    None
+}
+
+#[cfg(test)]
+fn queued(stage: &Stage) -> usize {
+    stage.frames.lock().map(|frames| frames.len()).unwrap_or(0)
 }
 
 fn finish_stream(stage: &Stage) {
-    if let Ok(mut latest) = stage.latest.lock() {
-        *latest = None;
+    if let Ok(mut frames) = stage.frames.lock() {
+        frames.clear();
     }
+    stage.clock.reset();
     stage.ended.store(true, Ordering::Release);
 }
 
@@ -1827,10 +1864,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_stage_keeps_only_the_newest_frame() {
+    fn the_stage_waits_for_its_clock_and_drops_a_backlog() {
         let stage = Stage {
-            latest: Mutex::new(None),
+            frames: Mutex::new(VecDeque::new()),
             ended: AtomicBool::new(false),
+            clock: PlayClock::new(),
         };
         store_frame(
             &stage,
@@ -1839,17 +1877,20 @@ mod tests {
                 height: 1,
                 rgba: vec![1, 0, 0, 255],
             },
+            5_000_000,
         );
-        store_frame(
-            &stage,
-            Frame {
-                width: 1,
-                height: 1,
-                rgba: vec![9, 0, 0, 255],
-            },
-        );
-        let frame = take_frame(&stage).expect("a frame is waiting");
-        assert_eq!(frame.rgba[0], 9);
-        assert!(take_frame(&stage).is_none());
+        assert!(take_frame(&stage).is_none(), "a frame stays held until it is due");
+        for index in 0..12u8 {
+            store_frame(
+                &stage,
+                Frame {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![index, 0, 0, 255],
+                },
+                8_000_000 + i64::from(index) * 16_000,
+            );
+        }
+        assert!(queued(&stage) <= 8, "a burst must not rebuild a long delay");
     }
 }

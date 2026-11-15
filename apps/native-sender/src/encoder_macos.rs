@@ -497,13 +497,16 @@ impl SCStreamOutputTrait for AudioHandler {
             }
             return;
         };
-        // Use the sample buffer's presentation timestamp for A/V sync,
-        // same as the video path does via capture_timestamp().
-        let timestamp_us = cmtime_to_us(sample.presentation_timestamp()).unwrap_or_else(unix_us_now);
         let Ok(mut codec) = self.codec.lock() else {
             return;
         };
-        for payload in codec.push(&pcm, channels, rate) {
+        // Stamp the first sample, not the moment the packet is finished.
+        // The picture uses the same wall clock at capture. The sample's own
+        // presentation time is a media clock and does not match it.
+        let frames = pcm.len() / channels.max(1);
+        let duration_us = (frames as i64).saturating_mul(1_000_000) / i64::from(rate.max(1));
+        let start_us = unix_us_now().saturating_sub(duration_us);
+        for (timestamp_us, payload) in codec.push(&pcm, channels, rate, start_us) {
             if !AUDIO_SENT.swap(true, Ordering::Relaxed) {
                 crate::audio::session_log("system audio: first packet captured");
             }
