@@ -12,7 +12,27 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <deque>
 #include <vector>
+
+// Some Windows SDKs hide this interface. The hardware decoder uses the device
+// from its own thread, so the device has to be marked multithread-protected
+// or a later Map of the NV12 readback fails and stalls teardown.
+struct DcmaxD3D11Multithread : public IUnknown {
+    virtual void STDMETHODCALLTYPE Enter(void) = 0;
+    virtual void STDMETHODCALLTYPE Leave(void) = 0;
+    virtual BOOL STDMETHODCALLTYPE SetMultithreadProtected(BOOL protect) = 0;
+    virtual BOOL STDMETHODCALLTYPE GetMultithreadProtected(void) = 0;
+};
+static const GUID kDcmaxD3D11Multithread = {
+    0x9B7E4E00, 0x342C, 0x4106, {0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0}};
+
+struct HeldFrame {
+    std::vector<uint8_t> y;
+    std::vector<uint8_t> uv;
+    int width;
+    int height;
+};
 
 struct MfDecoder {
     IMFTransform* transform;
@@ -20,12 +40,15 @@ struct MfDecoder {
     ID3D11DeviceContext* context;
     ID3D11Texture2D* stage;
     IMFDXGIDeviceManager* manager;
+    std::deque<HeldFrame> ready;
     std::vector<uint8_t> y;
     std::vector<uint8_t> uv;
     int width;
     int height;
     int hardware;
     int com_started;
+    int gpu_output;
+    int readback_note;
     UINT reset_token;
 };
 
@@ -82,18 +105,40 @@ static int copy_planes(MfDecoder* decoder, const uint8_t* data, UINT32 width, UI
     }
     const size_t y_bytes = static_cast<size_t>(width) * static_cast<size_t>(height);
     const size_t uv_bytes = y_bytes / 2;
-    decoder->y.resize(y_bytes);
-    decoder->uv.resize(uv_bytes);
+    HeldFrame frame;
+    frame.y.resize(y_bytes);
+    frame.uv.resize(uv_bytes);
     for (UINT32 row = 0; row < height; ++row) {
-        memcpy(decoder->y.data() + static_cast<size_t>(row) * width, data + static_cast<size_t>(row) * stride, width);
+        memcpy(frame.y.data() + static_cast<size_t>(row) * width, data + static_cast<size_t>(row) * stride, width);
     }
     const uint8_t* uv = data + static_cast<size_t>(stride) * height;
     for (UINT32 row = 0; row < height / 2; ++row) {
-        memcpy(decoder->uv.data() + static_cast<size_t>(row) * width, uv + static_cast<size_t>(row) * stride, width);
+        memcpy(frame.uv.data() + static_cast<size_t>(row) * width, uv + static_cast<size_t>(row) * stride, width);
     }
-    decoder->width = static_cast<int>(width);
-    decoder->height = static_cast<int>(height);
+    frame.width = static_cast<int>(width);
+    frame.height = static_cast<int>(height);
+    if (decoder->ready.size() >= 8) {
+        decoder->ready.pop_front();
+    }
+    decoder->ready.push_back(std::move(frame));
     return 0;
+}
+
+static int emit_frame(MfDecoder* decoder, const uint8_t** y, const uint8_t** uv, int* width, int* height) {
+    if (decoder->ready.empty()) {
+        return 0;
+    }
+    HeldFrame frame = std::move(decoder->ready.front());
+    decoder->ready.pop_front();
+    decoder->y.swap(frame.y);
+    decoder->uv.swap(frame.uv);
+    decoder->width = frame.width;
+    decoder->height = frame.height;
+    *y = decoder->y.data();
+    *uv = decoder->uv.data();
+    *width = decoder->width;
+    *height = decoder->height;
+    return 1;
 }
 
 static int copy_dxgi(MfDecoder* decoder, IMFDXGIBuffer* dxgi) {
@@ -122,8 +167,15 @@ static int copy_dxgi(MfDecoder* decoder, IMFDXGIBuffer* dxgi) {
             decoder->stage = nullptr;
         }
     }
+    auto make_stage = [&]() -> HRESULT {
+        if (decoder->stage != nullptr) {
+            decoder->stage->Release();
+            decoder->stage = nullptr;
+        }
+        return decoder->device->CreateTexture2D(&desc, nullptr, &decoder->stage);
+    };
     if (decoder->stage == nullptr) {
-        hr = decoder->device->CreateTexture2D(&desc, nullptr, &decoder->stage);
+        hr = make_stage();
         if (FAILED(hr)) {
             texture->Release();
             set_hr("could not stage the decoded frame", hr);
@@ -131,12 +183,22 @@ static int copy_dxgi(MfDecoder* decoder, IMFDXGIBuffer* dxgi) {
         }
     }
     decoder->context->CopySubresourceRegion(decoder->stage, 0, 0, 0, 0, texture, subresource, nullptr);
-    texture->Release();
     D3D11_MAPPED_SUBRESOURCE mapped{};
     hr = decoder->context->Map(decoder->stage, 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) {
+        // NVIDIA returns E_OUTOFMEMORY when a reused NV12 staging texture cannot
+        // be locked. A fresh texture is the read that succeeds.
+        HRESULT again = make_stage();
+        if (SUCCEEDED(again)) {
+            decoder->context->CopySubresourceRegion(decoder->stage, 0, 0, 0, 0, texture, subresource, nullptr);
+            decoder->context->Flush();
+            hr = decoder->context->Map(decoder->stage, 0, D3D11_MAP_READ, 0, &mapped);
+        }
+    }
+    texture->Release();
+    if (FAILED(hr)) {
         set_hr("could not read the decoded frame", hr);
-        return -1;
+        return -2;
     }
     int copied = copy_planes(
         decoder,
@@ -255,6 +317,22 @@ static int pull(MfDecoder* decoder, int depth) {
     }
     int copied = copy_sample(decoder, out.pSample);
     release_output(&out, owned, owned_buf);
+    if (copied == -2) {
+        // The frame was decoded. Only the GPU readback failed. Keep the
+        // decoder and ask it for ordinary memory next time. Do not flush:
+        // a flush here waits on the same device and stalls the viewer.
+        if (decoder->stage) {
+            decoder->stage->Release();
+            decoder->stage = nullptr;
+        }
+        if (decoder->transform && decoder->gpu_output) {
+            decoder->transform->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+            decoder->gpu_output = 0;
+            decoder->readback_note = 1;
+            return 0;
+        }
+        return -1;
+    }
     return copied == 0 ? 1 : -1;
 }
 
@@ -302,6 +380,12 @@ static int accept_transform(MfDecoder* decoder, IMFTransform* transform, int har
     }
     decoder->transform = transform;
     decoder->hardware = hardware;
+    decoder->gpu_output = hardware ? 1 : 0;
+    IMFAttributes* attributes = nullptr;
+    if (SUCCEEDED(transform->GetAttributes(&attributes)) && attributes != nullptr) {
+        attributes->SetUINT32(MF_LOW_LATENCY, TRUE);
+        attributes->Release();
+    }
     transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
     return 0;
@@ -369,6 +453,12 @@ static int open_device(MfDecoder* decoder) {
         set_hr("could not reset the decode device", hr);
         return -1;
     }
+    DcmaxD3D11Multithread* guard = nullptr;
+    if (SUCCEEDED(decoder->device->QueryInterface(kDcmaxD3D11Multithread, reinterpret_cast<void**>(&guard))) &&
+        guard != nullptr) {
+        guard->SetMultithreadProtected(TRUE);
+        guard->Release();
+    }
     return 0;
 }
 
@@ -385,6 +475,8 @@ MfDecoder* mf_open(void) {
     decoder->height = 0;
     decoder->hardware = 0;
     decoder->com_started = 0;
+    decoder->gpu_output = 0;
+    decoder->readback_note = 0;
     decoder->reset_token = 0;
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     decoder->com_started = SUCCEEDED(hr);
@@ -429,6 +521,15 @@ int mf_hardware(MfDecoder* decoder) {
     return decoder != nullptr && decoder->hardware ? 1 : 0;
 }
 
+int mf_take_note(MfDecoder* decoder, char* out, int cap) {
+    if (decoder == nullptr || decoder->readback_note == 0 || out == nullptr || cap < 16) {
+        return 0;
+    }
+    decoder->readback_note = 0;
+    snprintf(out, static_cast<size_t>(cap), "gpu readback failed, using system memory");
+    return 1;
+}
+
 int mf_decode(
     MfDecoder* decoder,
     const uint8_t* data,
@@ -470,51 +571,50 @@ int mf_decode(
     hr = decoder->transform->ProcessInput(0, sample, 0);
     sample->Release();
     if (hr == MF_E_NOTACCEPTING) {
-        pull(decoder, 0);
-        IMFSample* retry = nullptr;
-        IMFMediaBuffer* retry_buf = nullptr;
-        if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(length), &retry_buf)) ||
-            FAILED(MFCreateSample(&retry)) || FAILED(retry->AddBuffer(retry_buf))) {
-            if (retry) {
-                retry->Release();
+        // The decoder is holding a finished frame. Pull it into the queue
+        // before submitting this one again. The old path pulled that frame
+        // and then overwrote it, so the viewer showed about half the frames.
+        for (int attempt = 0; attempt < 4 && hr == MF_E_NOTACCEPTING; ++attempt) {
+            int pulled = pull(decoder, 0);
+            if (pulled < 0) {
+                return decoder->ready.empty() ? -1 : emit_frame(decoder, y, uv, width, height);
             }
-            if (retry_buf) {
-                retry_buf->Release();
+            IMFSample* retry = nullptr;
+            IMFMediaBuffer* retry_buf = nullptr;
+            if (FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(length), &retry_buf)) ||
+                FAILED(MFCreateSample(&retry)) || FAILED(retry->AddBuffer(retry_buf))) {
+                if (retry) {
+                    retry->Release();
+                }
+                if (retry_buf) {
+                    retry_buf->Release();
+                }
+                return emit_frame(decoder, y, uv, width, height);
             }
-            return 0;
+            BYTE* again = nullptr;
+            retry_buf->Lock(&again, nullptr, nullptr);
+            memcpy(again, data, static_cast<size_t>(length));
+            retry_buf->Unlock();
+            retry_buf->SetCurrentLength(static_cast<DWORD>(length));
+            hr = decoder->transform->ProcessInput(0, retry, 0);
+            retry_buf->Release();
+            retry->Release();
         }
-        BYTE* again = nullptr;
-        retry_buf->Lock(&again, nullptr, nullptr);
-        memcpy(again, data, static_cast<size_t>(length));
-        retry_buf->Unlock();
-        retry_buf->SetCurrentLength(static_cast<DWORD>(length));
-        hr = decoder->transform->ProcessInput(0, retry, 0);
-        retry_buf->Release();
-        retry->Release();
     }
     if (FAILED(hr)) {
         set_hr("decoder rejected a frame", hr);
-        return -1;
+        return decoder->ready.empty() ? -1 : emit_frame(decoder, y, uv, width, height);
     }
-    int produced = 0;
     for (;;) {
         int pulled = pull(decoder, 0);
         if (pulled == 0) {
             break;
         }
         if (pulled < 0) {
-            return produced ? 1 : -1;
+            return decoder->ready.empty() ? -1 : emit_frame(decoder, y, uv, width, height);
         }
-        produced = 1;
     }
-    if (!produced) {
-        return 0;
-    }
-    *y = decoder->y.data();
-    *uv = decoder->uv.data();
-    *width = decoder->width;
-    *height = decoder->height;
-    return 1;
+    return emit_frame(decoder, y, uv, width, height);
 }
 
 void mf_close(MfDecoder* decoder) {
@@ -522,8 +622,9 @@ void mf_close(MfDecoder* decoder) {
         return;
     }
     if (decoder->transform) {
-        decoder->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        decoder->transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        // End-of-stream and flush wait on the decode device. Releasing the
+        // transform is enough when the viewer is dropping the share, and it
+        // does not leave the picture thread stuck on the last frame.
         decoder->transform->Release();
     }
     if (decoder->stage) {

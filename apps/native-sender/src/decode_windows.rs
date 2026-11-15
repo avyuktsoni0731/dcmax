@@ -15,6 +15,7 @@ extern "C" {
     fn mf_open() -> *mut MfDecoder;
     fn mf_last_error() -> *const c_char;
     fn mf_hardware(decoder: *mut MfDecoder) -> c_int;
+    fn mf_take_note(decoder: *mut MfDecoder, out: *mut c_char, cap: c_int) -> c_int;
     fn mf_decode(
         decoder: *mut MfDecoder,
         data: *const u8,
@@ -79,6 +80,13 @@ impl Decoder {
                 &mut height,
             )
         };
+        let mut note = [0u8; 96];
+        if unsafe { mf_take_note(self.media, note.as_mut_ptr() as *mut c_char, note.len() as c_int) } == 1 {
+            let text = std::ffi::CStr::from_bytes_until_nul(&note)
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "gpu readback failed".to_string());
+            crate::audio::session_log(&format!("watch picture: {text}"));
+        }
         if status < 0 {
             let reason = unsafe { std::ffi::CStr::from_ptr(mf_last_error()) }.to_string_lossy();
             crate::audio::session_log(&format!("watch picture: hardware decode stopped ({reason})"));

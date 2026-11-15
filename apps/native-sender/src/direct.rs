@@ -209,7 +209,37 @@ pub async fn follow(
         .await
         .context("picture direct: stream")?;
     println!("picture direct: picture stream open");
-    bridge(local, send, recv).await;
+    // The host repeats its card once a second while it is sharing. When those
+    // cards stop, this picture is over. Closing here lets the watcher drop the
+    // frozen frame and accept the next share without leaving the room.
+    let mut last_host = tokio::time::Instant::now();
+    let mut bridge_task = tokio::spawn(async move {
+        bridge(local, send, recv).await;
+    });
+    loop {
+        tokio::select! {
+            finished = &mut bridge_task => {
+                if let Err(err) = finished {
+                    eprintln!("picture direct: picture task stopped ({err})");
+                }
+                break;
+            }
+            message = incoming.recv() => {
+                let Some(message) = message else { break };
+                if let Ok(card) = serde_json::from_slice::<Card>(&message) {
+                    if card.role == "host" && card.id != identity {
+                        last_host = tokio::time::Instant::now();
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(last_host + Duration::from_millis(2500)) => {
+                connection.close(0u32.into(), b"share ended");
+                break;
+            }
+        }
+    }
+    connection.close(0u32.into(), b"share ended");
+    bridge_task.abort();
     Ok(())
 }
 

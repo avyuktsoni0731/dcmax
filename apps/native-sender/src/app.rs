@@ -77,6 +77,7 @@ enum Cmd {
     Join(CallSettings),
     Share(PictureSettings),
     StopShare,
+    Tune(PictureSettings),
     Mute(bool),
     Leave,
 }
@@ -87,6 +88,7 @@ struct CallSettings {
     invite: Option<String>,
 }
 
+#[derive(Clone, Copy)]
 struct PictureSettings {
     width: u32,
     height: u32,
@@ -109,6 +111,8 @@ struct Joined {
     fan: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     host: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
     stop_share: Option<tokio::sync::watch::Sender<bool>>,
+    tune: Option<tokio::sync::watch::Sender<PictureSettings>>,
+    share_size: Option<(u32, u32)>,
     share: Option<tokio::task::JoinHandle<()>>,
     playback_stop: Arc<AtomicBool>,
 }
@@ -721,6 +725,9 @@ impl MyCord {
         });
         if before != (self.resolution, self.fps, self.bitrate_kbps) {
             self.persist();
+            if self.joined {
+                self.send(Cmd::Tune(self.picture_settings()));
+            }
         }
     }
 
@@ -1262,6 +1269,18 @@ async fn session(
                             let _ = notes.send(Note::Sharing(false));
                         }
                     }
+                    Cmd::Tune(picture) => {
+                        if let Some(call) = call.as_mut() {
+                            let restart = call.share.is_some()
+                                && call.share_size.is_some_and(|size| size != (picture.width, picture.height));
+                            if restart {
+                                stop_share(call).await;
+                                start_share(call, picture, &notes).await;
+                            } else if let Some(tune) = &call.tune {
+                                let _ = tune.send(picture);
+                            }
+                        }
+                    }
                     Cmd::Mute(muted) => {
                         if let Some(call) = call.as_ref() {
                             if muted {
@@ -1409,6 +1428,8 @@ async fn connect(
         fan,
         host: host_slot,
         stop_share: None,
+        tune: None,
+        share_size: None,
         share: None,
         playback_stop,
     })
@@ -1419,6 +1440,7 @@ async fn start_share(call: &mut Joined, picture: PictureSettings, notes: &std::s
         return;
     }
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (tune_tx, tune_rx) = tokio::sync::watch::channel(picture);
     let (host_tx, host_rx) = tokio::sync::mpsc::unbounded_channel();
     if let Ok(mut guard) = call.host.lock() {
         *guard = Some(host_tx);
@@ -1435,8 +1457,10 @@ async fn start_share(call: &mut Joined, picture: PictureSettings, notes: &std::s
     let host = Arc::clone(&call.host);
     let notes_task = notes.clone();
     call.stop_share = Some(stop_tx);
+    call.tune = Some(tune_tx);
+    call.share_size = Some((picture.width, picture.height));
     call.share = Some(tokio::spawn(async move {
-        let result = share_loop(config, participant, host_rx, stop_rx).await;
+        let result = share_loop(config, participant, host_rx, stop_rx, tune_rx).await;
         if let Ok(mut guard) = host.lock() {
             *guard = None;
         }
@@ -1462,6 +1486,8 @@ async fn stop_share(call: &mut Joined) {
     if let Ok(mut guard) = call.host.lock() {
         *guard = None;
     }
+    call.tune = None;
+    call.share_size = None;
 }
 
 async fn share_loop(
@@ -1469,6 +1495,7 @@ async fn share_loop(
     participant: LocalParticipant,
     incoming: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    mut tune: tokio::sync::watch::Receiver<PictureSettings>,
 ) -> Result<()> {
     let pipe = direct::host(participant.clone(), &config.identity, incoming)
         .await
@@ -1524,6 +1551,21 @@ async fn share_loop(
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
                     break;
+                }
+            }
+            changed = tune.changed() => {
+                if changed.is_ok() {
+                    let next = *tune.borrow();
+                    adapt.set_ceiling(next.bitrate_kbps);
+                    adapt.set_target_fps(next.fps);
+                    let pace = adapt.pace();
+                    encoder.set_bitrate_bps(pace.bps);
+                    encoder.set_fps(pace.fps);
+                    note_log(&format!(
+                        "share retune: {}kbps {}fps",
+                        pace.bps / 1000,
+                        pace.fps
+                    ));
                 }
             }
             unit = encoder.units.recv() => {
@@ -1824,6 +1866,17 @@ fn store_frame(stage: &Stage, frame: Frame, timestamp_us: i64) {
 
 fn take_frame(stage: &Stage) -> Option<Frame> {
     let now = stage.clock.now_us()?;
+    let waiting = stage.frames.lock().ok()?.len();
+    // A full queue of "not yet" frames means the clock is behind the pictures
+    // we still have. The next decode would delete the oldest. Show it.
+    if waiting >= 8 {
+        if let Some(timestamp_us) = stage.frames.lock().ok().and_then(|frames| frames.front().map(|frame| frame.timestamp_us)) {
+            if timestamp_us > now {
+                stage.clock.catch_up(timestamp_us);
+            }
+        }
+    }
+    let now = stage.clock.now_us()?;
     let mut frames = stage.frames.lock().ok()?;
     let mut dropped = 0u64;
     // Play frames in order. Drop only when the queued pictures span more
@@ -1840,7 +1893,7 @@ fn take_frame(stage: &Stage) -> Option<Frame> {
     if dropped > 0 {
         stage.stats.late_drop.fetch_add(dropped, Ordering::Relaxed);
     }
-    if frames.front().is_some_and(|frame| frame.timestamp_us <= now) {
+    if frames.front().is_some_and(|frame| frame.timestamp_us <= now || frames.len() >= 8) {
         return frames.pop_front().map(|timed| timed.frame);
     }
     None

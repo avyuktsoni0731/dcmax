@@ -304,6 +304,23 @@ impl PlayClock {
         }
     }
 
+    /// The queue is full of frames the clock still calls early. Waiting any
+    /// longer deletes them. Pull the clock up to this frame so the picture
+    /// and the desktop audio stay on the frames that are actually kept.
+    pub fn catch_up(&self, timestamp_us: i64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if !state.primed {
+            return;
+        }
+        let playout = state.origin_remote + state.origin_local.elapsed().as_micros() as i64;
+        if timestamp_us > playout {
+            state.origin_remote = timestamp_us;
+            state.origin_local = Instant::now();
+        }
+    }
+
     pub fn now_us(&self) -> Option<i64> {
         let state = self.state.lock().ok()?;
         if !state.primed {

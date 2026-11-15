@@ -44,6 +44,27 @@ impl PictureAdapt {
         }
     }
 
+    /// The number chosen in the app. A lower choice clamps immediately.
+    /// A higher choice stays the ceiling and the existing climb brings the
+    /// encoder back up once the pipe is clear.
+    pub fn set_ceiling(&mut self, bitrate_kbps: u32) {
+        let ceiling = u64::from(bitrate_kbps.max(1))
+            .saturating_mul(1000)
+            .clamp(800_000, 100_000_000);
+        self.ceiling_bps = ceiling;
+        self.floor_bps = FLOOR_BPS.min(ceiling);
+        if self.applied_bps > ceiling {
+            self.applied_bps = ceiling;
+        }
+    }
+
+    pub fn set_target_fps(&mut self, fps: u32) {
+        self.target_fps = fps.clamp(MIN_FPS, 240);
+        if self.applied_fps > self.target_fps {
+            self.applied_fps = self.target_fps;
+        }
+    }
+
     pub fn pace(&self) -> Pace {
         Pace {
             bps: self.applied_bps,
