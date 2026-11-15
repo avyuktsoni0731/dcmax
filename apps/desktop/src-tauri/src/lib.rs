@@ -271,12 +271,13 @@ fn present_on_main(handle: &AppHandle) {
             visible: rect.visible,
         }
     };
+    // `showing` means a frame has been drawn and should stay up. `armed` means
+    // the child window was already on screen on a previous tick. Metal will
+    // not give a drawable for a window that was just created, and taking the
+    // frame then discards it.
     thread_local! {
         static SHOWING: Cell<bool> = const { Cell::new(false) };
-    }
-    let mut showing = SHOWING.with(|slot| slot.get());
-    if !rect.visible {
-        showing = false;
+        static ARMED: Cell<bool> = const { Cell::new(false) };
     }
     SURFACE.with(|slot| {
         let mut surface = slot.borrow_mut();
@@ -292,16 +293,10 @@ fn present_on_main(handle: &AppHandle) {
                 i32::from(on && rect.width >= 2.0 && rect.height >= 2.0),
             )
         };
-        let view = place(surface.view, showing);
-        surface.view = view;
-        if surface.presenter.is_none() && !view.is_null() {
-            match Presenter::attach(view) {
-                Ok(presenter) => surface.presenter = Some(presenter),
-                Err(err) => eprintln!("picture surface: {err}"),
-            }
-        }
         if !rect.visible {
+            surface.view = place(surface.view, false);
             SHOWING.with(|slot| slot.set(false));
+            ARMED.with(|slot| slot.set(false));
             return;
         }
         let state = handle.state::<DesktopState>();
@@ -312,11 +307,29 @@ fn present_on_main(handle: &AppHandle) {
             return;
         };
         if engine.picture_ended() {
-            showing = false;
+            SHOWING.with(|slot| slot.set(false));
+            ARMED.with(|slot| slot.set(false));
+        }
+        let showing = SHOWING.with(|slot| slot.get());
+        let want = showing || engine.picture_ready();
+        let view = place(surface.view, want);
+        surface.view = view;
+        if surface.presenter.is_none() && !view.is_null() {
+            match Presenter::attach(view) {
+                Ok(presenter) => surface.presenter = Some(presenter),
+                Err(err) => eprintln!("picture surface: {err}"),
+            }
+        }
+        if !want || surface.presenter.is_none() {
+            ARMED.with(|slot| slot.set(false));
+            return;
+        }
+        let armed = ARMED.with(|slot| slot.get());
+        if !armed {
+            ARMED.with(|slot| slot.set(true));
+            return;
         }
         let Some(presenter) = surface.presenter.as_ref() else {
-            let _ = place(surface.view, showing);
-            SHOWING.with(|slot| slot.set(showing));
             return;
         };
         let drew = engine
@@ -336,10 +349,8 @@ fn present_on_main(handle: &AppHandle) {
             })
             .unwrap_or(false);
         if drew {
-            showing = true;
+            SHOWING.with(|slot| slot.set(true));
         }
-        let _ = place(surface.view, showing);
-        SHOWING.with(|slot| slot.set(showing));
     });
 }
 

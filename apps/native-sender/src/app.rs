@@ -262,6 +262,16 @@ impl Engine {
     pub fn picture_ended(&self) -> bool {
         self.stage.ended.swap(false, Ordering::AcqRel)
     }
+
+    /// A decoded frame is waiting. The window has to be on screen before it
+    /// can be drawn, and taking the frame earlier throws it away.
+    pub fn picture_ready(&self) -> bool {
+        self.stage
+            .frames
+            .lock()
+            .map(|frames| !frames.is_empty())
+            .unwrap_or(false)
+    }
 }
 
 fn picture_settings(request: ShareRequest) -> Result<PictureSettings> {

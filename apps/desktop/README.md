@@ -43,4 +43,6 @@ This Mac build is Apple Silicon only. It is ad-hoc signed, so it is for this com
 - `npm run tauri build` on this Mac: the app bundled and launched to the room screen.
 - The first Join aborted inside WebRTC because the shell link dropped `NSString(StdString)`. The desktop link now passes `-ObjC`, the same flag the working app uses, and that category is in the binary.
 
-Not tested after that link fix: a completed call in this window, microphone audio, screen sharing, the picture during a call, leave during a call, reconnect, sleep, or any Windows build of this shell.
+The first Windows-to-Mac watch decoded the picture and then dropped every frame. The shell only created the picture window after a successful draw, and Metal will not draw into a window that does not exist yet. The window is now opened when a frame is waiting, and the frame is drawn on the next tick.
+
+Not tested after that display fix: a completed watch of a Windows share in this window, microphone audio, leave during a call, reconnect, sleep, or any Windows build of this shell.
