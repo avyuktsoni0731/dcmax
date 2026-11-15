@@ -256,6 +256,12 @@ impl Engine {
         self.stage.stats.shown.fetch_add(1, Ordering::Relaxed);
         Some(draw(frame.pixels.as_ref()))
     }
+
+    /// The sharer closed the picture. The next call returns false until that
+    /// happens again, so the window can drop the last frame.
+    pub fn picture_ended(&self) -> bool {
+        self.stage.ended.swap(false, Ordering::AcqRel)
+    }
 }
 
 fn picture_settings(request: ShareRequest) -> Result<PictureSettings> {
@@ -1394,9 +1400,12 @@ async fn session(
                         if call.is_some() {
                             continue;
                         }
-                        match connect(&settings, &notes, Arc::clone(&stage)).await {
-                            Ok(joined) => {
+                        match connect(&settings, Arc::clone(&stage)).await {
+                            Ok((joined, warning)) => {
                                 let _ = notes.send(Note::Joined);
+                                if let Some(text) = warning {
+                                    let _ = notes.send(Note::Status(text));
+                                }
                                 call = Some(joined);
                             }
                             Err(err) => {
@@ -1472,11 +1481,7 @@ async fn session(
     }
 }
 
-async fn connect(
-    settings: &CallSettings,
-    notes: &std::sync::mpsc::Sender<Note>,
-    stage: Arc<Stage>,
-) -> Result<Joined> {
+async fn connect(settings: &CallSettings, stage: Arc<Stage>) -> Result<(Joined, Option<String>)> {
     let config = call_config(settings, &PictureSettings {
         width: 1920,
         height: 1080,
@@ -1508,15 +1513,17 @@ async fn connect(
         source: TrackSource::Microphone,
         ..Default::default()
     };
-    if let Err(err) = room
+    let warning = if let Err(err) = room
         .local_participant()
         .publish_track(LocalTrack::Audio(mic.clone()), mic_options)
         .await
     {
-        let _ = notes.send(Note::Status(format!(
+        Some(format!(
             "Joined without a microphone ({err}). You can still share and hear the room."
-        )));
-    }
+        ))
+    } else {
+        None
+    };
     let listener = listen("127.0.0.1:0".parse().expect("local address"))?;
     let playback = listener.local_addr().context("picture listener")?;
     let playback_stop = Arc::new(AtomicBool::new(false));
@@ -1566,7 +1573,7 @@ async fn connect(
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     });
-    Ok(Joined {
+    Ok((Joined {
         room,
         events,
         mic,
@@ -1578,7 +1585,7 @@ async fn connect(
         share_size: None,
         share: None,
         playback_stop,
-    })
+    }, warning))
 }
 
 async fn start_share(call: &mut Joined, picture: PictureSettings, notes: &std::sync::mpsc::Sender<Note>) {

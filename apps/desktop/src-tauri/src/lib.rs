@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -45,6 +46,35 @@ struct RectBody {
     width: f64,
     height: f64,
     visible: bool,
+}
+
+#[derive(Deserialize)]
+struct FullBody {
+    on: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Profile {
+    name: String,
+    room: String,
+    invite: String,
+    resolution: usize,
+    fps: u32,
+    bitrate_kbps: u32,
+    dark: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileBody {
+    name: String,
+    room: String,
+    invite: String,
+    resolution: usize,
+    fps: u32,
+    bitrate_kbps: u32,
+    dark: bool,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -108,6 +138,23 @@ fn tune(state: State<DesktopState>, body: ShareBody) -> Result<(), String> {
 #[tauri::command]
 fn set_muted(state: State<DesktopState>, body: MuteBody) -> Result<(), String> {
     with_engine(&state, |engine| engine.set_muted(body.muted))
+}
+
+#[tauri::command]
+fn set_fullscreen(app: AppHandle, body: FullBody) -> Result<(), String> {
+    let window = app.get_webview_window("main").ok_or("the window is unavailable")?;
+    window.set_fullscreen(body.on).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn profile() -> Profile {
+    load_profile()
+}
+
+#[tauri::command]
+fn remember(body: ProfileBody) -> Result<(), String> {
+    save_profile(&body);
+    Ok(())
 }
 
 #[tauri::command]
@@ -192,6 +239,7 @@ fn present_on_main(handle: &AppHandle) {
     extern "C" {
         fn dcmax_stage_place(
             ns_window: *mut c_void,
+            ns_content: *mut c_void,
             existing: *mut c_void,
             x: f64,
             y: f64,
@@ -207,6 +255,9 @@ fn present_on_main(handle: &AppHandle) {
     let Ok(ns_window) = window.ns_window() else {
         return;
     };
+    let Ok(ns_content) = window.ns_view() else {
+        return;
+    };
     let rect = {
         let state = handle.state::<DesktopState>();
         let Ok(rect) = state.rect.lock() else {
@@ -220,22 +271,28 @@ fn present_on_main(handle: &AppHandle) {
             visible: rect.visible,
         }
     };
-    if rect.width < 2.0 || rect.height < 2.0 {
-        return;
+    thread_local! {
+        static SHOWING: Cell<bool> = const { Cell::new(false) };
+    }
+    let mut showing = SHOWING.with(|slot| slot.get());
+    if !rect.visible {
+        showing = false;
     }
     SURFACE.with(|slot| {
         let mut surface = slot.borrow_mut();
-        let view = unsafe {
+        let place = |view: *mut c_void, on: bool| unsafe {
             dcmax_stage_place(
                 ns_window.cast(),
-                surface.view,
+                ns_content.cast(),
+                view,
                 rect.x,
                 rect.y,
-                rect.width,
-                rect.height,
-                i32::from(rect.visible),
+                rect.width.max(2.0),
+                rect.height.max(2.0),
+                i32::from(on && rect.width >= 2.0 && rect.height >= 2.0),
             )
         };
+        let view = place(surface.view, showing);
         surface.view = view;
         if surface.presenter.is_none() && !view.is_null() {
             match Presenter::attach(view) {
@@ -244,11 +301,9 @@ fn present_on_main(handle: &AppHandle) {
             }
         }
         if !rect.visible {
+            SHOWING.with(|slot| slot.set(false));
             return;
         }
-        let Some(presenter) = surface.presenter.as_ref() else {
-            return;
-        };
         let state = handle.state::<DesktopState>();
         let Ok(engine) = state.engine.lock() else {
             return;
@@ -256,19 +311,35 @@ fn present_on_main(handle: &AppHandle) {
         let Some(engine) = engine.as_ref() else {
             return;
         };
-        engine.with_picture(|picture| {
-            if let Picture::Nv12 { buffer, full_range } = picture {
-                let _ = presenter.draw_nv12(
-                    buffer.as_ptr().cast(),
-                    *full_range,
-                    Pointer {
-                        visible: false,
-                        x: 0.0,
-                        y: 0.0,
-                    },
-                );
-            }
-        });
+        if engine.picture_ended() {
+            showing = false;
+        }
+        let Some(presenter) = surface.presenter.as_ref() else {
+            let _ = place(surface.view, showing);
+            SHOWING.with(|slot| slot.set(showing));
+            return;
+        };
+        let drew = engine
+            .with_picture(|picture| match picture {
+                Picture::Nv12 { buffer, full_range } => {
+                    presenter.draw_nv12(
+                        buffer.as_ptr().cast(),
+                        *full_range,
+                        Pointer {
+                            visible: false,
+                            x: 0.0,
+                            y: 0.0,
+                        },
+                    ) == 0
+                }
+                Picture::Rgba { .. } => false,
+            })
+            .unwrap_or(false);
+        if drew {
+            showing = true;
+        }
+        let _ = place(surface.view, showing);
+        SHOWING.with(|slot| slot.set(showing));
     });
 }
 
@@ -292,6 +363,9 @@ pub fn run() {
             stop_share,
             tune,
             set_muted,
+            set_fullscreen,
+            profile,
+            remember,
             stage_rect
         ])
         .setup(|app| {
@@ -317,6 +391,84 @@ pub fn run() {
                         }
                     }
                 }
+                // Leave is handled on the call thread. Give that thread time
+                // to close the room before this process exits.
+                std::thread::sleep(Duration::from_millis(400));
             }
         });
+}
+
+fn profile_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+    Some(std::path::PathBuf::from(home).join(".mycord"))
+}
+
+fn load_profile() -> Profile {
+    let mut profile = Profile {
+        name: String::new(),
+        room: "mycord-room".to_string(),
+        invite: String::new(),
+        resolution: 1,
+        fps: 60,
+        bitrate_kbps: 40_000,
+        dark: false,
+    };
+    let Some(path) = profile_path() else {
+        return profile;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return profile;
+    };
+    let mut lines = text.lines();
+    if let Some(name) = lines.next() {
+        profile.name = name.to_string();
+    }
+    if let Some(room) = lines.next() {
+        if !room.is_empty() {
+            profile.room = room.to_string();
+        }
+    }
+    if let Some(invite) = lines.next() {
+        profile.invite = invite.to_string();
+    }
+    if let Some(resolution) = lines.next().and_then(|line| line.parse().ok()) {
+        if resolution < 3 {
+            profile.resolution = resolution;
+        }
+    }
+    if let Some(fps) = lines.next().and_then(|line| line.parse().ok()) {
+        if fps == 30 || fps == 60 {
+            profile.fps = fps;
+        }
+    }
+    if let Some(bitrate) = lines.next().and_then(|line| line.parse().ok()) {
+        if matches!(bitrate, 8000 | 12000 | 20000 | 40000 | 80000 | 100000) {
+            profile.bitrate_kbps = bitrate;
+        }
+    }
+    if let Some(theme) = lines.next() {
+        profile.dark = theme == "dark";
+    }
+    profile
+}
+
+fn save_profile(body: &ProfileBody) {
+    let Some(path) = profile_path() else {
+        return;
+    };
+    let resolution = body.resolution.min(2);
+    let fps = if body.fps == 30 { 30 } else { 60 };
+    let bitrate = if matches!(body.bitrate_kbps, 8000 | 12000 | 20000 | 40000 | 80000 | 100000) {
+        body.bitrate_kbps
+    } else {
+        40_000
+    };
+    let theme = if body.dark { "dark" } else { "light" };
+    let text = format!(
+        "{}\n{}\n{}\n{resolution}\n{fps}\n{bitrate}\n{theme}\n",
+        body.name.trim(),
+        body.room.trim(),
+        body.invite.trim()
+    );
+    let _ = std::fs::write(path, text);
 }

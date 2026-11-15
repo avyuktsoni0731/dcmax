@@ -1,40 +1,46 @@
-# MyCord desktop shell
+# MyCord Shell
 
-The installed call app is still `native-sender`. This directory is the new window around that same engine. It is not the app to hand to a friend until a real call has been tested here.
+This is the desktop window around the existing Rust call engine. Voice, capture, and the screen stay in that process. The window only sends join, leave, mute, share, and the picture settings.
 
-## Decision
+The app you already use, `MyCord.app` and `MyCord.exe`, is unchanged. This build is the one to try next.
 
-Voice and the screen stay in the Rust process. The webview draws the room screen and the buttons. It does not capture the microphone, encode the screen, or receive picture frames. LiveKit and the direct picture path carry the media.
+## Try it on this Mac
 
-The Next.js site stays the browser product. It is not packaged into this window, because that page shares a screen with the browser capture API and talks to the old remote sender launcher.
+Quit the current MyCord on the Mac first, so two apps do not join as the same person.
 
-A second process, and `cargo run` from the API, are not how the desktop app starts capture. The engine is the `native-sender` library linked into this binary. On a production API, the remote launcher is off unless `ENABLE_REMOTE_NATIVE_RUNTIME=1`.
+Open `~/Desktop/MyCord Shell.app`.
 
-## Run on this Mac
+The room screen is filled from `~/.mycord` when that file exists. Use a different display name from the other computer, and the same room name. On Windows, keep using the existing `MyCord.exe` for this test. The Windows build of this shell does not draw the screen yet.
+
+The first launch asks for the microphone. The first share asks for screen recording. Both prompts belong to MyCord Shell, which is a different app from MyCord, so macOS asks again.
+
+Leave, or quit the app, stops the call. The picture is drawn in a native surface over the stage. It is not sent through the webview.
+
+## Build again
 
 ```bash
 cd apps/desktop
 npm install
-npm run tauri dev
-```
-
-The current MyCord.app is unchanged. Open that for a call until this shell has been tried on both computers.
-
-## Package
-
-```bash
-cd apps/desktop
 npm run tauri build
 ```
 
-That command has not been run. A Mac build that other people can open still needs signing and notarisation, which are not set up in this repo. Windows packaging has not been built. WebView2 is the Tauri runtime on Windows; the picture surface for that window is not implemented, so Windows watching still belongs to the existing MyCord.exe.
+The app is written to:
+
+`apps/native-sender/target/release/bundle/macos/MyCord Shell.app`
+
+That path is used because the build reuses the engine's existing release output. A copy for the Desktop is:
+
+```bash
+ditto "apps/native-sender/target/release/bundle/macos/MyCord Shell.app" "$HOME/Desktop/MyCord Shell.app"
+codesign --force --sign - "$HOME/Desktop/MyCord Shell.app"
+```
+
+This Mac build is Apple Silicon only. It is ad-hoc signed, so it is for this computer. It is not notarised.
 
 ## What was run
 
 - `cargo test --lib` in `apps/native-sender`: 28 passed.
-- `cargo check --bin native-sender`: passed.
-- `cargo check` for this shell: passed.
-- Typecheck for this UI and for `apps/api`: passed.
-- `npm run tauri dev` on this Mac: the window opened on the room screen.
+- `npm run tauri build` on this Mac: the app bundled and launched to the room screen.
+- The first Join aborted inside WebRTC because the shell link dropped `NSString(StdString)`. The desktop link now passes `-ObjC`, the same flag the working app uses, and that category is in the binary.
 
-Not tested: joining a room, microphone, screen sharing, the Metal stage during a call, leave/reconnect, sleep, or any Windows build of this shell.
+Not tested after that link fix: a completed call in this window, microphone audio, screen sharing, the picture during a call, leave during a call, reconnect, sleep, or any Windows build of this shell.

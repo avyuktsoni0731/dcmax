@@ -16,6 +16,16 @@ const RESOLUTIONS = [
 
 const BITRATES = [8000, 12000, 20000, 40000, 80000, 100000];
 
+type Profile = {
+  name: string;
+  room: string;
+  invite: string;
+  resolution: number;
+  fps: number;
+  bitrateKbps: number;
+  dark: boolean;
+};
+
 export function App() {
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [name, setName] = useState("");
@@ -28,11 +38,39 @@ export function App() {
   const [resolution, setResolution] = useState(1);
   const [fps, setFps] = useState(60);
   const [bitrate, setBitrate] = useState(40000);
+  const [fullscreen, setFullscreen] = useState(false);
   const [busy, setBusy] = useState(false);
+
+  const saved = (next?: Partial<Profile>): Profile => ({
+    name,
+    room,
+    invite,
+    resolution,
+    fps,
+    bitrateKbps: bitrate,
+    dark: theme === "dark",
+    ...next
+  });
+
+  function persist(next?: Partial<Profile>) {
+    void invoke("remember", { body: saved(next) });
+  }
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
+
+  useEffect(() => {
+    void invoke<Profile>("profile").then((stored) => {
+      setName(stored.name);
+      setRoom(stored.room);
+      setInvite(stored.invite);
+      setResolution(stored.resolution);
+      setFps(stored.fps);
+      setBitrate(stored.bitrateKbps);
+      setTheme(stored.dark ? "dark" : "light");
+    });
+  }, []);
 
   useEffect(() => {
     const unlisten = listen<Note>("engine", (event) => {
@@ -49,8 +87,10 @@ export function App() {
         setPhase("lobby");
         setSharing(false);
         setMuted(false);
+        setFullscreen(false);
         setStatus("You left the room.");
         setBusy(false);
+        void invoke("set_fullscreen", { body: { on: false } });
       } else if (note.kind === "sharing") {
         setSharing(note.on);
         setStatus(note.on ? "Sharing your screen." : "In the room.");
@@ -109,7 +149,15 @@ export function App() {
         <div className="status">
           {phase === "joining" ? <span className="joining" /> : phase === "call" ? <span className="dot" /> : null}
           <span>{status}</span>
-          <button className="ghost" type="button" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+          <button
+            className="ghost"
+            type="button"
+            onClick={() => {
+              const next = theme === "dark" ? "light" : "dark";
+              setTheme(next);
+              persist({ dark: next === "dark" });
+            }}
+          >
             {theme === "dark" ? "Light" : "Dark"}
           </button>
         </div>
@@ -127,6 +175,7 @@ export function App() {
                 onChange={(event) => {
                   const next = Number(event.target.value);
                   setResolution(next);
+                  persist({ resolution: next });
                   const size = RESOLUTIONS[next] ?? RESOLUTIONS[1];
                   void invoke("tune", { body: { width: size.width, height: size.height, fps, bitrateKbps: bitrate } });
                 }}
@@ -145,6 +194,7 @@ export function App() {
                 onChange={(event) => {
                   const next = Number(event.target.value);
                   setFps(next);
+                  persist({ fps: next });
                   void invoke("tune", { body: { ...picture(), fps: next } });
                 }}
               >
@@ -159,6 +209,7 @@ export function App() {
                 onChange={(event) => {
                   const next = Number(event.target.value);
                   setBitrate(next);
+                  persist({ bitrateKbps: next });
                   void invoke("tune", { body: { ...picture(), bitrateKbps: next } });
                 }}
               >
@@ -178,6 +229,16 @@ export function App() {
               onClick={() => void run(() => (sharing ? invoke("stop_share") : invoke("share", { body: picture() })))}
             >
               {sharing ? "Stop sharing" : "Share screen"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const on = !fullscreen;
+                setFullscreen(on);
+                void invoke("set_fullscreen", { body: { on } });
+              }}
+            >
+              {fullscreen ? "Exit full screen" : "Full screen"}
             </button>
             <button className="leave" type="button" disabled={busy} onClick={() => void run(() => invoke("leave"))}>
               Leave
@@ -207,6 +268,7 @@ export function App() {
             onClick={() => {
               setPhase("joining");
               setStatus("Joining the room.");
+              persist();
               void run(
                 () => invoke("join", { body: { name, room, invite: invite.trim() ? invite.trim() : null } }),
                 false
