@@ -140,6 +140,62 @@ input, select {
   padding: 16px 16px 20px;
 }
 
+.app.fullscreen:not(.chrome) .stage {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  min-height: 0;
+}
+
+.app.fullscreen:not(.chrome) .bar,
+.app.fullscreen:not(.chrome) .dock {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.app.fullscreen .bar,
+.app.fullscreen .dock {
+  transition: opacity 180ms ease;
+}
+
+.app.fullscreen.chrome .bar,
+.app.fullscreen.chrome .dock {
+  position: relative;
+  z-index: 3;
+}
+
+.picker {
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+}
+
+.picker-card {
+  width: min(420px, calc(100% - 48px));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg);
+}
+
+.picker-card h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.picker-card button { width: 100%; }
+
 .joining {
   width: 10px;
   height: 10px;

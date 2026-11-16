@@ -408,7 +408,14 @@ extern "C" void* dcmax_stage_place(void* owner_ptr, void* existing, double x, do
     if (stage && (stage->win_w != width || stage->win_h != height)) {
         stage->win_w = width;
         stage->win_h = height;
+        RECT client = {0, 0, 0, 0};
+        GetClientRect(owner, &client);
+        int owner_w = client.right - client.left;
+        int owner_h = client.bottom - client.top;
         int radius = width < 48 || height < 48 ? 0 : 24;
+        if (width >= owner_w - 2 && height >= owner_h - 2) {
+            radius = 0;
+        }
         HRGN region = radius > 0 ? CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius) : nullptr;
         SetWindowRgn(hwnd, region, TRUE);
     }

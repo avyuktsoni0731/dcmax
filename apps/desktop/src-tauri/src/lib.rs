@@ -32,6 +32,8 @@ struct ShareBody {
     height: u32,
     fps: u32,
     bitrate_kbps: u32,
+    #[serde(default)]
+    display_id: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +108,7 @@ fn with_engine<T>(
 
 #[tauri::command]
 fn join(state: State<DesktopState>, body: JoinBody) -> Result<(), String> {
+    let _ = native_sender::prepare_voice();
     with_engine(&state, |engine| {
         engine.join(native_sender::CallRequest {
             name: body.name,
@@ -176,7 +179,32 @@ fn share_request(body: ShareBody) -> native_sender::ShareRequest {
         height: body.height,
         fps: body.fps,
         bitrate_kbps: body.bitrate_kbps,
+        display_id: body.display_id,
     }
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ScreenInfo {
+    id: u32,
+    label: String,
+    width: u32,
+    height: u32,
+}
+
+#[tauri::command]
+fn screens() -> Result<Vec<ScreenInfo>, String> {
+    native_sender::screens()
+        .map(|list| {
+            list.into_iter()
+                .map(|screen| ScreenInfo {
+                    id: screen.id,
+                    label: screen.label,
+                    width: screen.width,
+                    height: screen.height,
+                })
+                .collect()
+        })
+        .map_err(|err| err.to_string())
 }
 
 fn watch_notes(handle: AppHandle) {
@@ -492,7 +520,8 @@ pub fn run() {
             set_fullscreen,
             profile,
             remember,
-            stage_rect
+            stage_rect,
+            screens
         ])
         .setup(|app| {
             let engine = native_sender::Engine::start().map_err(|err| err.to_string())?;

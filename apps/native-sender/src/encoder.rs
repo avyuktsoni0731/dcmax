@@ -16,5 +16,24 @@ pub use macos::ScreenEncoder;
 #[cfg(target_os = "windows")]
 pub use windows::ScreenEncoder;
 
+#[derive(Clone, Debug)]
+pub struct ScreenChoice {
+    pub id: u32,
+    pub label: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub fn screens() -> anyhow::Result<Vec<ScreenChoice>> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::screens()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::screens()
+    }
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 compile_error!("native-sender supports macOS and Windows");

@@ -14,7 +14,11 @@ The room screen is filled from `~/.mycord` when that file exists. Use a differen
 
 The first launch asks for the microphone. The first share asks for screen recording. Both prompts belong to MyCord Shell, which is a different app from MyCord, so macOS asks again.
 
-Leave, or quit the app, stops the call. The picture is drawn in a native surface over the stage. It is not sent through the webview.
+Leave, or quit the app, stops the call. The picture is drawn in a native surface over the stage. It is not sent through the webview. Stopping a share hides that surface. It stays owned by the app, so the window is not released when the other person stops sharing.
+
+If more than one screen is connected, Share screen asks which one to send. Full screen fills the window. The controls hide, and they come back for a moment when the pointer moves.
+
+Voice is the room microphone, separate from the sound inside a screen share. Join opens the microphone on the window thread. If neither person can be heard, allow the microphone for MyCord Shell in System Settings and join again. A remote voice track is kept for the whole call.
 
 ## Build again
 

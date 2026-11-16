@@ -381,17 +381,40 @@ fn set_encode_priority() {
     }
 }
 
-fn output_size(config: &AppConfig) -> Result<(u32, u32, u32, u32)> {
+pub fn screens() -> Result<Vec<super::ScreenChoice>> {
     let content = SCShareableContent::get().map_err(|err| {
-        anyhow!(
-            "screen capture failed ({err}). Grant Screen Recording permission to the terminal running native-sender, then start it again."
-        )
+        anyhow!("screen capture failed ({err}). Grant Screen Recording permission to this app, then try again.")
     })?;
-    let displays = content.displays();
-    let display = displays
+    Ok(content
+        .displays()
+        .iter()
+        .enumerate()
+        .map(|(index, display)| super::ScreenChoice {
+            id: display.display_id(),
+            label: format!("Display {} · {}×{}", index + 1, display.width(), display.height()),
+            width: display.width(),
+            height: display.height(),
+        })
+        .collect())
+}
+
+fn choose_display<'a>(displays: &'a [SCDisplay], id: Option<u32>) -> Option<&'a SCDisplay> {
+    if let Some(id) = id {
+        if let Some(display) = displays.iter().find(|display| display.display_id() == id) {
+            return Some(display);
+        }
+    }
+    displays
         .iter()
         .max_by_key(|display| u64::from(display.width()) * u64::from(display.height()))
-        .context("ScreenCaptureKit did not list a display")?;
+}
+
+fn output_size(config: &AppConfig) -> Result<(u32, u32, u32, u32)> {
+    let content = SCShareableContent::get().map_err(|err| {
+        anyhow!("screen capture failed ({err}). Grant Screen Recording permission to this app, then try again.")
+    })?;
+    let displays = content.displays();
+    let display = choose_display(&displays, config.display_id).context("ScreenCaptureKit did not list a display")?;
     let width = even_min(config.width, display.width());
     let height = even_min(config.height, display.height());
     Ok((width, height, display.width(), display.height()))
@@ -417,10 +440,7 @@ fn open_stream(
         )
     })?;
     let displays = content.displays();
-    let display = displays
-        .iter()
-        .max_by_key(|display| u64::from(display.width()) * u64::from(display.height()))
-        .context("ScreenCaptureKit did not list a display")?;
+    let display = choose_display(&displays, config.display_id).context("ScreenCaptureKit did not list a display")?;
     println!(
         "screen encoder: capture=screencapturekit codec=videotoolbox {width}x{height} @ {}fps {} kbps gop={} display={display_width}x{display_height}",
         config.target_fps,

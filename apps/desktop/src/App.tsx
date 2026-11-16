@@ -16,6 +16,13 @@ const RESOLUTIONS = [
 
 const BITRATES = [8000, 12000, 20000, 40000, 80000, 100000];
 
+type ScreenChoice = {
+  id: number;
+  label: string;
+  width: number;
+  height: number;
+};
+
 type Profile = {
   name: string;
   room: string;
@@ -39,6 +46,9 @@ export function App() {
   const [fps, setFps] = useState(60);
   const [bitrate, setBitrate] = useState(40000);
   const [fullscreen, setFullscreen] = useState(false);
+  const [chrome, setChrome] = useState(true);
+  const [displayId, setDisplayId] = useState<number | null>(null);
+  const [picker, setPicker] = useState<ScreenChoice[] | null>(null);
   const [busy, setBusy] = useState(false);
 
   const saved = (next?: Partial<Profile>): Profile => ({
@@ -102,10 +112,33 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!fullscreen) {
+      setChrome(true);
+      return;
+    }
+    let timer = 0;
+    const show = () => {
+      setChrome(true);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => setChrome(false), 1800);
+    };
+    show();
+    window.addEventListener("mousemove", show);
+    return () => {
+      window.removeEventListener("mousemove", show);
+      window.clearTimeout(timer);
+    };
+  }, [fullscreen]);
+
+  useEffect(() => {
     if (phase !== "call") return;
     const node = document.getElementById("stage");
     if (!node) return;
     const post = () => {
+      if (picker) {
+        void invoke("stage_rect", { body: { x: 0, y: 0, width: 0, height: 0, visible: false } });
+        return;
+      }
       const rect = node.getBoundingClientRect();
       void invoke("stage_rect", {
         body: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, visible: true }
@@ -120,7 +153,7 @@ export function App() {
       window.removeEventListener("resize", post);
       void invoke("stage_rect", { body: { x: 0, y: 0, width: 0, height: 0, visible: false } });
     };
-  }, [phase]);
+  }, [phase, picker, fullscreen, chrome]);
 
   async function run(task: () => Promise<unknown>, settle = true) {
     setBusy(true);
@@ -136,11 +169,31 @@ export function App() {
 
   const picture = () => {
     const size = RESOLUTIONS[resolution] ?? RESOLUTIONS[1];
-    return { width: size.width, height: size.height, fps, bitrateKbps: bitrate };
+    return { width: size.width, height: size.height, fps, bitrateKbps: bitrate, displayId };
   };
 
+  async function shareScreen() {
+    if (sharing) {
+      await invoke("stop_share");
+      return;
+    }
+    let found: ScreenChoice[] = [];
+    try {
+      found = await invoke<ScreenChoice[]>("screens");
+    } catch {
+      found = [];
+    }
+    if (found.length > 1) {
+      setPicker(found);
+      return;
+    }
+    const next = found[0]?.id ?? null;
+    setDisplayId(next);
+    await invoke("share", { body: { ...picture(), displayId: next } });
+  }
+
   return (
-    <div className="app">
+    <div className={`app${fullscreen ? " fullscreen" : ""}${fullscreen && chrome ? " chrome" : ""}`}>
       <header className="bar">
         <div className="brand">
           <span className="mark" aria-hidden="true" />
@@ -223,11 +276,7 @@ export function App() {
             <button type="button" onClick={() => void run(() => invoke("set_muted", { body: { muted: !muted } }).then(() => setMuted(!muted)))}>
               {muted ? "Unmute" : "Mute"}
             </button>
-            <button
-              className="primary"
-              type="button"
-              onClick={() => void run(() => (sharing ? invoke("stop_share") : invoke("share", { body: picture() })))}
-            >
+            <button className="primary" type="button" onClick={() => void run(shareScreen)}>
               {sharing ? "Stop sharing" : "Share screen"}
             </button>
             <button
@@ -279,6 +328,30 @@ export function App() {
           </button>
         </main>
       )}
+      {picker ? (
+        <div className="picker" role="dialog" aria-modal="true" aria-label="Choose a screen">
+          <div className="picker-card">
+            <h2>Choose a screen</h2>
+            {picker.map((screen) => (
+              <button
+                key={screen.id}
+                type="button"
+                onClick={() => {
+                  const next = screen.id;
+                  setPicker(null);
+                  setDisplayId(next);
+                  void run(() => invoke("share", { body: { ...picture(), displayId: next } }));
+                }}
+              >
+                {screen.label}
+              </button>
+            ))}
+            <button className="ghost" type="button" onClick={() => setPicker(null)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

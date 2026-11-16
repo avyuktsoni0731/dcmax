@@ -6,6 +6,7 @@ use crate::audio::{decode_packet, decoder as opus_decoder, AudioPlayer, PlayCloc
 use crate::config::{AppConfig, CaptureBackend, EncoderBackend, TargetPlatform};
 use crate::direct::{self, TOPIC};
 use crate::encoder::ScreenEncoder;
+pub use crate::encoder::{screens, ScreenChoice};
 use crate::h264::{unix_us_now, MAX_FRAME_AGE};
 use crate::picture::{accept_picture, listen, FrameReader, PictureSender};
 use anyhow::{anyhow, Context, Result};
@@ -94,6 +95,7 @@ struct PictureSettings {
     height: u32,
     fps: u32,
     bitrate_kbps: u32,
+    display_id: Option<u32>,
 }
 
 enum Note {
@@ -108,6 +110,7 @@ struct Joined {
     events: tokio::sync::mpsc::UnboundedReceiver<RoomEvent>,
     mic: LocalAudioTrack,
     _audio: PlatformAudio,
+    remote_audio: Vec<RemoteAudioTrack>,
     fan: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     host: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
     stop_share: Option<tokio::sync::watch::Sender<bool>>,
@@ -128,6 +131,7 @@ pub struct ShareRequest {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    pub display_id: Option<u32>,
 }
 
 pub enum EngineNote {
@@ -258,9 +262,17 @@ impl Engine {
     }
 
     /// The sharer closed the picture. The next call returns false until that
-    /// happens again, so the window can drop the last frame.
+    /// happens again, so the window can drop the last frame. Queued pictures
+    /// are released here, on the thread that draws, rather than on the
+    /// thread that noticed the share had stopped.
     pub fn picture_ended(&self) -> bool {
-        self.stage.ended.swap(false, Ordering::AcqRel)
+        let ended = self.stage.ended.swap(false, Ordering::AcqRel);
+        if ended {
+            if let Ok(mut frames) = self.stage.frames.lock() {
+                frames.clear();
+            }
+        }
+        ended
     }
 
     /// A decoded frame is waiting. The window has to be on screen before it
@@ -289,7 +301,52 @@ fn picture_settings(request: ShareRequest) -> Result<PictureSettings> {
         height: request.height,
         fps: request.fps,
         bitrate_kbps: request.bitrate_kbps,
+        display_id: request.display_id,
     })
+}
+
+/// Opens the microphone on the calling thread and keeps that audio device
+/// for the process. Join runs this on the window thread. The call thread
+/// then reuses the same device, which is what CoreAudio and a webview need
+/// in order to record and play the room.
+pub fn prepare_voice() -> Result<()> {
+    static HELD: Mutex<Option<PlatformAudio>> = Mutex::new(None);
+    let mut held = HELD.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(audio) = held.as_ref() {
+        if !voice_ready() && audio.start_recording().is_ok() {
+            VOICE_READY.store(true, Ordering::Release);
+            crate::audio::session_log("microphone recording");
+        }
+        return Ok(());
+    }
+    let audio = PlatformAudio::new().context("Could not open the microphone")?;
+    let microphones: Vec<String> = audio.recording_devices().map(|device| device.name).collect();
+    let speakers: Vec<String> = audio.playout_devices().map(|device| device.name).collect();
+    crate::audio::session_log(&format!(
+        "microphone: {}",
+        if microphones.is_empty() { "none".to_string() } else { microphones.join(", ") }
+    ));
+    crate::audio::session_log(&format!(
+        "speakers: {}",
+        if speakers.is_empty() { "none".to_string() } else { speakers.join(", ") }
+    ));
+    match audio.start_recording() {
+        Ok(()) => {
+            VOICE_READY.store(true, Ordering::Release);
+            crate::audio::session_log("microphone recording");
+        }
+        Err(err) => {
+            crate::audio::session_log(&format!("microphone did not start: {err}"));
+        }
+    }
+    *held = Some(audio);
+    Ok(())
+}
+
+static VOICE_READY: AtomicBool = AtomicBool::new(false);
+
+fn voice_ready() -> bool {
+    VOICE_READY.load(Ordering::Acquire)
 }
 
 pub fn run() -> Result<()> {
@@ -405,6 +462,7 @@ impl MyCord {
             height,
             fps: self.fps,
             bitrate_kbps: self.bitrate_kbps,
+            display_id: None,
         }
     }
 
@@ -1480,6 +1538,26 @@ async fn session(
                         let _ = notes.send(Note::Status(format!("The room disconnected ({reason:?}).")));
                         let _ = notes.send(Note::Left);
                     }
+                    Some(RoomEvent::TrackSubscribed { track, participant, .. }) => {
+                        if let RemoteTrack::Audio(audio) = track {
+                            audio.enable();
+                            crate::audio::session_log(&format!("voice from {}", participant.identity()));
+                            if let Some(call) = call.as_mut() {
+                                call.remote_audio.push(audio);
+                            }
+                        }
+                    }
+                    Some(RoomEvent::TrackUnsubscribed { track, .. }) => {
+                        if let RemoteTrack::Audio(audio) = &track {
+                            let sid = audio.sid();
+                            if let Some(call) = call.as_mut() {
+                                call.remote_audio.retain(|held| held.sid() != sid);
+                            }
+                        }
+                    }
+                    Some(RoomEvent::TrackSubscriptionFailed { error, track_sid, .. }) => {
+                        crate::audio::session_log(&format!("voice subscribe failed {track_sid}: {error}"));
+                    }
                     Some(_) => {}
                     None => {
                         call = None;
@@ -1497,6 +1575,7 @@ async fn connect(settings: &CallSettings, stage: Arc<Stage>) -> Result<(Joined, 
         height: 1080,
         fps: 60,
         bitrate_kbps: 80_000,
+        display_id: None,
     });
     let http = reqwest::Client::new();
     crate::api::health_check(&http, &config.api_base_url)
@@ -1513,6 +1592,22 @@ async fn connect(settings: &CallSettings, stage: Arc<Stage>) -> Result<(Joined, 
     .await
     .context("Could not join this room")?;
     let audio = PlatformAudio::new().context("Could not open the microphone")?;
+    let voice_warning = if voice_ready() {
+        None
+    } else {
+        match audio.start_recording() {
+            Ok(()) => {
+                VOICE_READY.store(true, Ordering::Release);
+                None
+            }
+            Err(err) => {
+                crate::audio::session_log(&format!("microphone did not start: {err}"));
+                Some(format!(
+                    "The microphone did not start ({err}). Allow the microphone for MyCord Shell in System Settings, then join again. You can still share and hear the room."
+                ))
+            }
+        }
+    };
     let mut options = RoomOptions::default();
     options.auto_subscribe = true;
     let (room, events) = Room::connect(&token.url, &token.token, options)
@@ -1532,7 +1627,7 @@ async fn connect(settings: &CallSettings, stage: Arc<Stage>) -> Result<(Joined, 
             "Joined without a microphone ({err}). You can still share and hear the room."
         ))
     } else {
-        None
+        voice_warning
     };
     let listener = listen("127.0.0.1:0".parse().expect("local address"))?;
     let playback = listener.local_addr().context("picture listener")?;
@@ -1588,6 +1683,7 @@ async fn connect(settings: &CallSettings, stage: Arc<Stage>) -> Result<(Joined, 
         events,
         mic,
         _audio: audio,
+        remote_audio: Vec::new(),
         fan,
         host: host_slot,
         stop_share: None,
@@ -1910,6 +2006,7 @@ fn call_config(settings: &CallSettings, picture: &PictureSettings) -> AppConfig 
         picture_relay: None,
         invite: settings.invite.clone(),
         picture_direct: true,
+        display_id: picture.display_id,
     }
 }
 
@@ -2068,9 +2165,6 @@ fn queued(stage: &Stage) -> usize {
 }
 
 fn finish_stream(stage: &Stage) {
-    if let Ok(mut frames) = stage.frames.lock() {
-        frames.clear();
-    }
     stage.clock.reset();
     stage.ended.store(true, Ordering::Release);
 }

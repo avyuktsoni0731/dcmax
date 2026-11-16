@@ -284,10 +284,39 @@ impl Drop for ScreenEncoder {
     }
 }
 
-fn start_nvenc(config: &AppConfig) -> Result<ScreenEncoder> {
-    let monitor = Monitor::primary().map_err(|err| {
+pub fn screens() -> Result<Vec<super::ScreenChoice>> {
+    let monitors = Monitor::enumerate().map_err(|err| anyhow!("could not list monitors ({err})"))?;
+    let mut list = Vec::new();
+    for monitor in monitors {
+        let id = monitor.index().unwrap_or(list.len() + 1) as u32;
+        let width = monitor.width().unwrap_or(0);
+        let height = monitor.height().unwrap_or(0);
+        let name = monitor.name().unwrap_or_else(|_| format!("Display {id}"));
+        list.push(super::ScreenChoice {
+            id,
+            label: format!("{name} · {width}×{height}"),
+            width,
+            height,
+        });
+    }
+    Ok(list)
+}
+
+fn chosen_monitor(config: &AppConfig) -> Result<Monitor> {
+    if let Some(id) = config.display_id {
+        if let Ok(monitors) = Monitor::enumerate() {
+            if let Some(monitor) = monitors.into_iter().find(|monitor| monitor.index().ok() == Some(id as usize)) {
+                return Ok(monitor);
+            }
+        }
+    }
+    Monitor::primary().map_err(|err| {
         anyhow!("Windows Graphics Capture could not find the primary monitor ({err}). Start native-sender in the interactive desktop session.")
-    })?;
+    })
+}
+
+fn start_nvenc(config: &AppConfig) -> Result<ScreenEncoder> {
+    let monitor = chosen_monitor(config)?;
     let display_width = monitor
         .width()
         .map_err(|err| anyhow!("monitor width: {err}"))?;

@@ -113,6 +113,9 @@ pub struct AppConfig {
     pub picture_relay: Option<SocketAddr>,
     pub invite: Option<String>,
     pub picture_direct: bool,
+    /// Display chosen in the share dialog. Empty means the largest display
+    /// on Mac and the primary monitor on Windows.
+    pub display_id: Option<u32>,
 }
 
 impl AppConfig {
@@ -223,6 +226,7 @@ impl AppConfig {
             picture_relay: parse_addr(args.picture_relay.as_deref(), "--picture-relay")?,
             invite: args.invite.clone().filter(|invite| !invite.trim().is_empty()),
             picture_direct: args.picture_direct,
+            display_id: None,
         })
     }
 
