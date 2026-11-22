@@ -42,6 +42,11 @@ struct MuteBody {
 }
 
 #[derive(Deserialize)]
+struct GainBody {
+    percent: u32,
+}
+
+#[derive(Deserialize)]
 struct RectBody {
     x: f64,
     y: f64,
@@ -65,6 +70,8 @@ struct Profile {
     fps: u32,
     bitrate_kbps: u32,
     dark: bool,
+    voice: u32,
+    screen: u32,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +84,8 @@ struct ProfileBody {
     fps: u32,
     bitrate_kbps: u32,
     dark: bool,
+    voice: u32,
+    screen: u32,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -86,6 +95,15 @@ enum NoteEvent {
     Joined,
     Left,
     Sharing { on: bool },
+    People { people: Vec<PersonEvent> },
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonEvent {
+    name: String,
+    local: bool,
+    speaking: bool,
 }
 
 fn map_note(note: native_sender::EngineNote) -> NoteEvent {
@@ -94,6 +112,16 @@ fn map_note(note: native_sender::EngineNote) -> NoteEvent {
         native_sender::EngineNote::Joined => NoteEvent::Joined,
         native_sender::EngineNote::Left => NoteEvent::Left,
         native_sender::EngineNote::Sharing(on) => NoteEvent::Sharing { on },
+        native_sender::EngineNote::People(people) => NoteEvent::People {
+            people: people
+                .into_iter()
+                .map(|person| PersonEvent {
+                    name: person.name,
+                    local: person.local,
+                    speaking: person.speaking,
+                })
+                .collect(),
+        },
     }
 }
 
@@ -141,6 +169,16 @@ fn tune(state: State<DesktopState>, body: ShareBody) -> Result<(), String> {
 #[tauri::command]
 fn set_muted(state: State<DesktopState>, body: MuteBody) -> Result<(), String> {
     with_engine(&state, |engine| engine.set_muted(body.muted))
+}
+
+#[tauri::command]
+fn set_voice(state: State<DesktopState>, body: GainBody) -> Result<(), String> {
+    with_engine(&state, |engine| engine.set_voice(body.percent))
+}
+
+#[tauri::command]
+fn set_screen(state: State<DesktopState>, body: GainBody) -> Result<(), String> {
+    with_engine(&state, |engine| engine.set_screen(body.percent))
 }
 
 #[tauri::command]
@@ -517,6 +555,8 @@ pub fn run() {
             stop_share,
             tune,
             set_muted,
+            set_voice,
+            set_screen,
             set_fullscreen,
             profile,
             remember,
@@ -567,6 +607,8 @@ fn load_profile() -> Profile {
         fps: 60,
         bitrate_kbps: 40_000,
         dark: false,
+        voice: 100,
+        screen: 100,
     };
     let Some(path) = profile_path() else {
         return profile;
@@ -604,7 +646,17 @@ fn load_profile() -> Profile {
     if let Some(theme) = lines.next() {
         profile.dark = theme == "dark";
     }
+    if let Some(voice) = lines.next().and_then(|line| line.parse().ok()) {
+        profile.voice = gain_percent(voice);
+    }
+    if let Some(screen) = lines.next().and_then(|line| line.parse().ok()) {
+        profile.screen = gain_percent(screen);
+    }
     profile
+}
+
+fn gain_percent(value: u32) -> u32 {
+    value.min(200)
 }
 
 fn save_profile(body: &ProfileBody) {
@@ -619,8 +671,10 @@ fn save_profile(body: &ProfileBody) {
         40_000
     };
     let theme = if body.dark { "dark" } else { "light" };
+    let voice = gain_percent(body.voice);
+    let screen = gain_percent(body.screen);
     let text = format!(
-        "{}\n{}\n{}\n{resolution}\n{fps}\n{bitrate}\n{theme}\n",
+        "{}\n{}\n{}\n{resolution}\n{fps}\n{bitrate}\n{theme}\n{voice}\n{screen}\n",
         body.name.trim(),
         body.room.trim(),
         body.invite.trim()

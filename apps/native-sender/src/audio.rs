@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "windows")]
 use std::thread::{self, JoinHandle};
@@ -348,24 +348,47 @@ struct OutputQueue {
 }
 
 /// Plays 48 kHz stereo packets on the default output. `mute` replaces the
-/// sound with silence and drops anything already queued.
+/// sound with silence and drops anything already queued. `gain` is a percent
+/// from 0 to 200, applied as the samples leave for the speakers.
 pub struct AudioPlayer {
     queue: Arc<Mutex<OutputQueue>>,
     mute: Arc<AtomicBool>,
     _stream: Stream,
 }
 
+/// Scales one voice track. 100 is unchanged and 200 is twice as loud. WebRTC
+/// accepts a gain up to 10, so 200 percent stays inside that range.
+pub fn set_remote_volume(track: &livekit::prelude::RemoteAudioTrack, percent: u32) {
+    let volume = f64::from(percent.min(200)) / 100.0;
+    // The public track is one shared pointer, and that pointer's first word is
+    // the livekit audio object. The helper reads the WebRTC track out of it.
+    let owned = track.rtc_track();
+    let object = unsafe { *(&owned as *const _ as *const *mut std::ffi::c_void) };
+    if object.is_null() {
+        return;
+    }
+    unsafe { dcmax_set_voice_volume(object, volume) };
+}
+
+extern "C" {
+    fn dcmax_set_voice_volume(media_track: *mut std::ffi::c_void, volume: f64);
+}
+
 impl AudioPlayer {
     pub fn start(mute: Arc<AtomicBool>) -> Result<Self> {
-        Self::open(mute, None)
+        Self::open(mute, None, Arc::new(AtomicU32::new(100)))
     }
 
     /// Play each packet when the shared picture clock reaches its timestamp.
-    pub fn start_synced(mute: Arc<AtomicBool>, clock: Arc<PlayClock>) -> Result<Self> {
-        Self::open(mute, Some(clock))
+    pub fn start_synced(
+        mute: Arc<AtomicBool>,
+        clock: Arc<PlayClock>,
+        gain: Arc<AtomicU32>,
+    ) -> Result<Self> {
+        Self::open(mute, Some(clock), gain)
     }
 
-    fn open(mute: Arc<AtomicBool>, clock: Option<Arc<PlayClock>>) -> Result<Self> {
+    fn open(mute: Arc<AtomicBool>, clock: Option<Arc<PlayClock>>, gain: Arc<AtomicU32>) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -388,9 +411,17 @@ impl AudioPlayer {
                     Arc::clone(&queue),
                     Arc::clone(&mute),
                     clock.clone(),
+                    Arc::clone(&gain),
                 )
                 .or_else(|_| {
-                    build_f32(&device, &config.into(), Arc::clone(&queue), Arc::clone(&mute), fallback)
+                    build_f32(
+                        &device,
+                        &config.into(),
+                        Arc::clone(&queue),
+                        Arc::clone(&mute),
+                        fallback,
+                        Arc::clone(&gain),
+                    )
                 })?
             }
             Ok(config) => {
@@ -454,18 +485,25 @@ fn frames_to_us(frames: i64) -> i64 {
     frames.saturating_mul(1_000_000) / i64::from(RATE)
 }
 
+fn heard(sample: f32, percent: u32) -> f32 {
+    let gain = percent.min(200) as f32 / 100.0;
+    (sample * gain).clamp(-1.0, 1.0)
+}
+
 fn build_f32(
     device: &cpal::Device,
     config: &StreamConfig,
     queue: Arc<Mutex<OutputQueue>>,
     mute: Arc<AtomicBool>,
     clock: Option<Arc<PlayClock>>,
+    gain: Arc<AtomicU32>,
 ) -> Result<Stream> {
     let channels = config.channels as usize;
     let stream = device
         .build_output_stream(
             config,
             move |output: &mut [f32], _| {
+                let percent = gain.load(Ordering::Relaxed);
                 if mute.load(Ordering::Relaxed) {
                     output.fill(0.0);
                     if let Ok(mut queue) = queue.lock() {
@@ -492,10 +530,10 @@ fn build_f32(
                 for frame in output.chunks_mut(channels.max(1)) {
                     let (left, right) = take_sample(&mut queue, playout);
                     if let Some(slot) = frame.first_mut() {
-                        *slot = left;
+                        *slot = heard(left, percent);
                     }
                     if frame.len() > 1 {
-                        frame[1] = right;
+                        frame[1] = heard(right, percent);
                     }
                     for extra in frame.iter_mut().skip(2) {
                         *extra = 0.0;
@@ -600,12 +638,92 @@ pub struct EncodedAudio {
     pub timestamp_us: i64,
 }
 
+/// Finished when Windows has activated a loopback client that leaves this
+/// process out. The voice this app plays is the microphone the other person
+/// already hears, so capturing it again is the echo.
+#[cfg(target_os = "windows")]
+#[windows::core::implement(windows::Win32::Media::Audio::IActivateAudioInterfaceCompletionHandler)]
+struct LoopbackReady {
+    done: std::sync::mpsc::Sender<windows::core::Result<windows::Win32::Media::Audio::IAudioClient>>,
+}
+
+#[cfg(target_os = "windows")]
+impl windows::Win32::Media::Audio::IActivateAudioInterfaceCompletionHandler_Impl for LoopbackReady_Impl {
+    fn ActivateCompleted(
+        &self,
+        operation: windows::core::Ref<windows::Win32::Media::Audio::IActivateAudioInterfaceAsyncOperation>,
+    ) -> windows::core::Result<()> {
+        let client = unsafe {
+            let operation = operation.ok()?;
+            let mut hr = windows::core::HRESULT(0);
+            let mut unknown = None;
+            operation.GetActivateResult(&mut hr, &mut unknown)?;
+            if hr.is_err() {
+                Err(windows::core::Error::from(hr))
+            } else {
+                unknown
+                    .ok_or_else(|| windows::core::Error::from(hr))?
+                    .cast()
+            }
+        };
+        let _ = self.done.send(client);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn excluding_this_app() -> Result<windows::Win32::Media::Audio::IAudioClient> {
+    use windows::core::Interface;
+    use windows::Win32::Media::Audio::{
+        ActivateAudioInterfaceAsync, IActivateAudioInterfaceCompletionHandler, IAudioClient,
+        AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+    };
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Com::BLOB;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::System::Variant::VT_BLOB;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handler: IActivateAudioInterfaceCompletionHandler = LoopbackReady { done: tx }.into();
+    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                TargetProcessId: unsafe { GetCurrentProcessId() },
+                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+            },
+        },
+    };
+    let mut prop = PROPVARIANT::default();
+    let operation = unsafe {
+        (*prop.Anonymous.Anonymous).vt = VT_BLOB;
+        (*prop.Anonymous.Anonymous).Anonymous.blob = BLOB {
+            cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+            pBlobData: (&mut params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast(),
+        };
+        ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &IAudioClient::IID,
+            Some(std::ptr::addr_of!(prop)),
+            &handler,
+        )
+        .context("process loopback")?
+    };
+    let client = rx
+        .recv_timeout(Duration::from_secs(2))
+        .context("process loopback timed out")?
+        .context("process loopback activate")?;
+    drop(operation);
+    Ok(client)
+}
+
 #[cfg(target_os = "windows")]
 fn capture_loopback(
     tx: tokio::sync::mpsc::Sender<EncodedAudio>,
     stop: &AtomicBool,
 ) -> Result<()> {
-    use windows::core::Interface;
     use windows::Win32::Media::Audio::{
         eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
         AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_S_BUFFER_EMPTY,
@@ -617,13 +735,24 @@ fn capture_loopback(
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .context("audio device enumerator")?;
-        let device = enumerator
-            .GetDefaultAudioEndpoint(eRender, eConsole)
-            .context("default speakers")?;
-        let client: IAudioClient = device.Activate(CLSCTX_ALL, None).context("audio client")?;
+        let client = match excluding_this_app() {
+            Ok(client) => {
+                session_log("system audio: loopback excluding this app");
+                client
+            }
+            Err(err) => {
+                session_log(&format!(
+                    "system audio: could not leave this app out of the capture ({err:#})"
+                ));
+                let enumerator: IMMDeviceEnumerator =
+                    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                        .context("audio device enumerator")?;
+                let device = enumerator
+                    .GetDefaultAudioEndpoint(eRender, eConsole)
+                    .context("default speakers")?;
+                device.Activate(CLSCTX_ALL, None).context("audio client")?
+            }
+        };
         let mix = client.GetMixFormat().context("mix format")?;
         let format = &*mix;
         let rate = format.nSamplesPerSec;
@@ -735,6 +864,13 @@ fn is_float(format: &windows::Win32::Media::Audio::WAVEFORMATEX) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_gain_doubles_a_quiet_sample_and_stops_at_full_scale() {
+        assert!((heard(0.25, 200) - 0.5).abs() < 0.0001);
+        assert_eq!(heard(0.8, 200), 1.0);
+        assert_eq!(heard(0.8, 0), 0.0);
+    }
 
     #[test]
     fn opus_roundtrip_keeps_a_tone() {

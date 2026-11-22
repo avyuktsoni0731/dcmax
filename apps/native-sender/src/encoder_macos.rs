@@ -471,6 +471,11 @@ fn open_stream(
         .with_excludes_current_process_audio(true)
         .with_sample_rate(48_000)
         .with_channel_count(2);
+    // The microphone already travels on the voice room. Leaving it in the
+    // screen capture plays that same voice again, a little later.
+    if stream_config.set_captures_microphone(false).is_err() {
+        crate::audio::session_log("system audio: this macOS does not separate the microphone");
+    }
     if let Err(err) = stream_config.set_preserves_aspect_ratio(true) {
         eprintln!("keeping the display's aspect ratio is unavailable: {err}");
     }
@@ -497,7 +502,10 @@ fn open_stream(
             if let Err(err) = stream.add_output_handler(audio, SCStreamOutputType::Audio) {
                 crate::audio::session_log(&format!("system audio: {err}"));
             } else {
-                crate::audio::session_log("system audio: screencapturekit 48 kHz");
+                crate::audio::session_log(&format!(
+                    "system audio: screencapturekit 48 kHz exclude_app={}",
+                    stream_config.excludes_current_process_audio()
+                ));
             }
         }
         Err(err) => crate::audio::session_log(&format!("system audio: {err:#}")),

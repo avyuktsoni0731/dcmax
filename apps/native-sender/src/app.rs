@@ -18,7 +18,7 @@ use livekit::prelude::*;
 use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
 use livekit::webrtc::video_source::{native::NativeVideoSource, RtcVideoSource, VideoResolution};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,7 @@ struct Stage {
     ended: AtomicBool,
     clock: Arc<PlayClock>,
     stats: PictureStats,
+    screen_gain: Arc<AtomicU32>,
 }
 
 /// Counters for one watched picture. The play thread and the window both
@@ -80,6 +81,8 @@ enum Cmd {
     StopShare,
     Tune(PictureSettings),
     Mute(bool),
+    Voice(u32),
+    Screen(u32),
     Leave,
 }
 
@@ -103,6 +106,16 @@ enum Note {
     Joined,
     Left,
     Sharing(bool),
+    People(Vec<Person>),
+}
+
+/// Someone in the room. `speaking` follows the voice activity from the room,
+/// so the window can draw a ring while that person is talking.
+#[derive(Clone, Debug)]
+pub struct Person {
+    pub name: String,
+    pub local: bool,
+    pub speaking: bool,
 }
 
 struct Joined {
@@ -140,6 +153,7 @@ pub enum EngineNote {
     Joined,
     Left,
     Sharing(bool),
+    People(Vec<Person>),
 }
 
 /// The call thread the window talks to. Voice, capture, and the picture stay
@@ -159,6 +173,7 @@ impl Engine {
             ended: AtomicBool::new(false),
             clock: PlayClock::new(),
             stats: PictureStats::new(),
+            screen_gain: Arc::new(AtomicU32::new(100)),
         });
         let stage_thread = Arc::clone(&stage);
         std::thread::Builder::new()
@@ -243,6 +258,20 @@ impl Engine {
         Ok(())
     }
 
+    pub fn set_voice(&self, percent: u32) -> Result<()> {
+        self.commands
+            .send(Cmd::Voice(percent.min(200)))
+            .map_err(|_| anyhow!("the call runtime stopped"))?;
+        Ok(())
+    }
+
+    pub fn set_screen(&self, percent: u32) -> Result<()> {
+        self.commands
+            .send(Cmd::Screen(percent.min(200)))
+            .map_err(|_| anyhow!("the call runtime stopped"))?;
+        Ok(())
+    }
+
     pub fn poll(&self) -> Option<EngineNote> {
         let guard = self.notes.lock().ok()?;
         let note = guard.as_ref()?.try_recv().ok()?;
@@ -251,6 +280,7 @@ impl Engine {
             Note::Joined => EngineNote::Joined,
             Note::Left => EngineNote::Left,
             Note::Sharing(on) => EngineNote::Sharing(on),
+            Note::People(people) => EngineNote::People(people),
         })
     }
 
@@ -548,6 +578,7 @@ impl MyCord {
                         self.status = format!("In {}", self.room);
                     }
                 }
+                Note::People(_) => {}
             }
         }
         if self.stage.ended.swap(false, Ordering::AcqRel) {
@@ -1448,12 +1479,66 @@ fn glyph(painter: &egui::Painter, rect: egui::Rect, glyph: Glyph, color: egui::C
     }
 }
 
+fn person_name(identity: impl std::fmt::Display, name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        identity.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn roster(call: &Joined, speaking: &std::collections::HashSet<String>) -> Vec<Person> {
+    let local = call.room.local_participant();
+    let local_id = local.identity().to_string();
+    let mut people = vec![Person {
+        name: person_name(&local_id, &local.name()),
+        local: true,
+        speaking: speaking.contains(&local_id),
+    }];
+    let mut remote: Vec<_> = call.room.remote_participants().into_values().collect();
+    remote.sort_by(|left, right| {
+        person_name(left.identity(), &left.name()).cmp(&person_name(right.identity(), &right.name()))
+    });
+    for person in remote {
+        let id = person.identity().to_string();
+        people.push(Person {
+            name: person_name(&id, &person.name()),
+            local: false,
+            speaking: speaking.contains(&id),
+        });
+    }
+    people
+}
+
+fn note_people(
+    call: &Joined,
+    speaking: &std::collections::HashSet<String>,
+    notes: &std::sync::mpsc::Sender<Note>,
+    key: &mut String,
+) {
+    let people = roster(call, speaking);
+    let next = people
+        .iter()
+        .map(|person| format!("{}:{}:{}", person.name, u8::from(person.local), u8::from(person.speaking)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if next == *key {
+        return;
+    }
+    *key = next;
+    let _ = notes.send(Note::People(people));
+}
+
 async fn session(
     mut cmd: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
     notes: std::sync::mpsc::Sender<Note>,
     stage: Arc<Stage>,
 ) {
     let mut call: Option<Joined> = None;
+    let mut speaking: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut people_key = String::new();
+    let mut voice_gain = 100u32;
     loop {
         let event = async {
             match call.as_mut() {
@@ -1472,6 +1557,7 @@ async fn session(
                         match connect(&settings, Arc::clone(&stage)).await {
                             Ok((joined, warning)) => {
                                 let _ = notes.send(Note::Joined);
+                                note_people(&joined, &speaking, &notes, &mut people_key);
                                 if let Some(text) = warning {
                                     let _ = notes.send(Note::Status(text));
                                 }
@@ -1514,11 +1600,24 @@ async fn session(
                             }
                         }
                     }
+                    Cmd::Voice(percent) => {
+                        voice_gain = percent.min(200);
+                        if let Some(call) = call.as_ref() {
+                            for audio in &call.remote_audio {
+                                crate::audio::set_remote_volume(audio, voice_gain);
+                            }
+                        }
+                    }
+                    Cmd::Screen(percent) => {
+                        stage.screen_gain.store(percent.min(200), Ordering::Relaxed);
+                    }
                     Cmd::Leave => {
                         if let Some(mut call) = call.take() {
                             call.playback_stop.store(true, Ordering::Release);
                             stop_share(&mut call).await;
                             let _ = tokio::time::timeout(Duration::from_secs(2), call.room.close()).await;
+                            speaking.clear();
+                            people_key.clear();
                             let _ = notes.send(Note::Left);
                         }
                     }
@@ -1547,13 +1646,30 @@ async fn session(
                             call.playback_stop.store(true, Ordering::Release);
                             stop_share(&mut call).await;
                         }
+                        speaking.clear();
+                        people_key.clear();
                         let _ = notes.send(Note::Status(format!("The room disconnected ({reason:?}).")));
                         let _ = notes.send(Note::Left);
+                    }
+                    Some(RoomEvent::ParticipantConnected(_)) | Some(RoomEvent::ParticipantDisconnected(_)) => {
+                        if let Some(call) = call.as_ref() {
+                            note_people(call, &speaking, &notes, &mut people_key);
+                        }
+                    }
+                    Some(RoomEvent::ActiveSpeakersChanged { speakers }) => {
+                        speaking.clear();
+                        for speaker in speakers {
+                            speaking.insert(speaker.identity().to_string());
+                        }
+                        if let Some(call) = call.as_ref() {
+                            note_people(call, &speaking, &notes, &mut people_key);
+                        }
                     }
                     Some(RoomEvent::TrackSubscribed { track, publication, participant }) => {
                         match track {
                             RemoteTrack::Audio(audio) => {
                                 audio.enable();
+                                crate::audio::set_remote_volume(&audio, voice_gain);
                                 crate::audio::session_log(&format!("voice from {}", participant.identity()));
                                 if let Some(call) = call.as_mut() {
                                     call.remote_audio.push(audio);
@@ -1582,6 +1698,8 @@ async fn session(
                     Some(_) => {}
                     None => {
                         call = None;
+                        speaking.clear();
+                        people_key.clear();
                         let _ = notes.send(Note::Left);
                     }
                 }
@@ -2039,7 +2157,11 @@ fn call_config(settings: &CallSettings, picture: &PictureSettings) -> AppConfig 
 }
 
 fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<AtomicBool>) {
-    let player = match AudioPlayer::start_synced(Arc::new(AtomicBool::new(false)), Arc::clone(&stage.clock)) {
+    let player = match AudioPlayer::start_synced(
+        Arc::new(AtomicBool::new(false)),
+        Arc::clone(&stage.clock),
+        Arc::clone(&stage.screen_gain),
+    ) {
         Ok(player) => Some(player),
         Err(err) => {
             note_log(&format!("desktop audio player: {err:#}"));
@@ -2469,6 +2591,7 @@ mod tests {
             ended: AtomicBool::new(false),
             clock: PlayClock::new(),
             stats: PictureStats::new(),
+            screen_gain: Arc::new(AtomicU32::new(100)),
         };
         store_frame(
             &stage,
