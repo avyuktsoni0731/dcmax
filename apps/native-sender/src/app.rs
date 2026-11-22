@@ -112,6 +112,7 @@ struct Joined {
     _audio: PlatformAudio,
     remote_audio: Vec<RemoteAudioTrack>,
     fan: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    room_picture: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
     host: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
     stop_share: Option<tokio::sync::watch::Sender<bool>>,
     tune: Option<tokio::sync::watch::Sender<PictureSettings>>,
@@ -1525,9 +1526,20 @@ async fn session(
             }
             event = event => {
                 match event {
-                    Some(RoomEvent::DataReceived { payload, topic, .. }) if topic.as_deref() == Some(TOPIC) => {
+                    Some(RoomEvent::DataReceived { payload, topic, participant, .. }) => {
                         if let Some(call) = call.as_ref() {
-                            let _ = call.fan.send(payload.to_vec());
+                            if topic.as_deref() == Some(TOPIC) {
+                                let _ = call.fan.send(payload.to_vec());
+                            } else if topic.as_deref() == Some(direct::ROOM_TOPIC) {
+                                let from = participant
+                                    .as_ref()
+                                    .map(|person| person.identity().to_string())
+                                    .unwrap_or_default();
+                                let mine = call.room.local_participant().identity().to_string();
+                                if from.is_empty() || from != mine {
+                                    let _ = call.room_picture.send((from, payload.to_vec()));
+                                }
+                            }
                         }
                     }
                     Some(RoomEvent::Disconnected { reason }) => {
@@ -1538,13 +1550,22 @@ async fn session(
                         let _ = notes.send(Note::Status(format!("The room disconnected ({reason:?}).")));
                         let _ = notes.send(Note::Left);
                     }
-                    Some(RoomEvent::TrackSubscribed { track, participant, .. }) => {
-                        if let RemoteTrack::Audio(audio) = track {
-                            audio.enable();
-                            crate::audio::session_log(&format!("voice from {}", participant.identity()));
-                            if let Some(call) = call.as_mut() {
-                                call.remote_audio.push(audio);
+                    Some(RoomEvent::TrackSubscribed { track, publication, participant }) => {
+                        match track {
+                            RemoteTrack::Audio(audio) => {
+                                audio.enable();
+                                crate::audio::session_log(&format!("voice from {}", participant.identity()));
+                                if let Some(call) = call.as_mut() {
+                                    call.remote_audio.push(audio);
+                                }
                             }
+                            RemoteTrack::Video(_) if publication.source() == TrackSource::Screenshare => {
+                                // The picture the window draws is the direct stream, or the
+                                // same bytes through the room. This extra copy would use the
+                                // uplink twice and still would not be drawn.
+                                publication.set_subscribed(false);
+                            }
+                            _ => {}
                         }
                     }
                     Some(RoomEvent::TrackUnsubscribed { track, .. }) => {
@@ -1638,6 +1659,12 @@ async fn connect(settings: &CallSettings, stage: Arc<Stage>) -> Result<(Joined, 
         .spawn(move || play_picture(listener, stage, stop))
         .context("picture playback")?;
     let (fan, mut fan_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (room_picture, room_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+    let room_playback = playback;
+    let room_stop = Arc::clone(&playback_stop);
+    tokio::spawn(async move {
+        direct::play_room(room_rx, room_playback, room_stop).await;
+    });
     let follow_slot: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>> = Arc::new(Mutex::new(None));
     let host_slot: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>> = Arc::new(Mutex::new(None));
     let follow_for_fan = Arc::clone(&follow_slot);
@@ -1685,6 +1712,7 @@ async fn connect(settings: &CallSettings, stage: Arc<Stage>) -> Result<(Joined, 
         _audio: audio,
         remote_audio: Vec::new(),
         fan,
+        room_picture,
         host: host_slot,
         stop_share: None,
         tune: None,

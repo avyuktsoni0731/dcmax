@@ -2,17 +2,24 @@
 //! address. The apps exchange that address over the LiveKit data channel, punch
 //! a UDP mapping, then carry the existing picture bytes on a reliable stream.
 //! The video does not go through a server when the punch works.
+//!
+//! Two networks that cannot punch still need a picture. The same bytes then
+//! ride the room that already carries the microphone, in order, and the watcher
+//! plays them through the same local player.
 
 use anyhow::{bail, Context, Result};
 use livekit::prelude::*;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 pub const TOPIC: &str = "picture-direct";
+/// Picture bytes when the two computers cannot punch a direct path.
+pub const ROOM_TOPIC: &str = "picture-room";
 
 const COOKIE: u32 = 0x2112_A442;
 const PUNCH: &[u8] = b"dcmax-punch";
@@ -60,9 +67,9 @@ pub async fn host(
         .await
         .context("address lookup")??;
     let mine = make_cert()?;
-    println!("picture direct: this app is at {}", join_addrs(&candidates));
+    log_line(&format!("picture direct: this app is at {}", join_addrs(&candidates)));
     let endpoint = server_endpoint(socket, &mine)?;
-    println!("picture direct: listening");
+    log_line("picture direct: listening");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let local = listener.local_addr()?;
     let card = Card {
@@ -74,13 +81,19 @@ pub async fn host(
     };
     let payload = serde_json::to_vec(&card)?;
     let (alive_tx, alive_rx) = tokio::sync::watch::channel(true);
+    let (announce_tx, announce_rx) = tokio::sync::watch::channel(true);
+    let announcer = participant.clone();
     tokio::spawn(async move {
         let mut incoming = incoming;
+        let announce_rx = announce_rx;
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let _ = participant
+                    if !*announce_rx.borrow() {
+                        continue;
+                    }
+                    let _ = announcer
                         .publish_data(DataPacket {
                             payload: payload.clone(),
                             topic: Some(TOPIC.to_string()),
@@ -99,40 +112,7 @@ pub async fn host(
         }
     });
     tokio::spawn(async move {
-        let mut alive_rx = alive_rx;
-        loop {
-            if !*alive_rx.borrow() {
-                break;
-            }
-            let connecting = tokio::select! {
-                _ = alive_rx.changed() => break,
-                conn = endpoint.accept() => conn,
-            };
-            let Some(connecting) = connecting else {
-                break;
-            };
-            let Ok(connection) = connecting.await else {
-                continue;
-            };
-            // The sender opens the stream. Quinn does not tell the watcher a
-            // stream exists until this side writes, and the watcher has nothing
-            // to write until a frame has already arrived.
-            let Ok((send, recv)) = connection.open_bi().await else {
-                continue;
-            };
-            // Accept the local sender only once the watcher is on this stream.
-            // Accepting earlier fills the socket with frames, the queue then
-            // drops the rest, and the watcher is left with a single frame.
-            let Ok(accepted) = tokio::time::timeout(Duration::from_secs(30), listener.accept()).await else {
-                continue;
-            };
-            let Ok((tcp, _)) = accepted else {
-                break;
-            };
-            println!("picture direct: carrying the picture");
-            bridge(tcp, send, recv).await;
-            println!("picture direct: picture stopped");
-        }
+        serve(endpoint, listener, alive_rx, announce_tx, participant).await;
     });
     Ok(local)
 }
@@ -157,11 +137,22 @@ pub async fn join_watch(config: crate::config::AppConfig, playback: SocketAddr) 
         .await
         .context("LiveKit room connect failed")?;
     let (tx, incoming) = tokio::sync::mpsc::unbounded_channel();
+    let (room_tx, room_rx) = tokio::sync::mpsc::unbounded_channel();
+    let room_playback = playback;
+    tokio::spawn(async move {
+        play_room(room_rx, room_playback, Arc::new(AtomicBool::new(false))).await;
+    });
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
-            if let RoomEvent::DataReceived { payload, topic, .. } = event {
+            if let RoomEvent::DataReceived { payload, topic, participant, .. } = event {
                 if topic.as_deref() == Some(TOPIC) {
                     let _ = tx.send(payload.to_vec());
+                } else if topic.as_deref() == Some(ROOM_TOPIC) {
+                    let from = participant
+                        .as_ref()
+                        .map(|person| person.identity().to_string())
+                        .unwrap_or_default();
+                    let _ = room_tx.send((from, payload.to_vec()));
                 }
             }
         }
@@ -182,7 +173,7 @@ pub async fn follow(
     let (socket, candidates) = tokio::task::spawn_blocking(prepare)
         .await
         .context("address lookup")??;
-    println!("picture direct: this app is at {}", join_addrs(&candidates));
+    log_line(&format!("picture direct: this app is at {}", join_addrs(&candidates)));
     let card = Card {
         id: identity.to_string(),
         role: "watch".to_string(),
@@ -193,22 +184,23 @@ pub async fn follow(
     let peer = exchange(&participant, &card, &mut incoming, true).await?;
     let targets = peer.targets();
     let expected = unhex(&peer.cert)?;
-    println!("picture direct: other app is at {}", join_addrs(&targets));
+    log_line(&format!("picture direct: other app is at {}", join_addrs(&targets)));
     let (socket, reached) = punch_owned(socket, targets.clone()).await?;
     if !reached.is_empty() {
-        println!("picture direct: reached {}", join_addrs(&reached));
+        log_line(&format!("picture direct: reached {}", join_addrs(&reached)));
     }
     let mut endpoint = client_endpoint(socket, expected)?;
     let connection = connect_first(&mut endpoint, dial_order(&reached, &targets)).await?;
-    let local = tokio::net::TcpStream::connect(playback)
-        .await
-        .context("picture direct: playback pipe")?;
-    println!("picture direct: connected, waiting for the first frame");
+    // Open the stream before touching playback. A direct attempt that never
+    // produces a stream must not sit on the player the room path needs.
     let (send, recv) = connection
         .accept_bi()
         .await
         .context("picture direct: stream")?;
-    println!("picture direct: picture stream open");
+    let local = tokio::net::TcpStream::connect(playback)
+        .await
+        .context("picture direct: playback pipe")?;
+    log_line("picture direct: picture stream open");
     // The host repeats its card once a second while it is sharing. When those
     // cards stop, this picture is over. Closing here lets the watcher drop the
     // frozen frame and accept the next share without leaving the room.
@@ -383,6 +375,433 @@ async fn connect_with_retry(
     }
 }
 
+const DIRECT_WAIT: Duration = Duration::from_secs(4);
+const ROOM_CHUNK: usize = 8_000;
+const ROOM_START: u8 = 1;
+const ROOM_MORE: u8 = 0;
+const ROOM_END: u8 = 2;
+const HOLD_CAP: usize = 8 * 1024 * 1024;
+const FRAME_HEADER: usize = 28;
+const FRAME_MAGIC: u32 = 0x4443_4D58;
+const FRAME_FLAG_KEY: u8 = 0x01;
+const FRAME_FLAG_AUDIO: u8 = 0x02;
+
+enum Choice {
+    Direct {
+        connection: quinn::Connection,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        tcp: tokio::net::TcpStream,
+        prelude: Vec<u8>,
+    },
+    Room {
+        tcp: tokio::net::TcpStream,
+        prelude: Vec<u8>,
+    },
+    Stop,
+}
+
+async fn serve(
+    endpoint: quinn::Endpoint,
+    listener: tokio::net::TcpListener,
+    mut alive: tokio::sync::watch::Receiver<bool>,
+    announce: tokio::sync::watch::Sender<bool>,
+    participant: LocalParticipant,
+) {
+    loop {
+        if !*alive.borrow() {
+            break;
+        }
+        let accepted = tokio::select! {
+            changed = alive.changed() => {
+                if changed.is_err() || !*alive.borrow() {
+                    break;
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let Ok((tcp, _)) = accepted else {
+            break;
+        };
+        match choose(&endpoint, tcp, &mut alive).await {
+            Choice::Direct {
+                connection,
+                mut send,
+                recv,
+                tcp,
+                prelude,
+            } => {
+                log_line("picture direct: carrying the picture");
+                if !prelude.is_empty() && send.write_all(&prelude).await.is_err() {
+                    log_line("picture direct: direct send failed, using the room");
+                    drop(send);
+                    drop(recv);
+                    drop(connection);
+                    carry_room(&participant, tcp, prelude).await;
+                } else {
+                    let _connection = connection;
+                    bridge(tcp, send, recv).await;
+                    log_line("picture direct: picture stopped");
+                }
+            }
+            Choice::Room { tcp, prelude } => {
+                let _ = announce.send(false);
+                log_line("picture room: no direct path, sending through the room");
+                let sending = carry_room(&participant, tcp, prelude);
+                tokio::pin!(sending);
+                loop {
+                    tokio::select! {
+                        _ = &mut sending => break,
+                        incoming = endpoint.accept() => {
+                            // The watcher may still be punching. Refuse it so
+                            // that attempt does not take the local player.
+                            drop(incoming);
+                        }
+                        changed = alive.changed() => {
+                            if changed.is_err() || !*alive.borrow() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            Choice::Stop => return,
+        }
+    }
+}
+
+async fn choose(
+    endpoint: &quinn::Endpoint,
+    mut tcp: tokio::net::TcpStream,
+    alive: &mut tokio::sync::watch::Receiver<bool>,
+) -> Choice {
+    tcp.set_nodelay(true).ok();
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel(1);
+    let mut hold = Hold::default();
+    let mut buf = vec![0u8; 64 * 1024];
+    let deadline = tokio::time::sleep(DIRECT_WAIT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            changed = alive.changed() => {
+                if changed.is_err() || !*alive.borrow() {
+                    return Choice::Stop;
+                }
+            }
+            _ = &mut deadline => break,
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    return Choice::Stop;
+                };
+                let tx = ready_tx.clone();
+                tokio::spawn(async move {
+                    let Ok(connection) = tokio::time::timeout(Duration::from_secs(3), incoming).await else {
+                        return;
+                    };
+                    let Ok(connection) = connection else {
+                        return;
+                    };
+                    let _ = tx.try_send(connection);
+                });
+            }
+            ready = ready_rx.recv() => {
+                let Some(connection) = ready else {
+                    continue;
+                };
+                match open_picture(connection).await {
+                    Some(opened) => {
+                        return Choice::Direct {
+                            connection: opened.0,
+                            send: opened.1,
+                            recv: opened.2,
+                            tcp,
+                            prelude: hold.take_for_send(),
+                        };
+                    }
+                    None => {}
+                }
+            }
+            read = tcp.read(&mut buf) => match read {
+                Ok(0) | Err(_) => return Choice::Stop,
+                Ok(size) => hold.push(&buf[..size]),
+            },
+        }
+    }
+    if let Ok(connection) = ready_rx.try_recv() {
+        if let Some(opened) = open_picture(connection).await {
+            return Choice::Direct {
+                connection: opened.0,
+                send: opened.1,
+                recv: opened.2,
+                tcp,
+                prelude: hold.take_for_send(),
+            };
+        }
+    }
+    Choice::Room {
+        tcp,
+        prelude: hold.take_for_send(),
+    }
+}
+
+async fn open_picture(
+    connection: quinn::Connection,
+) -> Option<(quinn::Connection, quinn::SendStream, quinn::RecvStream)> {
+    match tokio::time::timeout(Duration::from_secs(2), connection.open_bi()).await {
+        Ok(Ok((send, recv))) => Some((connection, send, recv)),
+        _ => None,
+    }
+}
+
+async fn carry_room(participant: &LocalParticipant, mut tcp: tokio::net::TcpStream, pending: Vec<u8>) {
+    let mut started = false;
+    if !pending.is_empty() && !send_chunks(participant, &pending, &mut started).await {
+        let _ = publish_room(participant, vec![ROOM_END]).await;
+        return;
+    }
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let size = match tcp.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(size) => size,
+        };
+        if !send_chunks(participant, &buf[..size], &mut started).await {
+            let _ = publish_room(participant, vec![ROOM_END]).await;
+            return;
+        }
+    }
+    if started {
+        let _ = publish_room(participant, vec![ROOM_END]).await;
+        log_line("picture room: share ended");
+    }
+}
+
+async fn send_chunks(participant: &LocalParticipant, bytes: &[u8], started: &mut bool) -> bool {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = (offset + ROOM_CHUNK).min(bytes.len());
+        let mut packet = Vec::with_capacity(1 + end - offset);
+        packet.push(if *started { ROOM_MORE } else { ROOM_START });
+        if !*started {
+            log_line("picture room: sending picture bytes");
+        }
+        *started = true;
+        packet.extend_from_slice(&bytes[offset..end]);
+        offset = end;
+        if !publish_room(participant, packet).await {
+            return false;
+        }
+    }
+    true
+}
+
+async fn publish_room(participant: &LocalParticipant, payload: Vec<u8>) -> bool {
+    for _ in 0..3 {
+        let sent = participant
+            .publish_data(DataPacket {
+                payload: payload.clone(),
+                topic: Some(ROOM_TOPIC.to_string()),
+                reliable: true,
+                destination_identities: Vec::new(),
+            })
+            .await;
+        if sent.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    log_line("picture room: the room did not take the picture");
+    false
+}
+
+/// Play picture bytes that arrived through the room. Direct playback is a
+/// different connection, used only when that path opens a stream.
+pub async fn play_room(
+    mut incoming: UnboundedReceiver<(String, Vec<u8>)>,
+    playback: SocketAddr,
+    stop: Arc<AtomicBool>,
+) {
+    let mut writer: Option<tokio::net::tcp::OwnedWriteHalf> = None;
+    let mut active: Option<String> = None;
+    let mut idle = tokio::time::Instant::now();
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let packet = tokio::select! {
+            packet = incoming.recv() => packet,
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                if writer.is_some() && idle.elapsed() > Duration::from_secs(3) {
+                    log_line("picture room: sender stopped");
+                    writer = None;
+                    active = None;
+                }
+                continue;
+            }
+        };
+        let Some((from, packet)) = packet else {
+            break;
+        };
+        if packet.is_empty() {
+            continue;
+        }
+        if active.as_ref().is_some_and(|current| current != &from) && packet[0] != ROOM_START {
+            continue;
+        }
+        idle = tokio::time::Instant::now();
+        match packet[0] {
+            ROOM_START => {
+                active = Some(from);
+                writer = None;
+                match tokio::net::TcpStream::connect(playback).await {
+                    Ok(stream) => {
+                        stream.set_nodelay(true).ok();
+                        log_line("picture room: connected");
+                        let (_read, mut write) = stream.into_split();
+                        if packet.len() > 1 && write.write_all(&packet[1..]).await.is_err() {
+                            log_line("picture room: playback write stopped");
+                            continue;
+                        }
+                        writer = Some(write);
+                    }
+                    Err(err) => log_line(&format!("picture room: playback did not open ({err})")),
+                }
+            }
+            ROOM_MORE => {
+                if let Some(write) = writer.as_mut() {
+                    if write.write_all(&packet[1..]).await.is_err() {
+                        log_line("picture room: playback write stopped");
+                        writer = None;
+                    }
+                }
+            }
+            ROOM_END => {
+                writer = None;
+                log_line("picture room: share ended");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Bytes already read from the sender, kept aligned to picture frames.
+/// A keyframe is the first byte a watcher can decode, so anything older than
+/// the latest keyframe is dropped once the buffer grows.
+#[derive(Default)]
+struct Hold {
+    buf: Vec<u8>,
+}
+
+impl Hold {
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        self.shrink();
+    }
+
+    fn shrink(&mut self) {
+        let mut pos = 0usize;
+        let mut key_at = None;
+        let mut complete = 0usize;
+        while pos + FRAME_HEADER <= self.buf.len() {
+            let magic = u32::from_le_bytes(self.buf[pos..pos + 4].try_into().unwrap());
+            if magic != FRAME_MAGIC {
+                pos += 1;
+                continue;
+            }
+            let flags = self.buf[pos + 5];
+            let len = u32::from_le_bytes(self.buf[pos + 12..pos + 16].try_into().unwrap()) as usize;
+            if len > 8 * 1024 * 1024 {
+                pos += 1;
+                continue;
+            }
+            if pos + FRAME_HEADER + len > self.buf.len() {
+                break;
+            }
+            if flags & FRAME_FLAG_KEY != 0 && flags & FRAME_FLAG_AUDIO == 0 {
+                key_at = Some(pos);
+            }
+            pos += FRAME_HEADER + len;
+            complete = pos;
+        }
+        if self.buf.len() > HOLD_CAP {
+            if let Some(key) = key_at {
+                if key > 0 {
+                    self.buf.drain(..key);
+                }
+            } else if complete > 0 && complete < self.buf.len() {
+                self.buf.drain(..complete);
+            } else if complete > 0 {
+                self.buf.clear();
+            }
+        }
+        self.drop_before_key();
+    }
+
+    fn drop_before_key(&mut self) {
+        let Some(key) = self.first_key() else {
+            return;
+        };
+        if key > 0 {
+            self.buf.drain(..key);
+        }
+    }
+
+    fn first_key(&self) -> Option<usize> {
+        let mut pos = 0usize;
+        while pos + FRAME_HEADER <= self.buf.len() {
+            let magic = u32::from_le_bytes(self.buf[pos..pos + 4].try_into().unwrap());
+            if magic != FRAME_MAGIC {
+                return None;
+            }
+            let flags = self.buf[pos + 5];
+            let len = u32::from_le_bytes(self.buf[pos + 12..pos + 16].try_into().unwrap()) as usize;
+            if len > 8 * 1024 * 1024 {
+                return None;
+            }
+            if flags & FRAME_FLAG_KEY != 0 && flags & FRAME_FLAG_AUDIO == 0 {
+                return Some(pos);
+            }
+            if pos + FRAME_HEADER + len > self.buf.len() {
+                return None;
+            }
+            pos += FRAME_HEADER + len;
+        }
+        None
+    }
+
+    fn take_for_send(&mut self) -> Vec<u8> {
+        let mut pos = 0usize;
+        let mut latest = None;
+        while pos + FRAME_HEADER <= self.buf.len() {
+            let magic = u32::from_le_bytes(self.buf[pos..pos + 4].try_into().unwrap());
+            if magic != FRAME_MAGIC {
+                break;
+            }
+            let flags = self.buf[pos + 5];
+            let len = u32::from_le_bytes(self.buf[pos + 12..pos + 16].try_into().unwrap()) as usize;
+            if len > 8 * 1024 * 1024 || pos + FRAME_HEADER + len > self.buf.len() {
+                break;
+            }
+            if flags & FRAME_FLAG_KEY != 0 && flags & FRAME_FLAG_AUDIO == 0 {
+                latest = Some(pos);
+            }
+            pos += FRAME_HEADER + len;
+        }
+        if let Some(key) = latest {
+            if key > 0 {
+                self.buf.drain(..key);
+            }
+        }
+        std::mem::take(&mut self.buf)
+    }
+}
+
+fn log_line(line: &str) {
+    println!("{line}");
+    crate::audio::session_log(line);
+}
+
 async fn bridge(local: tokio::net::TcpStream, mut send: quinn::SendStream, mut recv: quinn::RecvStream) {
     local.set_nodelay(true).ok();
     let (mut reader, mut writer) = local.into_split();
@@ -476,9 +895,26 @@ fn local_candidates(port: u16) -> Vec<SocketAddr> {
 
 fn virtual_adapter(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    ["virtualbox", "vmware", "hyper-v", "vethernet", "docker", "bluetooth", "teredo", "wsl"]
-        .iter()
-        .any(|label| name.contains(label))
+    [
+        "virtualbox",
+        "vmware",
+        "hyper-v",
+        "vethernet",
+        "docker",
+        "bluetooth",
+        "teredo",
+        "wsl",
+        "awdl",
+        "llw",
+        "bridge",
+        "gif",
+        "stf",
+        "pktap",
+        "ipsec",
+        "anpi",
+    ]
+    .iter()
+    .any(|label| name.contains(label))
 }
 
 fn rank(addr: &SocketAddr) -> u8 {
@@ -486,9 +922,9 @@ fn rank(addr: &SocketAddr) -> u8 {
         return 3;
     };
     let [first, second, third, _] = ip.octets();
-    // VirtualBox's host-only network. It is a private address on this PC and
-    // is not reachable from the other machine.
-    if first == 192 && second == 168 && third == 56 {
+    // VirtualBox's host-only network, and the iPhone USB/hotspot range. Both
+    // are private addresses on this computer and are not the other machine's path.
+    if (first == 192 && second == 168 && third == 56) || (first == 172 && second == 20 && third == 10) {
         return 5;
     }
     if ip.is_private() {
@@ -861,5 +1297,38 @@ mod tests {
         assert_eq!(&buf, b"frame");
         send.write_all(b"audio").await.unwrap();
         server.await.unwrap();
+    }
+
+    fn picture_frame(key: bool, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
+        bytes.push(2);
+        bytes.push(if key { FRAME_FLAG_KEY } else { 0 });
+        bytes.push(0);
+        bytes.push(0);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1i64.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn held_picture_starts_at_a_keyframe() {
+        let mut hold = Hold::default();
+        hold.push(&picture_frame(false, b"old"));
+        let key = picture_frame(true, b"key");
+        assert_eq!(key.len(), FRAME_HEADER + 3);
+        hold.push(&key[..10]);
+        hold.push(&key[10..]);
+        hold.push(&picture_frame(false, b"next"));
+        let newer = picture_frame(true, b"new");
+        hold.push(&newer);
+        let bytes = hold.take_for_send();
+        assert!(bytes.starts_with(&newer));
+        assert!(!bytes.windows(3).any(|win| win == b"old"));
+        assert!(!bytes.windows(4).any(|win| win == b"next"));
     }
 }

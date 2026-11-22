@@ -20,6 +20,8 @@ If more than one screen is connected, Share screen asks which one to send. Full 
 
 Voice is the room microphone, separate from the sound inside a screen share. Join opens the microphone on the window thread. If neither person can be heard, allow the microphone for MyCord Shell in System Settings and join again. A remote voice track is kept for the whole call.
 
+On the same network the picture goes directly from one computer to the other. On a different network that direct path cannot open, so the same picture goes through the room instead. Both people need this version of the app for that.
+
 ## Build again
 
 ```bash
