@@ -653,6 +653,7 @@ impl windows::Win32::Media::Audio::IActivateAudioInterfaceCompletionHandler_Impl
         &self,
         operation: windows::core::Ref<windows::Win32::Media::Audio::IActivateAudioInterfaceAsyncOperation>,
     ) -> windows::core::Result<()> {
+        use windows::core::Interface;
         let client = unsafe {
             let operation = operation.ok()?;
             let mut hr = windows::core::HRESULT(0);
