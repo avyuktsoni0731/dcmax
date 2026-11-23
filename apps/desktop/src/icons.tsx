@@ -80,6 +80,110 @@ export function DarkIcon(props: IconProps) {
   );
 }
 
+export function HomeIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z" />
+    </Glyph>
+  );
+}
+
+export function FriendsIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z" />
+    </Glyph>
+  );
+}
+
+export function RecentsIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z" />
+    </Glyph>
+  );
+}
+
+export function MessagesIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M20 2H4c-1.1 0-1.99.9-1.99 2L2 22l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-2 12H6v-2h12v2zm0-3H6V9h12v2zm0-3H6V6h12v2z" />
+    </Glyph>
+  );
+}
+
+export function SettingsIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z" />
+    </Glyph>
+  );
+}
+
+export function PhoneIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z" />
+    </Glyph>
+  );
+}
+
+export function MonitorIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M21 2H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h7v2H8v2h8v-2h-2v-2h7c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H3V4h18v12z" />
+    </Glyph>
+  );
+}
+
+export function AddIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
+    </Glyph>
+  );
+}
+
+export function SearchIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z" />
+    </Glyph>
+  );
+}
+
+export function SendIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z" />
+    </Glyph>
+  );
+}
+
+export function ChevronIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M7.41 8.59 12 13.17l4.59-4.58L18 10l-6 6-6-6z" />
+    </Glyph>
+  );
+}
+
+export function HeadphonesIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M12 1a9 9 0 0 0-9 9v7c0 1.66 1.34 3 3 3h3v-8H5v-2c0-3.87 3.13-7 7-7s7 3.13 7 7v2h-4v8h3c1.66 0 3-1.34 3-3v-7a9 9 0 0 0-9-9z" />
+    </Glyph>
+  );
+}
+
+export function ArrowIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+    </Glyph>
+  );
+}
+
 export function LightIcon(props: IconProps) {
   return (
     <Glyph {...props}>
