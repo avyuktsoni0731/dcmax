@@ -218,7 +218,7 @@ export function App() {
         setBusy(false);
       } else if (note.kind === "joined") {
         setPhase("call");
-        setStatus("You're in the room.");
+        setStatus("");
         setBusy(false);
         remotesRef.current = null;
         playJoined();
@@ -245,7 +245,7 @@ export function App() {
       } else if (note.kind === "sharing") {
         setSharing(note.on);
         sharingRef.current = note.on;
-        setStatus(note.on ? "Sharing your screen." : "You're in the room.");
+        setStatus(note.on ? "Sharing your screen." : "");
       } else if (note.kind === "people") {
         setPeople(note.people);
         const remotes = note.people.filter((person) => !person.local);
@@ -269,7 +269,9 @@ export function App() {
           window.setTimeout(() => playEnter(), 220);
         }
         if (!sharingRef.current) {
-          setStatus(names.length > 0 ? `In the room with ${names.join(", ")}` : "You're in the room.");
+          setStatus((current) => (
+            /microphone|could not|did not/i.test(current) ? current : ""
+          ));
         }
         if (remotes.length > 0) {
           commit((current) => {
@@ -345,7 +347,7 @@ export function App() {
     if (!menu) return;
     const close = (event: PointerEvent) => {
       const target = event.target;
-      if (target instanceof Element && target.closest(".tool, .menu")) return;
+      if (target instanceof Element && target.closest(".tool, .strip")) return;
       setMenu(null);
     };
     window.addEventListener("pointerdown", close);
@@ -515,11 +517,52 @@ export function App() {
               <strong>{room || "Room"}</strong>
               <span>{Math.max(people.length, 1)} {Math.max(people.length, 1) === 1 ? "person" : "people"}</span>
             </div>
-            <div className="call-live">{notice ?? status}</div>
+            <div className={`call-live${status && /microphone|could not|did not/i.test(status) ? " warn" : ""}`}>{notice ?? status}</div>
           </header>
           <div className="stage" id="stage">
             <div className="stage-copy">{sharing ? "Sharing your screen." : "Waiting for a screen."}</div>
           </div>
+          {menu === "audio" ? (
+            <div className="strip" role="dialog" aria-label="Audio boost">
+              <label>
+                Voice
+                <input type="range" min={0} max={200} step={5} value={voice} aria-label="Other person's volume" onChange={(event) => changeVoice(Number(event.target.value))} />
+              </label>
+              <strong className="boost-read">{voice}%</strong>
+              <label>
+                Screen
+                <input type="range" min={0} max={200} step={5} value={screen} aria-label="Screen audio volume" onChange={(event) => changeScreen(Number(event.target.value))} />
+              </label>
+              <strong className="boost-read">{screen}%</strong>
+            </div>
+          ) : null}
+          {menu === "share" ? (
+            <div className="strip" role="dialog" aria-label="Screen share settings">
+              <label>
+                Resolution
+                <select aria-label="Resolution" value={resolution} onChange={(event) => tune({ resolution: Number(event.target.value) })}>
+                  {RESOLUTIONS.map((item, index) => (
+                    <option key={item.label} value={index}>{item.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Framerate
+                <select aria-label="Frame rate" value={fps} onChange={(event) => tune({ fps: Number(event.target.value) })}>
+                  <option value={30}>30 Hz</option>
+                  <option value={60}>60 Hz</option>
+                </select>
+              </label>
+              <label>
+                Bitrate
+                <select aria-label="Bitrate" value={bitrate} onChange={(event) => tune({ bitrate: Number(event.target.value) })}>
+                  {BITRATES.map((value) => (
+                    <option key={value} value={value}>{value / 1000} Mbps</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          ) : null}
           <div className="call-dock">
             <button
               className={`who${talking ? " speaking" : ""}`}
@@ -559,20 +602,6 @@ export function App() {
                 <button className="caret" type="button" aria-label="Voice volume" onClick={() => setMenu(menu === "audio" ? null : "audio")}>
                   <ChevronIcon size={18} />
                 </button>
-                {menu === "audio" ? (
-                  <div className="menu" role="dialog" aria-label="Audio boost">
-                    <label>
-                      Voice
-                      <input type="range" min={0} max={200} step={5} value={voice} aria-label="Other person's volume" onChange={(event) => changeVoice(Number(event.target.value))} />
-                      <span className="boost-read">{voice}%</span>
-                    </label>
-                    <label>
-                      Screen
-                      <input type="range" min={0} max={200} step={5} value={screen} aria-label="Screen audio volume" onChange={(event) => changeScreen(Number(event.target.value))} />
-                      <span className="boost-read">{screen}%</span>
-                    </label>
-                  </div>
-                ) : null}
               </div>
               <div className={`tool${deaf ? " muted" : ""}`} onPointerDown={(event) => event.stopPropagation()}>
                 <button type="button" aria-pressed={deaf} aria-label={deaf ? "Hear the room" : "Silence the room"} onClick={toggleDeaf}>
@@ -587,36 +616,6 @@ export function App() {
                 <button className="caret" type="button" aria-label="Share settings" onClick={() => setMenu(menu === "share" ? null : "share")}>
                   <ChevronIcon size={18} />
                 </button>
-                {menu === "share" ? (
-                  <div className="menu" role="dialog" aria-label="Screen share settings">
-                    <label>
-                      Resolution
-                      <select aria-label="Resolution" value={resolution} onChange={(event) => tune({ resolution: Number(event.target.value) })}>
-                        {RESOLUTIONS.map((item, index) => (
-                          <option key={item.label} value={index}>{item.label}</option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
-                      Framerate
-                      <select aria-label="Frame rate" value={fps} onChange={(event) => tune({ fps: Number(event.target.value) })}>
-                        <option value={30}>30 Hz</option>
-                        <option value={60}>60 Hz</option>
-                      </select>
-                    </label>
-                    <label>
-                      Bitrate
-                      <select aria-label="Bitrate" value={bitrate} onChange={(event) => tune({ bitrate: Number(event.target.value) })}>
-                        {BITRATES.map((value) => (
-                          <option key={value} value={value}>{value / 1000} Mbps</option>
-                        ))}
-                      </select>
-                    </label>
-                    <button className="cream" type="button" onClick={() => void run(shareScreen)}>
-                      {sharing ? "Stop sharing" : "Share screen"}
-                    </button>
-                  </div>
-                ) : null}
               </div>
               <div className="tool">
                 <button

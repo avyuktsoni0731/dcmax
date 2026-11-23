@@ -506,7 +506,8 @@ textarea { height: auto; padding: 10px 12px; resize: vertical; }
   min-width: 0;
 }
 .call-room strong { color: var(--text); font-weight: 620; }
-.call-live { color: var(--green); font-size: 13px; }
+.call-live { color: var(--muted); font-size: 13px; min-height: 1.2em; text-align: right; }
+.call-live.warn { color: var(--danger); }
 
 .stage {
   flex: 1;
@@ -614,33 +615,23 @@ textarea { height: auto; padding: 10px 12px; resize: vertical; }
 .you-tile .avatar { box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18); }
 .you-tile.speaking .avatar { box-shadow: 0 0 0 3px var(--bg), 0 0 0 5px var(--green); }
 
-.menu {
-  position: absolute;
-  left: 50%;
-  bottom: calc(100% + 10px);
-  transform: translateX(-50%);
-  width: 280px;
-  padding: 12px;
+.strip {
+  margin: 10px 16px 0;
+  padding: 10px 12px;
   border-radius: 16px;
   background: var(--card);
   border: 1px solid var(--line);
-  box-shadow: var(--shadow);
-  z-index: 4;
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  align-items: end;
+  gap: 12px;
 }
-.menu label {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 6px 12px;
-  align-items: center;
+.strip label {
+  flex: 1;
+  min-width: 0;
   font-size: 12px;
 }
-.menu label input,
-.menu label select { grid-column: 1 / -1; }
-.menu .cream { width: 100%; margin-top: 4px; }
-.boost-read { font-variant-numeric: tabular-nums; color: var(--text); }
+.strip select { height: 36px; }
+.boost-read { font-variant-numeric: tabular-nums; color: var(--text); font-size: 13px; padding-bottom: 10px; }
 
 input[type="range"] {
   height: 18px;

@@ -340,11 +340,29 @@ fn picture_settings(request: ShareRequest) -> Result<PictureSettings> {
 /// for the process. Join runs this on the window thread. The call thread
 /// then reuses the same device, which is what CoreAudio and a webview need
 /// in order to record and play the room.
+fn start_mic(audio: &PlatformAudio) -> bool {
+    crate::audio::prime_capture_thread();
+    if audio.start_recording().is_ok() {
+        return true;
+    }
+    // The default device can refuse while another listed microphone opens.
+    // A failed init leaves recording uninitialized, so the next device can try.
+    let devices: Vec<_> = audio.recording_devices().collect();
+    for device in devices {
+        if audio.set_recording_device(&device.id).is_ok() && audio.start_recording().is_ok() {
+            crate::audio::session_log(&format!("microphone opened {}", device.name));
+            return true;
+        }
+        crate::audio::session_log(&format!("microphone {} did not open", device.name));
+    }
+    false
+}
+
 pub fn prepare_voice() -> Result<()> {
     static HELD: Mutex<Option<PlatformAudio>> = Mutex::new(None);
     let mut held = HELD.lock().unwrap_or_else(|err| err.into_inner());
     if let Some(audio) = held.as_ref() {
-        if !voice_ready() && audio.start_recording().is_ok() {
+        if !voice_ready() && start_mic(audio) {
             VOICE_READY.store(true, Ordering::Release);
             crate::audio::session_log("microphone recording");
         }
@@ -361,14 +379,11 @@ pub fn prepare_voice() -> Result<()> {
         "speakers: {}",
         if speakers.is_empty() { "none".to_string() } else { speakers.join(", ") }
     ));
-    match audio.start_recording() {
-        Ok(()) => {
-            VOICE_READY.store(true, Ordering::Release);
-            crate::audio::session_log("microphone recording");
-        }
-        Err(err) => {
-            crate::audio::session_log(&format!("microphone did not start: {err}"));
-        }
+    if start_mic(&audio) {
+        VOICE_READY.store(true, Ordering::Release);
+        crate::audio::session_log("microphone recording");
+    } else {
+        crate::audio::session_log("microphone did not start: init_recording failed");
     }
     *held = Some(audio);
     Ok(())
@@ -1733,19 +1748,16 @@ async fn connect(settings: &CallSettings, stage: Arc<Stage>) -> Result<(Joined, 
     let audio = PlatformAudio::new().context("Could not open the microphone")?;
     let voice_warning = if voice_ready() {
         None
+    } else if start_mic(&audio) {
+        VOICE_READY.store(true, Ordering::Release);
+        crate::audio::session_log("microphone recording");
+        None
     } else {
-        match audio.start_recording() {
-            Ok(()) => {
-                VOICE_READY.store(true, Ordering::Release);
-                None
-            }
-            Err(err) => {
-                crate::audio::session_log(&format!("microphone did not start: {err}"));
-                Some(format!(
-                    "The microphone did not start ({err}). Allow the microphone for MyCord Shell in System Settings, then join again. You can still share and hear the room."
-                ))
-            }
-        }
+        crate::audio::session_log("microphone did not start: init_recording failed");
+        Some(
+            "The microphone did not start. Allow the microphone for MyCord Shell, then join again. You can still share and hear the room."
+                .to_string(),
+        )
     };
     let mut options = RoomOptions::default();
     options.auto_subscribe = true;

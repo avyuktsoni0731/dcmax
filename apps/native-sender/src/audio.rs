@@ -20,6 +20,18 @@ const RATE: u32 = 48_000;
 const FRAME: usize = 960;
 const STEREO: usize = FRAME * 2;
 
+/// The microphone is opened from whichever thread joins the room. Windows
+/// audio calls on a thread that never joined COM fail before the first sample.
+pub fn prime_capture_thread() {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+    }
+}
+
 pub fn session_log(line: &str) {
     let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) else {
         return;
@@ -786,7 +798,7 @@ fn capture_loopback(
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let (mut client, process_loopback) = match excluding_this_app() {
+        let (mut client, mut process_loopback) = match excluding_this_app() {
             Ok(client) => {
                 session_log("system audio: loopback excluding this app");
                 (client, true)
@@ -798,7 +810,35 @@ fn capture_loopback(
                 (speaker_client()?, false)
             }
         };
-        let mut mix = client.GetMixFormat().context("mix format")?;
+        // The process-loopback client does not implement GetMixFormat
+        // (0x80004001). Asking it used to end the capture before a single
+        // packet, so the viewer heard the picture and nothing else. The
+        // speakers already know the format the engine is playing.
+        let mut mix = if process_loopback {
+            match client.GetMixFormat() {
+                Ok(format) => format,
+                Err(err) => {
+                    session_log(&format!(
+                        "system audio: process loopback has no mix format ({err}), using the speakers"
+                    ));
+                    match speaker_client().and_then(|speakers| unsafe {
+                        speakers.GetMixFormat().context("speaker mix format")
+                    }) {
+                        Ok(format) => format,
+                        Err(err) => {
+                            session_log(&format!(
+                                "system audio: speaker format failed ({err:#}), opening the speakers directly"
+                            ));
+                            client = speaker_client()?;
+                            process_loopback = false;
+                            client.GetMixFormat().context("mix format")?
+                        }
+                    }
+                }
+            }
+        } else {
+            client.GetMixFormat().context("mix format")?
+        };
         // Process loopback is already a loopback client. Setting the loopback
         // flag again faults inside the audio engine.
         let stream_flags = if process_loopback {
