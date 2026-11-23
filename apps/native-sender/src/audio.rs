@@ -682,13 +682,13 @@ fn excluding_this_app() -> Result<windows::Win32::Media::Audio::IAudioClient> {
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
     };
     use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-    use windows::Win32::System::Com::BLOB;
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::System::Variant::VT_BLOB;
 
+    session_log("system audio: opening process loopback");
     let (tx, rx) = std::sync::mpsc::channel();
     let handler: IActivateAudioInterfaceCompletionHandler = LoopbackReady { done: tx }.into();
-    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+    let params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
@@ -697,13 +697,51 @@ fn excluding_this_app() -> Result<windows::Win32::Media::Audio::IAudioClient> {
             },
         },
     };
+    // The audio engine frees this blob with CoTaskMemFree. A stack address
+    // there is the heap corruption that killed the process on share.
+    let params_bytes = std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>();
+    let params_data = unsafe { windows::Win32::System::Com::CoTaskMemAlloc(params_bytes) };
+    if params_data.is_null() {
+        anyhow::bail!("process loopback alloc");
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            std::ptr::addr_of!(params).cast::<u8>(),
+            params_data.cast::<u8>(),
+            params_bytes,
+        );
+    }
+    #[repr(C)]
+    struct ActivationBlob {
+        vt: u16,
+        reserved1: u16,
+        reserved2: u16,
+        reserved3: u16,
+        size: u32,
+        _pad: u32,
+        data: *mut u8,
+    }
+    let blob = ActivationBlob {
+        vt: VT_BLOB.0,
+        reserved1: 0,
+        reserved2: 0,
+        reserved3: 0,
+        size: params_bytes as u32,
+        _pad: 0,
+        data: params_data.cast(),
+    };
     let mut prop = PROPVARIANT::default();
+    if std::mem::size_of::<ActivationBlob>() > std::mem::size_of::<PROPVARIANT>() {
+        anyhow::bail!("process loopback property is the wrong size");
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            std::ptr::addr_of!(blob).cast::<u8>(),
+            std::ptr::addr_of_mut!(prop).cast::<u8>(),
+            std::mem::size_of::<ActivationBlob>(),
+        );
+    }
     let operation = unsafe {
-        (*prop.Anonymous.Anonymous).vt = VT_BLOB;
-        (*prop.Anonymous.Anonymous).Anonymous.blob = BLOB {
-            cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-            pBlobData: (&mut params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast(),
-        };
         ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
@@ -721,40 +759,81 @@ fn excluding_this_app() -> Result<windows::Win32::Media::Audio::IAudioClient> {
 }
 
 #[cfg(target_os = "windows")]
+fn speaker_client() -> Result<windows::Win32::Media::Audio::IAudioClient> {
+    use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).context("audio device enumerator")?;
+        let device = enumerator
+            .GetDefaultAudioEndpoint(eRender, eConsole)
+            .context("default speakers")?;
+        device.Activate(CLSCTX_ALL, None).context("audio client")
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn capture_loopback(
     tx: tokio::sync::mpsc::Sender<EncodedAudio>,
     stop: &AtomicBool,
 ) -> Result<()> {
     use windows::Win32::Media::Audio::{
-        eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
-        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_S_BUFFER_EMPTY,
-        MMDeviceEnumerator,
+        IAudioCaptureClient, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+        AUDCLNT_S_BUFFER_EMPTY,
     };
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
-    };
+    use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let client = match excluding_this_app() {
+        let (mut client, process_loopback) = match excluding_this_app() {
             Ok(client) => {
                 session_log("system audio: loopback excluding this app");
-                client
+                (client, true)
             }
             Err(err) => {
                 session_log(&format!(
                     "system audio: could not leave this app out of the capture ({err:#})"
                 ));
-                let enumerator: IMMDeviceEnumerator =
-                    CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                        .context("audio device enumerator")?;
-                let device = enumerator
-                    .GetDefaultAudioEndpoint(eRender, eConsole)
-                    .context("default speakers")?;
-                device.Activate(CLSCTX_ALL, None).context("audio client")?
+                (speaker_client()?, false)
             }
         };
-        let mix = client.GetMixFormat().context("mix format")?;
+        let mut mix = client.GetMixFormat().context("mix format")?;
+        // Process loopback is already a loopback client. Setting the loopback
+        // flag again faults inside the audio engine.
+        let stream_flags = if process_loopback {
+            0
+        } else {
+            AUDCLNT_STREAMFLAGS_LOOPBACK
+        };
+        if let Err(err) = client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            stream_flags,
+            200_000,
+            0,
+            mix,
+            None,
+        ) {
+            if !process_loopback {
+                return Err(err).context("loopback initialize");
+            }
+            session_log(&format!(
+                "system audio: process loopback initialize failed ({err}), using speakers"
+            ));
+            CoTaskMemFree(Some(mix.cast()));
+            client = speaker_client()?;
+            mix = client.GetMixFormat().context("mix format")?;
+            client
+                .Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    AUDCLNT_STREAMFLAGS_LOOPBACK,
+                    200_000,
+                    0,
+                    mix,
+                    None,
+                )
+                .context("loopback initialize")?;
+        }
         let format = &*mix;
         let rate = format.nSamplesPerSec;
         let channels = format.nChannels as usize;
@@ -767,16 +846,6 @@ fn capture_loopback(
             // it and throw every sample away.
             float = true;
         }
-        client
-            .Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
-                200_000,
-                0,
-                mix,
-                None,
-            )
-            .context("loopback initialize")?;
         CoTaskMemFree(Some(mix.cast()));
         let capture: IAudioCaptureClient = client.GetService().context("capture client")?;
         client.Start().context("loopback start")?;
