@@ -23,7 +23,10 @@ use clap::Parser;
 use config::{AppConfig, CliArgs, TargetPlatform};
 use reqwest::Client;
 
-pub use app::{prepare_voice, screens, CallRequest, Engine, EngineNote, Person, ScreenChoice, ShareRequest};
+pub use app::{
+    audio_inputs, audio_outputs, choose_input, choose_output, prepare_voice, screens, AudioGear, CallRequest, Engine,
+    EngineNote, Person, ScreenChoice, ShareRequest,
+};
 pub use present_gl::Picture;
 #[cfg(target_os = "macos")]
 pub use present_macos::{Pointer, Presenter};

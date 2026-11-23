@@ -22,6 +22,19 @@ const STEREO: usize = FRAME * 2;
 
 /// The microphone is opened from whichever thread joins the room. Windows
 /// audio calls on a thread that never joined COM fail before the first sample.
+static OUTPUT_NAME: Mutex<String> = Mutex::new(String::new());
+
+/// Screen-share audio uses this speaker name when it matches a local output.
+pub fn set_output_name(name: &str) {
+    if let Ok(mut slot) = OUTPUT_NAME.lock() {
+        *slot = name.to_string();
+    }
+}
+
+fn output_name() -> String {
+    OUTPUT_NAME.lock().map(|slot| slot.clone()).unwrap_or_default()
+}
+
 pub fn prime_capture_thread() {
     #[cfg(target_os = "windows")]
     {
@@ -402,9 +415,23 @@ impl AudioPlayer {
 
     fn open(mute: Arc<AtomicBool>, clock: Option<Arc<PlayClock>>, gain: Arc<AtomicU32>) -> Result<Self> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .context("this Mac has no audio output")?;
+        let preferred = output_name();
+        let named = if preferred.is_empty() {
+            None
+        } else {
+            host.output_devices().ok().and_then(|mut devices| {
+                devices.find(|device| device.name().ok().as_deref() == Some(preferred.as_str()))
+            })
+        };
+        if !preferred.is_empty() && named.is_none() {
+            session_log(&format!("screen audio output: {preferred} is not available, using the default"));
+        }
+        let device = named
+            .or_else(|| host.default_output_device())
+            .context("this computer has no audio output")?;
+        if let Ok(name) = device.name() {
+            session_log(&format!("screen audio output: {name}"));
+        }
         let wanted = StreamConfig {
             channels: 2,
             sample_rate: cpal::SampleRate(RATE),

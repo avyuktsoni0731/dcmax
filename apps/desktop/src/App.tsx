@@ -60,7 +60,11 @@ type Profile = {
   dark: boolean;
   voice: number;
   screen: number;
+  input: string;
+  output: string;
 };
+
+type Gear = { id: string; name: string };
 
 const NAV: { id: Page; label: string; icon: typeof HomeIcon }[] = [
   { id: "home", label: "Home", icon: HomeIcon },
@@ -86,6 +90,10 @@ export function App() {
   const [bitrate, setBitrate] = useState(40000);
   const [voice, setVoice] = useState(100);
   const [screen, setScreen] = useState(100);
+  const [inputId, setInputId] = useState("");
+  const [outputId, setOutputId] = useState("");
+  const [inputs, setInputs] = useState<Gear[]>([]);
+  const [outputs, setOutputs] = useState<Gear[]>([]);
   const [fullscreen, setFullscreen] = useState(false);
   const [chrome, setChrome] = useState(true);
   const [displayId, setDisplayId] = useState<number | null>(null);
@@ -121,11 +129,30 @@ export function App() {
     dark: theme === "dark",
     voice,
     screen,
+    input: inputId,
+    output: outputId,
     ...next
   });
 
   function persist(next?: Partial<Profile>) {
     void invoke("remember", { body: saved(next) }).catch(() => {});
+  }
+
+  function loadDevices() {
+    void invoke<Gear[]>("inputs").then(setInputs).catch(() => {});
+    void invoke<Gear[]>("outputs").then(setOutputs).catch(() => {});
+  }
+
+  function pickInput(id: string) {
+    setInputId(id);
+    persist({ input: id });
+    void invoke("set_input", { body: { id } }).catch(() => {});
+  }
+
+  function pickOutput(id: string) {
+    setOutputId(id);
+    persist({ output: id });
+    void invoke("set_output", { body: { id } }).catch(() => {});
   }
 
   function commit(recipe: (current: Desk) => Desk) {
@@ -139,6 +166,10 @@ export function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
+
+  useEffect(() => {
+    loadDevices();
+  }, [phase]);
 
   useEffect(() => {
     if (!import.meta.env.DEV) return;
@@ -199,6 +230,8 @@ export function App() {
         setTheme(stored.dark ? "dark" : "light");
         setVoice(stored.voice ?? 100);
         setScreen(stored.screen ?? 100);
+        setInputId(stored.input ?? "");
+        setOutputId(stored.output ?? "");
       })
       .catch(() => {});
   }, []);
@@ -534,6 +567,8 @@ export function App() {
                 <input type="range" min={0} max={200} step={5} value={screen} aria-label="Screen audio volume" onChange={(event) => changeScreen(Number(event.target.value))} />
               </label>
               <strong className="boost-read">{screen}%</strong>
+              <DeviceSelect label="Microphone" value={inputId} devices={inputs} onChange={pickInput} />
+              <DeviceSelect label="Speakers" value={outputId} devices={outputs} onChange={pickOutput} />
             </div>
           ) : null}
           {menu === "share" ? (
@@ -882,6 +917,8 @@ export function App() {
                 <button className="outline" type="button" onClick={() => { const next = theme === "dark" ? "light" : "dark"; setTheme(next); persist({ dark: next === "dark" }); }}>
                   {theme === "dark" ? "Switch to light" : "Switch to dark"}
                 </button>
+                <DeviceSelect label="Microphone" value={inputId} devices={inputs} onChange={pickInput} />
+                <DeviceSelect label="Speakers" value={outputId} devices={outputs} onChange={pickOutput} />
               </div>
             </div>
           ) : null}
@@ -915,6 +952,21 @@ export function App() {
         </div>
       ) : null}
     </div>
+  );
+}
+
+function DeviceSelect({ label, value, devices, onChange }: { label: string; value: string; devices: Gear[]; onChange: (id: string) => void }) {
+  const known = devices.some((device) => device.id === value);
+  return (
+    <label>
+      {label}
+      <select aria-label={label} value={known ? value : ""} onChange={(event) => onChange(event.target.value)}>
+        <option value="">System default</option>
+        {devices.map((device) => (
+          <option key={device.id} value={device.id}>{device.name}</option>
+        ))}
+      </select>
+    </label>
   );
 }
 

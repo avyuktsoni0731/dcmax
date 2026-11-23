@@ -72,6 +72,8 @@ struct Profile {
     dark: bool,
     voice: u32,
     screen: u32,
+    input: String,
+    output: String,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +88,8 @@ struct ProfileBody {
     dark: bool,
     voice: u32,
     screen: u32,
+    input: String,
+    output: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -136,6 +140,9 @@ fn with_engine<T>(
 
 #[tauri::command]
 fn join(state: State<DesktopState>, body: JoinBody) -> Result<(), String> {
+    let stored = load_profile();
+    let _ = native_sender::choose_input(&stored.input);
+    let _ = native_sender::choose_output(&stored.output);
     let _ = native_sender::prepare_voice();
     with_engine(&state, |engine| {
         engine.join(native_sender::CallRequest {
@@ -179,6 +186,41 @@ fn set_voice(state: State<DesktopState>, body: GainBody) -> Result<(), String> {
 #[tauri::command]
 fn set_screen(state: State<DesktopState>, body: GainBody) -> Result<(), String> {
     with_engine(&state, |engine| engine.set_screen(body.percent))
+}
+
+#[derive(Clone, serde::Serialize)]
+struct Gear {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct DeviceBody {
+    id: String,
+}
+
+#[tauri::command]
+fn inputs() -> Result<Vec<Gear>, String> {
+    native_sender::audio_inputs()
+        .map(|list| list.into_iter().map(|device| Gear { id: device.id, name: device.name }).collect())
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn outputs() -> Result<Vec<Gear>, String> {
+    native_sender::audio_outputs()
+        .map(|list| list.into_iter().map(|device| Gear { id: device.id, name: device.name }).collect())
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_input(body: DeviceBody) -> Result<(), String> {
+    native_sender::choose_input(&body.id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_output(body: DeviceBody) -> Result<(), String> {
+    native_sender::choose_output(&body.id).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -557,6 +599,10 @@ pub fn run() {
             set_muted,
             set_voice,
             set_screen,
+            inputs,
+            outputs,
+            set_input,
+            set_output,
             set_fullscreen,
             profile,
             remember,
@@ -609,6 +655,8 @@ fn load_profile() -> Profile {
         dark: false,
         voice: 100,
         screen: 100,
+        input: String::new(),
+        output: String::new(),
     };
     let Some(path) = profile_path() else {
         return profile;
@@ -652,6 +700,12 @@ fn load_profile() -> Profile {
     if let Some(screen) = lines.next().and_then(|line| line.parse().ok()) {
         profile.screen = gain_percent(screen);
     }
+    if let Some(input) = lines.next() {
+        profile.input = input.to_string();
+    }
+    if let Some(output) = lines.next() {
+        profile.output = output.to_string();
+    }
     profile
 }
 
@@ -674,10 +728,12 @@ fn save_profile(body: &ProfileBody) {
     let voice = gain_percent(body.voice);
     let screen = gain_percent(body.screen);
     let text = format!(
-        "{}\n{}\n{}\n{resolution}\n{fps}\n{bitrate}\n{theme}\n{voice}\n{screen}\n",
+        "{}\n{}\n{}\n{resolution}\n{fps}\n{bitrate}\n{theme}\n{voice}\n{screen}\n{}\n{}\n",
         body.name.trim(),
         body.room.trim(),
-        body.invite.trim()
+        body.invite.trim(),
+        body.input.trim(),
+        body.output.trim()
     );
     let _ = std::fs::write(path, text);
 }

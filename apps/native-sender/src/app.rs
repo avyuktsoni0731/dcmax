@@ -389,6 +389,80 @@ pub fn prepare_voice() -> Result<()> {
     Ok(())
 }
 
+pub struct AudioGear {
+    pub id: String,
+    pub name: String,
+}
+
+fn platform() -> Result<PlatformAudio> {
+    crate::audio::prime_capture_thread();
+    PlatformAudio::new().context("Could not open the audio devices")
+}
+
+pub fn audio_inputs() -> Result<Vec<AudioGear>> {
+    let audio = platform()?;
+    Ok(audio
+        .recording_devices()
+        .map(|device| AudioGear {
+            id: device.id.as_str().to_string(),
+            name: device.name,
+        })
+        .collect())
+}
+
+pub fn audio_outputs() -> Result<Vec<AudioGear>> {
+    let audio = platform()?;
+    Ok(audio
+        .playout_devices()
+        .map(|device| AudioGear {
+            id: device.id.as_str().to_string(),
+            name: device.name,
+        })
+        .collect())
+}
+
+fn chosen<'a, T>(
+    devices: &'a [T],
+    id: &str,
+    name_of: impl Fn(&T) -> &str,
+    id_of: impl Fn(&T) -> &str,
+) -> Result<&'a T> {
+    let device = if id.is_empty() {
+        devices
+            .iter()
+            .find(|device| name_of(device).to_lowercase().starts_with("default"))
+            .or_else(|| devices.first())
+    } else {
+        devices.iter().find(|device| id_of(device) == id)
+    };
+    device.context("That audio device is not connected")
+}
+
+pub fn choose_input(id: &str) -> Result<()> {
+    let audio = platform()?;
+    let devices: Vec<_> = audio.recording_devices().collect();
+    let device = chosen(&devices, id, |device| &device.name, |device| device.id.as_str())?;
+    let name = device.name.clone();
+    audio
+        .switch_recording_device(&device.id)
+        .context("Could not switch the microphone")?;
+    crate::audio::session_log(&format!("microphone selected {name}"));
+    Ok(())
+}
+
+pub fn choose_output(id: &str) -> Result<()> {
+    let audio = platform()?;
+    let devices: Vec<_> = audio.playout_devices().collect();
+    let device = chosen(&devices, id, |device| &device.name, |device| device.id.as_str())?;
+    let name = device.name.clone();
+    audio
+        .switch_playout_device(&device.id)
+        .context("Could not switch the speakers")?;
+    crate::audio::set_output_name(&name);
+    crate::audio::session_log(&format!("speakers selected {name}"));
+    Ok(())
+}
+
 static VOICE_READY: AtomicBool = AtomicBool::new(false);
 
 fn voice_ready() -> bool {

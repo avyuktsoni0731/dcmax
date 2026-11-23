@@ -622,6 +622,7 @@ textarea { height: auto; padding: 10px 12px; resize: vertical; }
   background: var(--card);
   border: 1px solid var(--line);
   display: flex;
+  flex-wrap: wrap;
   align-items: end;
   gap: 12px;
 }
