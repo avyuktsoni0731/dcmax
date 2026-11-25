@@ -818,8 +818,8 @@ fn capture_loopback(
     stop: &AtomicBool,
 ) -> Result<()> {
     use windows::Win32::Media::Audio::{
-        IAudioCaptureClient, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-        AUDCLNT_S_BUFFER_EMPTY,
+        IAudioCaptureClient, WAVEFORMATEX, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+        AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDCLNT_S_BUFFER_EMPTY,
     };
     use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 
@@ -866,13 +866,19 @@ fn capture_loopback(
         } else {
             client.GetMixFormat().context("mix format")?
         };
-        // Process loopback is already a loopback client. Setting the loopback
-        // flag again faults inside the audio engine.
+        // Process loopback rejects a capture with no flags: 0x88890021 is
+        // AUDCLNT_E_INVALID_STREAM_FLAG. It has to be opened as loopback, and
+        // the engine converts into the format we ask for. Flags 0 made this
+        // fall through to the whole speaker mix, which includes the voice
+        // this app is playing, so the other person came back inside the share.
         let stream_flags = if process_loopback {
-            0
+            AUDCLNT_STREAMFLAGS_LOOPBACK
+                | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
         } else {
             AUDCLNT_STREAMFLAGS_LOOPBACK
         };
+        let mut stereo = false;
         if let Err(err) = client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             stream_flags,
@@ -885,39 +891,72 @@ fn capture_loopback(
                 return Err(err).context("loopback initialize");
             }
             session_log(&format!(
-                "system audio: process loopback initialize failed ({err}), using speakers"
+                "system audio: process loopback initialize failed ({err}), trying stereo"
             ));
-            CoTaskMemFree(Some(mix.cast()));
-            client = speaker_client()?;
-            mix = client.GetMixFormat().context("mix format")?;
-            client
+            let plain = WAVEFORMATEX {
+                wFormatTag: 3,
+                nChannels: 2,
+                nSamplesPerSec: 48_000,
+                nAvgBytesPerSec: 48_000 * 8,
+                nBlockAlign: 8,
+                wBitsPerSample: 32,
+                cbSize: 0,
+            };
+            if client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
-                    AUDCLNT_STREAMFLAGS_LOOPBACK,
+                    stream_flags,
                     200_000,
                     0,
-                    mix,
+                    &plain,
                     None,
                 )
-                .context("loopback initialize")?;
+                .is_ok()
+            {
+                stereo = true;
+            } else {
+                session_log(
+                    "system audio: could not leave this app out, so the share includes its playback",
+                );
+                CoTaskMemFree(Some(mix.cast()));
+                client = speaker_client()?;
+                process_loopback = false;
+                mix = client.GetMixFormat().context("mix format")?;
+                client
+                    .Initialize(
+                        AUDCLNT_SHAREMODE_SHARED,
+                        AUDCLNT_STREAMFLAGS_LOOPBACK,
+                        200_000,
+                        0,
+                        mix,
+                        None,
+                    )
+                    .context("loopback initialize")?;
+            }
         }
-        let format = &*mix;
-        let rate = format.nSamplesPerSec;
-        let channels = format.nChannels as usize;
-        let bits = format.wBitsPerSample;
-        let block = format.nBlockAlign as usize;
-        let mut float = is_float(format);
-        if !float && bits == 32 {
-            // The shared mix format is 32-bit float. The extensible GUID sits at
-            // byte 24; reading it with the padded Rust struct size used to miss
-            // it and throw every sample away.
-            float = true;
-        }
-        CoTaskMemFree(Some(mix.cast()));
+        let (rate, channels, bits, block, float) = if stereo {
+            CoTaskMemFree(Some(mix.cast()));
+            (48_000u32, 2usize, 32u16, 8usize, true)
+        } else {
+            let format = &*mix;
+            let rate = format.nSamplesPerSec;
+            let channels = format.nChannels as usize;
+            let bits = format.wBitsPerSample;
+            let block = format.nBlockAlign as usize;
+            let mut float = is_float(format);
+            if !float && bits == 32 {
+                // The shared mix format is 32-bit float. The extensible GUID sits at
+                // byte 24; reading it with the padded Rust struct size used to miss
+                // it and throw every sample away.
+                float = true;
+            }
+            CoTaskMemFree(Some(mix.cast()));
+            (rate, channels, bits, block, float)
+        };
         let capture: IAudioCaptureClient = client.GetService().context("capture client")?;
         client.Start().context("loopback start")?;
         session_log(&format!(
-            "system audio: wasapi loopback {rate} Hz {channels} ch {bits}-bit float={float}"
+            "system audio: wasapi loopback {rate} Hz {channels} ch {bits}-bit float={float} exclude_app={process_loopback}"
         ));
         let mut codec = SystemAudio::new()?;
         let mut scratch = Vec::new();
