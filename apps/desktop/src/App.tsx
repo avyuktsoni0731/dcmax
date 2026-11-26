@@ -62,6 +62,7 @@ type Profile = {
   screen: number;
   input: string;
   output: string;
+  noise: boolean;
 };
 
 type Gear = { id: string; name: string };
@@ -92,6 +93,7 @@ export function App() {
   const [screen, setScreen] = useState(100);
   const [inputId, setInputId] = useState("");
   const [outputId, setOutputId] = useState("");
+  const [noise, setNoise] = useState(true);
   const [inputs, setInputs] = useState<Gear[]>([]);
   const [outputs, setOutputs] = useState<Gear[]>([]);
   const [fullscreen, setFullscreen] = useState(false);
@@ -131,6 +133,7 @@ export function App() {
     screen,
     input: inputId,
     output: outputId,
+    noise,
     ...next
   });
 
@@ -153,6 +156,12 @@ export function App() {
     setOutputId(id);
     persist({ output: id });
     void invoke("set_output", { body: { id } }).catch(() => {});
+  }
+
+  function pickNoise(on: boolean) {
+    setNoise(on);
+    persist({ noise: on });
+    void invoke("set_noise", { body: { on } }).catch(() => {});
   }
 
   function commit(recipe: (current: Desk) => Desk) {
@@ -232,6 +241,9 @@ export function App() {
         setScreen(stored.screen ?? 100);
         setInputId(stored.input ?? "");
         setOutputId(stored.output ?? "");
+        const suppression = stored.noise ?? true;
+        setNoise(suppression);
+        void invoke("set_noise", { body: { on: suppression } }).catch(() => {});
       })
       .catch(() => {});
   }, []);
@@ -569,6 +581,7 @@ export function App() {
               <strong className="boost-read">{screen}%</strong>
               <DeviceSelect label="Microphone" value={inputId} devices={inputs} onChange={pickInput} />
               <DeviceSelect label="Speakers" value={outputId} devices={outputs} onChange={pickOutput} />
+              <NoiseSwitch on={noise} onChange={pickNoise} />
             </div>
           ) : null}
           {menu === "share" ? (
@@ -919,6 +932,7 @@ export function App() {
                 </button>
                 <DeviceSelect label="Microphone" value={inputId} devices={inputs} onChange={pickInput} />
                 <DeviceSelect label="Speakers" value={outputId} devices={outputs} onChange={pickOutput} />
+                <NoiseSwitch on={noise} onChange={pickNoise} />
               </div>
             </div>
           ) : null}
@@ -952,6 +966,15 @@ export function App() {
         </div>
       ) : null}
     </div>
+  );
+}
+
+function NoiseSwitch({ on, onChange }: { on: boolean; onChange: (on: boolean) => void }) {
+  return (
+    <button className={`switch${on ? " on" : ""}`} type="button" role="switch" aria-checked={on} onClick={() => onChange(!on)}>
+      <span>Noise suppression</span>
+      <i />
+    </button>
   );
 }
 

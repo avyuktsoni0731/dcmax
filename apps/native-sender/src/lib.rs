@@ -10,6 +10,7 @@ mod decode_macos;
 mod decode_windows;
 mod encoder;
 mod h264;
+mod noise;
 mod picture;
 mod present_gl;
 #[cfg(target_os = "macos")]
@@ -27,6 +28,7 @@ pub use app::{
     audio_inputs, audio_outputs, choose_input, choose_output, prepare_voice, screens, AudioGear, CallRequest, Engine,
     EngineNote, Person, ScreenChoice, ShareRequest,
 };
+pub use noise::set_noise_suppression;
 pub use present_gl::Picture;
 #[cfg(target_os = "macos")]
 pub use present_macos::{Pointer, Presenter};

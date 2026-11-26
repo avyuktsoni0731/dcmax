@@ -176,6 +176,7 @@ impl Engine {
             screen_gain: Arc::new(AtomicU32::new(100)),
         });
         let stage_thread = Arc::clone(&stage);
+        crate::noise::install();
         std::thread::Builder::new()
             .name("mycord".to_string())
             .spawn(move || {

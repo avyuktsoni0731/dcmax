@@ -31,6 +31,10 @@ serde_json = "1"
 socket2 = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "io-util"] }
 eframe = "0.31"
+nnnoiseless = "0.5"
+
+[patch.crates-io]
+webrtc-sys = { path = "vendor/webrtc-sys" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

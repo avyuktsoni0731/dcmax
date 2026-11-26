@@ -74,6 +74,7 @@ struct Profile {
     screen: u32,
     input: String,
     output: String,
+    noise: bool,
 }
 
 #[derive(Deserialize)]
@@ -90,6 +91,12 @@ struct ProfileBody {
     screen: u32,
     input: String,
     output: String,
+    #[serde(default = "noise_on")]
+    noise: bool,
+}
+
+fn noise_on() -> bool {
+    true
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -141,6 +148,7 @@ fn with_engine<T>(
 #[tauri::command]
 fn join(state: State<DesktopState>, body: JoinBody) -> Result<(), String> {
     let stored = load_profile();
+    native_sender::set_noise_suppression(stored.noise);
     let _ = native_sender::choose_input(&stored.input);
     let _ = native_sender::choose_output(&stored.output);
     let _ = native_sender::prepare_voice();
@@ -221,6 +229,17 @@ fn set_input(body: DeviceBody) -> Result<(), String> {
 #[tauri::command]
 fn set_output(body: DeviceBody) -> Result<(), String> {
     native_sender::choose_output(&body.id).map_err(|err| err.to_string())
+}
+
+#[derive(Deserialize)]
+struct NoiseBody {
+    on: bool,
+}
+
+#[tauri::command]
+fn set_noise(body: NoiseBody) -> Result<(), String> {
+    native_sender::set_noise_suppression(body.on);
+    Ok(())
 }
 
 #[tauri::command]
@@ -603,6 +622,7 @@ pub fn run() {
             outputs,
             set_input,
             set_output,
+            set_noise,
             set_fullscreen,
             profile,
             remember,
@@ -657,6 +677,7 @@ fn load_profile() -> Profile {
         screen: 100,
         input: String::new(),
         output: String::new(),
+        noise: true,
     };
     let Some(path) = profile_path() else {
         return profile;
@@ -706,6 +727,9 @@ fn load_profile() -> Profile {
     if let Some(output) = lines.next() {
         profile.output = output.to_string();
     }
+    if let Some(noise) = lines.next() {
+        profile.noise = noise != "0";
+    }
     profile
 }
 
@@ -727,8 +751,9 @@ fn save_profile(body: &ProfileBody) {
     let theme = if body.dark { "dark" } else { "light" };
     let voice = gain_percent(body.voice);
     let screen = gain_percent(body.screen);
+    let noise = if body.noise { "1" } else { "0" };
     let text = format!(
-        "{}\n{}\n{}\n{resolution}\n{fps}\n{bitrate}\n{theme}\n{voice}\n{screen}\n{}\n{}\n",
+        "{}\n{}\n{}\n{resolution}\n{fps}\n{bitrate}\n{theme}\n{voice}\n{screen}\n{}\n{}\n{noise}\n",
         body.name.trim(),
         body.room.trim(),
         body.invite.trim(),
