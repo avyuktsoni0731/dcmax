@@ -3,9 +3,10 @@
 //! a UDP mapping, then carry the existing picture bytes on a reliable stream.
 //! The video does not go through a server when the punch works.
 //!
-//! Two networks that cannot punch still need a picture. The same bytes then
-//! ride the room that already carries the microphone, in order, and the watcher
-//! plays them through the same local player.
+//! When the punch does not open, the picture bytes are not copied through the
+//! room. The sender drains its local pipe and tells the watcher, on
+//! [`MEDIA_TOPIC`], to subscribe to the screen track instead. That track is
+//! lossy, so a late frame can be dropped without holding the desktop audio.
 
 use anyhow::{bail, Context, Result};
 use livekit::prelude::*;
@@ -19,7 +20,13 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 pub const TOPIC: &str = "picture-direct";
 /// Picture bytes when the two computers cannot punch a direct path.
+/// Older builds still send this. A current build uses [`MEDIA_TOPIC`] and the
+/// screen track instead.
 pub const ROOM_TOPIC: &str = "picture-room";
+/// One small word, `room` or `direct`, telling the watcher which picture to show.
+pub const MEDIA_TOPIC: &str = "picture-media";
+pub const MEDIA_ROOM: &[u8] = b"room";
+pub const MEDIA_DIRECT: &[u8] = b"direct";
 
 const COOKIE: u32 = 0x2112_A442;
 const PUNCH: &[u8] = b"dcmax-punch";
@@ -62,6 +69,7 @@ pub async fn host(
     participant: LocalParticipant,
     identity: &str,
     incoming: UnboundedReceiver<Vec<u8>>,
+    room_media: Arc<AtomicBool>,
 ) -> Result<SocketAddr> {
     let (socket, candidates) = tokio::task::spawn_blocking(prepare)
         .await
@@ -112,7 +120,7 @@ pub async fn host(
         }
     });
     tokio::spawn(async move {
-        serve(endpoint, listener, alive_rx, announce_tx, participant).await;
+        serve(endpoint, listener, alive_rx, announce_tx, participant, room_media).await;
     });
     Ok(local)
 }
@@ -376,7 +384,6 @@ async fn connect_with_retry(
 }
 
 const DIRECT_WAIT: Duration = Duration::from_secs(4);
-const ROOM_CHUNK: usize = 8_000;
 const ROOM_START: u8 = 1;
 const ROOM_MORE: u8 = 0;
 const ROOM_END: u8 = 2;
@@ -407,6 +414,7 @@ async fn serve(
     mut alive: tokio::sync::watch::Receiver<bool>,
     announce: tokio::sync::watch::Sender<bool>,
     participant: LocalParticipant,
+    room_media: Arc<AtomicBool>,
 ) {
     loop {
         if !*alive.borrow() {
@@ -434,12 +442,15 @@ async fn serve(
             } => {
                 log_line("picture direct: carrying the picture");
                 if !prelude.is_empty() && send.write_all(&prelude).await.is_err() {
-                    log_line("picture direct: direct send failed, using the room");
+                    log_line("picture direct: direct send failed, using the screen track");
                     drop(send);
                     drop(recv);
                     drop(connection);
-                    carry_room(&participant, tcp, prelude).await;
+                    let _ = announce.send(false);
+                    release_to_media(&participant, tcp, &room_media).await;
                 } else {
+                    room_media.store(false, Ordering::Release);
+                    publish_mode(&participant, MEDIA_DIRECT).await;
                     let _connection = connection;
                     bridge(tcp, send, recv).await;
                     log_line("picture direct: picture stopped");
@@ -447,8 +458,8 @@ async fn serve(
             }
             Choice::Room { tcp, prelude } => {
                 let _ = announce.send(false);
-                log_line("picture room: no direct path, sending through the room");
-                let sending = carry_room(&participant, tcp, prelude);
+                drop(prelude);
+                let sending = release_to_media(&participant, tcp, &room_media);
                 tokio::pin!(sending);
                 loop {
                     tokio::select! {
@@ -554,65 +565,37 @@ async fn open_picture(
     }
 }
 
-async fn carry_room(participant: &LocalParticipant, mut tcp: tokio::net::TcpStream, pending: Vec<u8>) {
-    let mut started = false;
-    if !pending.is_empty() && !send_chunks(participant, &pending, &mut started).await {
-        let _ = publish_room(participant, vec![ROOM_END]).await;
-        return;
-    }
+/// The punch did not open. Drop the local picture bytes so the encoder does
+/// not block, and tell the watcher to use the screen track.
+async fn release_to_media(
+    participant: &LocalParticipant,
+    mut tcp: tokio::net::TcpStream,
+    room_media: &AtomicBool,
+) {
+    room_media.store(true, Ordering::Release);
+    log_line("picture room: no direct path, sending the screen track");
+    publish_mode(participant, MEDIA_ROOM).await;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let size = match tcp.read(&mut buf).await {
+        match tcp.read(&mut buf).await {
             Ok(0) | Err(_) => break,
-            Ok(size) => size,
-        };
-        if !send_chunks(participant, &buf[..size], &mut started).await {
-            let _ = publish_room(participant, vec![ROOM_END]).await;
-            return;
+            Ok(_) => {}
         }
-    }
-    if started {
-        let _ = publish_room(participant, vec![ROOM_END]).await;
-        log_line("picture room: share ended");
     }
 }
 
-async fn send_chunks(participant: &LocalParticipant, bytes: &[u8], started: &mut bool) -> bool {
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let end = (offset + ROOM_CHUNK).min(bytes.len());
-        let mut packet = Vec::with_capacity(1 + end - offset);
-        packet.push(if *started { ROOM_MORE } else { ROOM_START });
-        if !*started {
-            log_line("picture room: sending picture bytes");
-        }
-        *started = true;
-        packet.extend_from_slice(&bytes[offset..end]);
-        offset = end;
-        if !publish_room(participant, packet).await {
-            return false;
-        }
+async fn publish_mode(participant: &LocalParticipant, mode: &[u8]) {
+    let sent = participant
+        .publish_data(DataPacket {
+            payload: mode.to_vec(),
+            topic: Some(MEDIA_TOPIC.to_string()),
+            reliable: true,
+            destination_identities: Vec::new(),
+        })
+        .await;
+    if sent.is_err() {
+        log_line("picture room: the watcher was not told which path to use");
     }
-    true
-}
-
-async fn publish_room(participant: &LocalParticipant, payload: Vec<u8>) -> bool {
-    for _ in 0..3 {
-        let sent = participant
-            .publish_data(DataPacket {
-                payload: payload.clone(),
-                topic: Some(ROOM_TOPIC.to_string()),
-                reliable: true,
-                destination_identities: Vec::new(),
-            })
-            .await;
-        if sent.is_ok() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    }
-    log_line("picture room: the room did not take the picture");
-    false
 }
 
 /// Play picture bytes that arrived through the room. Direct playback is a

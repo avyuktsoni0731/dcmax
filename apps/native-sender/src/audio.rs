@@ -184,6 +184,8 @@ impl SystemAudio {
     }
 
     /// Interleaved PCM in, zero or more Opus packets out.
+    /// Each item is the packet time, the Opus payload, and the 20 ms PCM
+    /// that produced it. The PCM is what a LiveKit audio track needs.
     ///
     /// `first_sample_us` is the sender clock time of the first new sample.
     /// Each packet is 20 ms and gets its own timestamp, so the viewer can
@@ -194,7 +196,7 @@ impl SystemAudio {
         channels: usize,
         sample_rate: u32,
         first_sample_us: i64,
-    ) -> Vec<(i64, Vec<u8>)> {
+    ) -> Vec<(i64, Vec<u8>, Vec<i16>)> {
         if self.pending.is_empty() {
             self.packet_us = first_sample_us;
         }
@@ -204,7 +206,7 @@ impl SystemAudio {
             let frame: Vec<i16> = self.pending.drain(..STEREO).collect();
             match self.encoder.encode(&frame) {
                 Ok(packet) => {
-                    packets.push((self.packet_us, packet));
+                    packets.push((self.packet_us, packet, frame));
                     self.packet_us = self.packet_us.saturating_add(20_000);
                 }
                 Err(err) => {
@@ -675,6 +677,8 @@ impl Drop for DesktopAudio {
 pub struct EncodedAudio {
     pub payload: Vec<u8>,
     pub timestamp_us: i64,
+    /// 48 kHz stereo, 20 ms, the samples behind `payload`.
+    pub pcm: Vec<i16>,
 }
 
 /// Finished when Windows has activated a loopback client that leaves this
@@ -989,11 +993,12 @@ fn capture_loopback(
                     let now = crate::h264::unix_us_now();
                     let duration_us = (frames as i64).saturating_mul(1_000_000) / rate.max(1) as i64;
                     let start_us = now.saturating_sub(duration_us);
-                    for (timestamp_us, payload) in codec.push(&scratch, channels, rate, start_us) {
+                    for (timestamp_us, payload, pcm) in codec.push(&scratch, channels, rate, start_us) {
                         if tx
                             .try_send(EncodedAudio {
                                 payload,
                                 timestamp_us,
+                                pcm,
                             })
                             .is_err()
                         {

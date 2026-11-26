@@ -11,12 +11,17 @@ use crate::h264::{unix_us_now, MAX_FRAME_AGE};
 use crate::picture::{accept_picture, listen, FrameReader, PictureSender};
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
+use futures_util::StreamExt;
 use livekit::options::{
     DegradationPreference, TrackPublishOptions, VideoCodec, VideoEncoderBackend, VideoEncoding,
 };
 use livekit::prelude::*;
+use livekit::webrtc::audio_frame::AudioFrame;
+use livekit::webrtc::audio_source::native::NativeAudioSource;
+use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
 use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
 use livekit::webrtc::video_source::{native::NativeVideoSource, RtcVideoSource, VideoResolution};
+use livekit::webrtc::video_stream::native::{NativeVideoStream, NativeVideoStreamOptions};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -124,6 +129,11 @@ struct Joined {
     mic: LocalAudioTrack,
     _audio: PlatformAudio,
     remote_audio: Vec<RemoteAudioTrack>,
+    screen_pubs: Vec<RemoteTrackPublication>,
+    screen_audio: Vec<RemoteAudioTrack>,
+    watch_media: Arc<AtomicBool>,
+    media_gen: Arc<AtomicU64>,
+    media_stop: Option<tokio::sync::watch::Sender<bool>>,
     fan: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     room_picture: tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>,
     host: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
@@ -1699,7 +1709,13 @@ async fn session(
                         }
                     }
                     Cmd::Screen(percent) => {
-                        stage.screen_gain.store(percent.min(200), Ordering::Relaxed);
+                        let percent = percent.min(200);
+                        stage.screen_gain.store(percent, Ordering::Relaxed);
+                        if let Some(call) = call.as_ref() {
+                            for audio in &call.screen_audio {
+                                crate::audio::set_remote_volume(audio, percent);
+                            }
+                        }
                     }
                     Cmd::Leave => {
                         if let Some(mut call) = call.take() {
@@ -1716,7 +1732,7 @@ async fn session(
             event = event => {
                 match event {
                     Some(RoomEvent::DataReceived { payload, topic, participant, .. }) => {
-                        if let Some(call) = call.as_ref() {
+                        if let Some(call) = call.as_mut() {
                             if topic.as_deref() == Some(TOPIC) {
                                 let _ = call.fan.send(payload.to_vec());
                             } else if topic.as_deref() == Some(direct::ROOM_TOPIC) {
@@ -1727,6 +1743,19 @@ async fn session(
                                 let mine = call.room.local_participant().identity().to_string();
                                 if from.is_empty() || from != mine {
                                     let _ = call.room_picture.send((from, payload.to_vec()));
+                                }
+                            } else if topic.as_deref() == Some(direct::MEDIA_TOPIC) {
+                                let from = participant
+                                    .as_ref()
+                                    .map(|person| person.identity().to_string())
+                                    .unwrap_or_default();
+                                let mine = call.room.local_participant().identity().to_string();
+                                if from.is_empty() || from != mine {
+                                    if payload.as_ref() == direct::MEDIA_ROOM {
+                                        use_screen_track(call);
+                                    } else if payload.as_ref() == direct::MEDIA_DIRECT {
+                                        use_direct_picture(call);
+                                    }
                                 }
                             }
                         }
@@ -1759,17 +1788,46 @@ async fn session(
                         match track {
                             RemoteTrack::Audio(audio) => {
                                 audio.enable();
-                                crate::audio::set_remote_volume(&audio, voice_gain);
-                                crate::audio::session_log(&format!("voice from {}", participant.identity()));
-                                if let Some(call) = call.as_mut() {
-                                    call.remote_audio.push(audio);
+                                if publication.source() == TrackSource::ScreenshareAudio {
+                                    let mine = call
+                                        .as_ref()
+                                        .map(|call| call.room.local_participant().identity().to_string())
+                                        .unwrap_or_default();
+                                    if participant.identity().to_string() == mine {
+                                        continue;
+                                    }
+                                    let gain = stage.screen_gain.load(Ordering::Relaxed);
+                                    crate::audio::set_remote_volume(&audio, gain);
+                                    crate::audio::session_log(&format!(
+                                        "desktop audio from {}",
+                                        participant.identity()
+                                    ));
+                                    if let Some(call) = call.as_mut() {
+                                        call.screen_audio.push(audio);
+                                    }
+                                } else {
+                                    crate::audio::set_remote_volume(&audio, voice_gain);
+                                    crate::audio::session_log(&format!("voice from {}", participant.identity()));
+                                    if let Some(call) = call.as_mut() {
+                                        call.remote_audio.push(audio);
+                                    }
                                 }
                             }
-                            RemoteTrack::Video(_) if publication.source() == TrackSource::Screenshare => {
-                                // The picture the window draws is the direct stream, or the
-                                // same bytes through the room. This extra copy would use the
-                                // uplink twice and still would not be drawn.
-                                publication.set_subscribed(false);
+                            RemoteTrack::Video(video) if publication.source() == TrackSource::Screenshare => {
+                                let Some(call) = call.as_mut() else { continue };
+                                let mine = call.room.local_participant().identity().to_string();
+                                if participant.identity().to_string() == mine {
+                                    publication.set_subscribed(false);
+                                } else {
+                                    remember_screen(call, &publication);
+                                    if call.watch_media.load(Ordering::Acquire) {
+                                        watch_screen(call, video, &stage);
+                                    } else {
+                                        // The direct picture is the one on screen until the
+                                        // punch fails and the sharer says to use this track.
+                                        publication.set_subscribed(false);
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -1779,6 +1837,7 @@ async fn session(
                             let sid = audio.sid();
                             if let Some(call) = call.as_mut() {
                                 call.remote_audio.retain(|held| held.sid() != sid);
+                                call.screen_audio.retain(|held| held.sid() != sid);
                             }
                         }
                     }
@@ -1916,6 +1975,11 @@ async fn connect(settings: &CallSettings, stage: Arc<Stage>) -> Result<(Joined, 
         mic,
         _audio: audio,
         remote_audio: Vec::new(),
+        screen_pubs: Vec::new(),
+        screen_audio: Vec::new(),
+        watch_media: Arc::new(AtomicBool::new(false)),
+        media_gen: Arc::new(AtomicU64::new(0)),
+        media_stop: None,
         fan,
         room_picture,
         host: host_slot,
@@ -1989,9 +2053,15 @@ async fn share_loop(
     mut stop: tokio::sync::watch::Receiver<bool>,
     mut tune: tokio::sync::watch::Receiver<PictureSettings>,
 ) -> Result<()> {
-    let pipe = direct::host(participant.clone(), &config.identity, incoming)
-        .await
-        .context("Could not open the direct picture")?;
+    let room_media = Arc::new(AtomicBool::new(false));
+    let pipe = direct::host(
+        participant.clone(),
+        &config.identity,
+        incoming,
+        Arc::clone(&room_media),
+    )
+    .await
+    .context("Could not open the direct picture")?;
     let picture = PictureSender::connect(pipe).context("Could not start the picture sender")?;
     let mut encoder = ScreenEncoder::start(&config).context("Could not capture the screen")?;
     let resolution = VideoResolution {
@@ -2009,7 +2079,7 @@ async fn share_loop(
             max_bitrate: u64::from(config.bitrate_kbps) * 1000,
             max_framerate: f64::from(config.target_fps),
         }),
-        degradation_preference: Some(DegradationPreference::MaintainFramerateAndResolution),
+        degradation_preference: Some(DegradationPreference::Balanced),
         ..Default::default()
     };
     let publication = participant
@@ -2031,6 +2101,11 @@ async fn share_loop(
     let mut keys = 0u64;
     let mut last_sent = picture.sent();
     let mut last_skipped = picture.skipped();
+    let mut cap_bps = u64::from(config.bitrate_kbps) * 1000;
+    let mut link_bps: Option<u64> = None;
+    let mut link_fps = config.target_fps;
+    let mut room_ready = false;
+    let mut screen_pcm: Option<tokio::sync::mpsc::Sender<Vec<i16>>> = None;
     note_log(&format!(
         "share started: {}x{} target {}fps cap {}kbps",
         config.width, config.height, config.target_fps, config.bitrate_kbps
@@ -2048,20 +2123,42 @@ async fn share_loop(
             changed = tune.changed() => {
                 if changed.is_ok() {
                     let next = *tune.borrow();
+                    cap_bps = u64::from(next.bitrate_kbps) * 1000;
                     adapt.set_ceiling(next.bitrate_kbps);
                     adapt.set_target_fps(next.fps);
-                    let pace = adapt.pace();
-                    encoder.set_bitrate_bps(pace.bps);
-                    encoder.set_fps(pace.fps);
+                    link_fps = link_fps.min(next.fps);
+                    if room_ready {
+                        if let Some(applied) = link_bps {
+                            let bps = applied.min(cap_bps).max(800_000);
+                            link_bps = Some(bps);
+                            encoder.set_bitrate_bps(bps);
+                        }
+                    } else {
+                        let pace = adapt.pace();
+                        encoder.set_bitrate_bps(pace.bps);
+                        encoder.set_fps(pace.fps);
+                    }
                     note_log(&format!(
                         "share retune: {}kbps {}fps",
-                        pace.bps / 1000,
-                        pace.fps
+                        next.bitrate_kbps,
+                        next.fps
                     ));
                 }
             }
             unit = encoder.units.recv() => {
                 let Some(unit) = unit else { break };
+                enter_room(
+                    &room_media,
+                    &mut room_ready,
+                    &encoder,
+                    cap_bps,
+                    &mut link_bps,
+                    &mut screen_pcm,
+                    &participant,
+                );
+                if room_ready {
+                    follow_link(&source, &encoder, cap_bps, &mut link_bps, &mut link_fps, config.target_fps);
+                }
                 let timestamp_us = match unit.timestamp_us {
                     Some(timestamp) if timestamp > 0 => timestamp,
                     _ => {
@@ -2117,11 +2214,21 @@ async fn share_loop(
                         &mut keys,
                         &mut last_sent,
                         &mut last_skipped,
+                        link_bps.map(|bps| (bps, link_fps)),
                     );
                     window = Instant::now();
                 }
             }
             audio = encoder.audio.recv(), if audio_open => {
+                enter_room(
+                    &room_media,
+                    &mut room_ready,
+                    &encoder,
+                    cap_bps,
+                    &mut link_bps,
+                    &mut screen_pcm,
+                    &participant,
+                );
                 if let Some(audio) = audio {
                     if !audio_noted {
                         audio_noted = true;
@@ -2130,12 +2237,27 @@ async fn share_loop(
                     audio_pkts += 1;
                     audio_bytes += audio.payload.len() as u64;
                     picture.offer_audio(&audio.payload, audio.timestamp_us);
+                    if let Some(tx) = screen_pcm.as_ref() {
+                        let _ = tx.try_send(audio.pcm);
+                    }
                 } else {
                     audio_open = false;
                     note_log("desktop audio capture ended");
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                enter_room(
+                    &room_media,
+                    &mut room_ready,
+                    &encoder,
+                    cap_bps,
+                    &mut link_bps,
+                    &mut screen_pcm,
+                    &participant,
+                );
+                if room_ready {
+                    follow_link(&source, &encoder, cap_bps, &mut link_bps, &mut link_fps, config.target_fps);
+                }
                 if window.elapsed() >= Duration::from_secs(1) {
                     apply_pace(
                         &encoder,
@@ -2150,6 +2272,7 @@ async fn share_loop(
                         &mut keys,
                         &mut last_sent,
                         &mut last_skipped,
+                        link_bps.map(|bps| (bps, link_fps)),
                     );
                     window = Instant::now();
                 }
@@ -2182,11 +2305,12 @@ fn apply_pace(
     keys: &mut u64,
     last_sent: &mut u64,
     last_skipped: &mut u64,
+    link: Option<(u64, u32)>,
 ) {
     let sent = picture.sent().saturating_sub(*last_sent);
     let skipped = picture.skipped().saturating_sub(*last_skipped);
     let pace = adapt.observe(*encoded, sent, skipped);
-    if pace.changed {
+    if link.is_none() && pace.changed {
         encoder.set_bitrate_bps(pace.bps);
         encoder.set_fps(pace.fps);
         note_log(&format!(
@@ -2196,6 +2320,7 @@ fn apply_pace(
             pace.fps
         ));
     }
+    let (pace_bps, pace_fps) = link.unwrap_or((pace.bps, pace.fps));
     log_share(
         picture,
         elapsed,
@@ -2207,8 +2332,8 @@ fn apply_pace(
         keys,
         last_sent,
         last_skipped,
-        pace.bps,
-        pace.fps,
+        pace_bps,
+        pace_fps,
     );
 }
 
@@ -2241,6 +2366,220 @@ fn call_config(settings: &CallSettings, picture: &PictureSettings) -> AppConfig 
         picture_direct: true,
         display_id: picture.display_id,
     }
+}
+
+fn use_screen_track(call: &mut Joined) {
+    call.media_gen.fetch_add(1, Ordering::AcqRel);
+    call.watch_media.store(true, Ordering::Release);
+    for publication in &call.screen_pubs {
+        publication.set_subscribed(true);
+    }
+    note_log("picture room: watching the screen track");
+}
+
+fn use_direct_picture(call: &mut Joined) {
+    call.media_gen.fetch_add(1, Ordering::AcqRel);
+    call.watch_media.store(false, Ordering::Release);
+    if let Some(stop) = call.media_stop.take() {
+        let _ = stop.send(true);
+    }
+    for publication in &call.screen_pubs {
+        publication.set_subscribed(false);
+    }
+}
+
+fn remember_screen(call: &mut Joined, publication: &RemoteTrackPublication) {
+    let sid = publication.sid().to_string();
+    if call.screen_pubs.iter().any(|item| item.sid().to_string() == sid) {
+        return;
+    }
+    call.screen_pubs.push(publication.clone());
+}
+
+fn watch_screen(call: &mut Joined, video: RemoteVideoTrack, stage: &Arc<Stage>) {
+    if let Some(stop) = call.media_stop.take() {
+        let _ = stop.send(true);
+    }
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    call.media_stop = Some(tx);
+    let stage = Arc::clone(stage);
+    let gen = call.media_gen.load(Ordering::Acquire);
+    let media_gen = Arc::clone(&call.media_gen);
+    let watch_media = Arc::clone(&call.watch_media);
+    tokio::spawn(async move {
+        play_live_video(video, stage, rx, gen, media_gen, watch_media).await;
+    });
+}
+
+async fn play_live_video(
+    video: RemoteVideoTrack,
+    stage: Arc<Stage>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    gen: u64,
+    media_gen: Arc<AtomicU64>,
+    watch_media: Arc<AtomicBool>,
+) {
+    let mut stream = NativeVideoStream::with_options(
+        video.rtc_track(),
+        NativeVideoStreamOptions {
+            queue_size_frames: Some(2),
+        },
+    );
+    note_log("picture room: screen track open");
+    let mut window = Instant::now();
+    let mut frames = 0u64;
+    let mut natural = false;
+    loop {
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break;
+                }
+            }
+            frame = stream.next() => {
+                let Some(frame) = frame else {
+                    natural = true;
+                    break;
+                };
+                let Some(shown) = crate::room_media::picture_from_frame(&frame) else {
+                    continue;
+                };
+                frames += 1;
+                stage.stats.received.fetch_add(1, Ordering::Relaxed);
+                stage.stats.decoded.fetch_add(1, Ordering::Relaxed);
+                let timestamp = if frame.timestamp_us > 0 {
+                    frame.timestamp_us
+                } else {
+                    unix_us_now()
+                };
+                store_frame(
+                    &stage,
+                    Frame {
+                        width: shown.width,
+                        height: shown.height,
+                        pixels: Arc::new(shown.picture),
+                    },
+                    timestamp,
+                );
+                if window.elapsed() >= Duration::from_secs(1) {
+                    note_log(&format!("watch: screen track {frames} fps"));
+                    frames = 0;
+                    window = Instant::now();
+                }
+            }
+        }
+    }
+    if natural && media_gen.load(Ordering::Acquire) == gen {
+        watch_media.store(false, Ordering::Release);
+        finish_stream(&stage);
+        note_log("picture room: screen track ended");
+    }
+}
+
+const ROOM_FLOOR_BPS: u64 = 800_000;
+const ROOM_START_BPS: u64 = 4_000_000;
+
+fn enter_room(
+    room_media: &AtomicBool,
+    entered: &mut bool,
+    encoder: &ScreenEncoder,
+    cap_bps: u64,
+    link_bps: &mut Option<u64>,
+    screen_pcm: &mut Option<tokio::sync::mpsc::Sender<Vec<i16>>>,
+    participant: &LocalParticipant,
+) {
+    if *entered || !room_media.load(Ordering::Relaxed) {
+        return;
+    }
+    *entered = true;
+    let start = cap_bps.min(ROOM_START_BPS).max(ROOM_FLOOR_BPS);
+    encoder.set_bitrate_bps(start);
+    *link_bps = Some(start);
+    encoder.request_keyframe();
+    note_log(&format!(
+        "picture room: screen track at {}kbps until the link reports",
+        start / 1000
+    ));
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    *screen_pcm = Some(tx);
+    let participant = participant.clone();
+    tokio::spawn(async move {
+        publish_screen_audio(participant, rx).await;
+    });
+}
+
+fn follow_link(
+    source: &NativeVideoSource,
+    encoder: &ScreenEncoder,
+    cap_bps: u64,
+    link_bps: &mut Option<u64>,
+    link_fps: &mut u32,
+    fps_cap: u32,
+) {
+    let Some(target) = source.take_rate_control_request() else {
+        return;
+    };
+    let ceiling = cap_bps.max(ROOM_FLOOR_BPS);
+    let bps = target.target_bitrate_bps.clamp(ROOM_FLOOR_BPS, ceiling);
+    if link_bps.map(|applied| applied.abs_diff(bps) > 100_000).unwrap_or(true) {
+        encoder.set_bitrate_bps(bps);
+        *link_bps = Some(bps);
+        note_log(&format!("share pace: link {}kbps", bps / 1000));
+    }
+    if target.framerate_fps.is_finite() && target.framerate_fps >= 15.0 {
+        let fps = (target.framerate_fps.round() as u32).clamp(15, fps_cap.max(15));
+        if fps != *link_fps {
+            *link_fps = fps;
+            encoder.set_fps(fps);
+        }
+    }
+}
+
+async fn publish_screen_audio(
+    participant: LocalParticipant,
+    mut rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
+) {
+    let source = NativeAudioSource::new(
+        AudioSourceOptions {
+            echo_cancellation: false,
+            noise_suppression: false,
+            auto_gain_control: false,
+        },
+        48_000,
+        2,
+        20,
+    );
+    let track = LocalAudioTrack::create_audio_track("screen-audio", RtcAudioSource::Native(source.clone()));
+    let options = TrackPublishOptions {
+        source: TrackSource::ScreenshareAudio,
+        ..Default::default()
+    };
+    let published = match participant.publish_track(LocalTrack::Audio(track), options).await {
+        Ok(published) => published,
+        Err(err) => {
+            note_log(&format!("picture room: desktop audio track failed: {err}"));
+            return;
+        }
+    };
+    note_log("picture room: desktop audio is its own track");
+    while let Some(pcm) = rx.recv().await {
+        if pcm.len() < 2 || pcm.len() % 2 != 0 {
+            continue;
+        }
+        let samples = (pcm.len() / 2) as u32;
+        let frame = AudioFrame {
+            data: pcm.into(),
+            sample_rate: 48_000,
+            num_channels: 2,
+            samples_per_channel: samples,
+        };
+        if source.capture_frame(&frame).await.is_err() {
+            note_log("picture room: desktop audio frame was not accepted");
+            break;
+        }
+    }
+    let _ = participant.unpublish_track(&published.sid()).await;
 }
 
 fn play_picture(listener: std::net::TcpListener, stage: Arc<Stage>, stop: Arc<AtomicBool>) {

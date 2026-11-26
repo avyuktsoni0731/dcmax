@@ -17,6 +17,7 @@ mod present_gl;
 mod present_macos;
 mod publish;
 mod relay;
+mod room_media;
 mod watch;
 
 use anyhow::{Context, Result};

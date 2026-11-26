@@ -11,6 +11,8 @@ use livekit::prelude::*;
 use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
 use livekit::webrtc::video_source::{native::NativeVideoSource, RtcVideoSource, VideoResolution};
 use reqwest::Client;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
@@ -117,14 +119,18 @@ pub async fn run(
     let mut late_drops: u64 = 0;
     let mut need_key = true;
     let mut last_timestamp_us: i64 = 0;
+    let mut link_bps = 0u64;
+    let mut room_cut = false;
+    let room_media = Arc::new(AtomicBool::new(false));
     let (pipe_tx, mut pipe_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut waiting_for_direct = config.picture_direct;
     if config.picture_direct {
         let participant = room.local_participant();
         let identity = config.identity.clone();
+        let room_flag = Arc::clone(&room_media);
         println!("picture direct: looking for the other app");
         tokio::spawn(async move {
-            match crate::direct::host(participant, &identity, direct_rx).await {
+            match crate::direct::host(participant, &identity, direct_rx, room_flag).await {
                 Ok(addr) => {
                     let _ = pipe_tx.send(addr);
                 }
@@ -250,6 +256,20 @@ pub async fn run(
                 window_latency_ms = 0.0;
             }
             _ = rate_tick.tick() => {
+                if room_media.load(Ordering::Relaxed) {
+                    if !room_cut {
+                        room_cut = true;
+                        let cap = u64::from(config.bitrate_kbps) * 1000;
+                        let bps = cap.min(4_000_000).max(800_000);
+                        link_bps = bps;
+                        encoder.set_bitrate_bps(bps);
+                        encoder.request_keyframe();
+                        eprintln!("picture room: encoder starts at {} kbps", bps / 1000);
+                    }
+                    rate_frames = 0;
+                    rate_send_drops = 0;
+                    continue;
+                }
                 if picture.is_some() {
                     // The watch is on the direct picture, and that path can
                     // carry the bitrate from --bitrate-kbps. LiveKit's estimate
@@ -330,9 +350,19 @@ pub async fn run(
                     encoder.request_keyframe();
                 }
                 if let Some(target) = source.take_rate_control_request() {
-                    // Frame rate stays where it was set. Chasing it down after
-                    // a stall makes the stall permanent.
-                    governor.note_estimate(target.target_bitrate_bps);
+                    if room_media.load(Ordering::Relaxed) {
+                        let cap = u64::from(config.bitrate_kbps) * 1000;
+                        let bps = target.target_bitrate_bps.clamp(800_000, cap.max(800_000));
+                        if bps.abs_diff(link_bps) > 100_000 {
+                            link_bps = bps;
+                            encoder.set_bitrate_bps(bps);
+                            eprintln!("encoder bitrate -> {bps} bps (screen track)");
+                        }
+                    } else {
+                        // Frame rate stays where it was set. Chasing it down after
+                        // a stall makes the stall permanent.
+                        governor.note_estimate(target.target_bitrate_bps);
+                    }
                 }
             }
             packet = audio_rx.recv() => {
