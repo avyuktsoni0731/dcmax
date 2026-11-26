@@ -1,3 +1,4 @@
+use crate::adapt::RoomAim;
 use crate::api;
 use crate::config::AppConfig;
 use crate::encoder::ScreenEncoder;
@@ -65,9 +66,8 @@ pub async fn run(
             max_bitrate: u64::from(config.bitrate_kbps) * 1000,
             max_framerate: f64::from(config.target_fps),
         }),
-        // A screen-share default drops frames to keep resolution. That breaks
-        // a pre-encoded chain until the next keyframe, and the FFmpeg stand-in
-        // cannot make one on request.
+        // Hold the chosen frame rate and resolution. The encoder owns the
+        // bitrate and steps it down only while the receiver is losing the picture.
         degradation_preference: Some(DegradationPreference::MaintainFramerateAndResolution),
         ..Default::default()
     };
@@ -114,13 +114,14 @@ pub async fn run(
     let mut window_latency_ms: f64 = 0.0;
     let mut keyframe_requests: u64 = 0;
     let mut governor = RateGovernor::new(u64::from(config.bitrate_kbps) * 1000, config.target_fps);
+    let mut aim = RoomAim::new(config.bitrate_kbps, config.target_fps);
+    let mut room_ready = false;
+    let mut room_loss = 0u32;
     let mut rate_frames: u64 = 0;
     let mut rate_send_drops: u64 = 0;
     let mut late_drops: u64 = 0;
     let mut need_key = true;
     let mut last_timestamp_us: i64 = 0;
-    let mut link_bps = 0u64;
-    let mut room_cut = false;
     let room_media = Arc::new(AtomicBool::new(false));
     let (pipe_tx, mut pipe_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut waiting_for_direct = config.picture_direct;
@@ -222,7 +223,7 @@ pub async fn run(
                     "heartbeat: fps={achieved_fps:.1} frames={produced} dropped={dropped} queue_drops={} late={late_drops} stale={} keyframe_requests={keyframe_requests} rate_target_bps={} uptime={:.0}s{picture_note}",
                     encoder.queue_drops(),
                     encoder.stale_skips(),
-                    governor.applied_bps(),
+                    if room_ready { aim.applied_bps() } else { governor.applied_bps() },
                     started.elapsed().as_secs_f64()
                 );
                 // The frame loop has to keep reading while this post is in flight.
@@ -257,24 +258,40 @@ pub async fn run(
             }
             _ = rate_tick.tick() => {
                 if room_media.load(Ordering::Relaxed) {
-                    if !room_cut {
-                        room_cut = true;
-                        let cap = u64::from(config.bitrate_kbps) * 1000;
-                        let bps = cap.min(4_000_000).max(800_000);
-                        link_bps = bps;
-                        encoder.set_bitrate_bps(bps);
+                    if !room_ready {
+                        room_ready = true;
+                        encoder.set_bitrate_bps(aim.applied_bps());
+                        encoder.set_fps(config.target_fps);
                         encoder.request_keyframe();
-                        eprintln!("picture room: encoder starts at {} kbps", bps / 1000);
+                        eprintln!(
+                            "picture room: aiming at {}kbps {}fps",
+                            aim.applied_bps() / 1000,
+                            aim.fps()
+                        );
+                    }
+                    let pace = aim.decide(room_loss);
+                    room_loss = 0;
+                    if pace.changed {
+                        encoder.set_bitrate_bps(pace.bps);
+                        if pace.reason == "easing" {
+                            encoder.request_keyframe();
+                        }
+                        eprintln!(
+                            "share pace: {} {}kbps {}fps{}",
+                            pace.reason,
+                            pace.bps / 1000,
+                            pace.fps,
+                            aim.hint_note()
+                        );
                     }
                     rate_frames = 0;
                     rate_send_drops = 0;
                     continue;
                 }
-                if picture.is_some() {
-                    // The watch is on the direct picture, and that path can
-                    // carry the bitrate from --bitrate-kbps. LiveKit's estimate
-                    // describes the cloud hop, which will not hold 50–100 Mbps,
-                    // so it must not walk the encoder down.
+                if waiting_for_direct || picture.is_some() {
+                    // The direct path is still opening, or it is already carrying
+                    // the picture at the chosen bitrate. The cloud estimate
+                    // describes a different hop and stays out of this encoder.
                     rate_frames = 0;
                     rate_send_drops = 0;
                     continue;
@@ -347,17 +364,14 @@ pub async fn run(
                 }
                 if source.take_keyframe_request() {
                     keyframe_requests += 1;
+                    if room_media.load(Ordering::Relaxed) {
+                        room_loss = room_loss.saturating_add(1);
+                    }
                     encoder.request_keyframe();
                 }
                 if let Some(target) = source.take_rate_control_request() {
                     if room_media.load(Ordering::Relaxed) {
-                        let cap = u64::from(config.bitrate_kbps) * 1000;
-                        let bps = target.target_bitrate_bps.clamp(800_000, cap.max(800_000));
-                        if bps.abs_diff(link_bps) > 100_000 {
-                            link_bps = bps;
-                            encoder.set_bitrate_bps(bps);
-                            eprintln!("encoder bitrate -> {bps} bps (screen track)");
-                        }
+                        aim.note_estimate(target.target_bitrate_bps);
                     } else {
                         // Frame rate stays where it was set. Chasing it down after
                         // a stall makes the stall permanent.

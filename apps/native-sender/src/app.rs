@@ -1,7 +1,7 @@
 //! The window people open. No flags: a name, a room code, then voice and the
 //! native picture. The command-line tools stay available when arguments are set.
 
-use crate::adapt::PictureAdapt;
+use crate::adapt::{PictureAdapt, RoomAim};
 use crate::audio::{decode_packet, decoder as opus_decoder, AudioPlayer, PlayClock};
 use crate::config::{AppConfig, CaptureBackend, EncoderBackend, TargetPlatform};
 use crate::direct::{self, TOPIC};
@@ -2079,7 +2079,9 @@ async fn share_loop(
             max_bitrate: u64::from(config.bitrate_kbps) * 1000,
             max_framerate: f64::from(config.target_fps),
         }),
-        degradation_preference: Some(DegradationPreference::Balanced),
+        // Hold the chosen frame rate and resolution. The encoder owns the
+        // bitrate and steps it down only while the receiver is losing the picture.
+        degradation_preference: Some(DegradationPreference::MaintainFramerateAndResolution),
         ..Default::default()
     };
     let publication = participant
@@ -2101,9 +2103,8 @@ async fn share_loop(
     let mut keys = 0u64;
     let mut last_sent = picture.sent();
     let mut last_skipped = picture.skipped();
-    let mut cap_bps = u64::from(config.bitrate_kbps) * 1000;
-    let mut link_bps: Option<u64> = None;
-    let mut link_fps = config.target_fps;
+    let mut aim = RoomAim::new(config.bitrate_kbps, config.target_fps);
+    let mut link_loss = 0u32;
     let mut room_ready = false;
     let mut screen_pcm: Option<tokio::sync::mpsc::Sender<Vec<i16>>> = None;
     note_log(&format!(
@@ -2123,15 +2124,14 @@ async fn share_loop(
             changed = tune.changed() => {
                 if changed.is_ok() {
                     let next = *tune.borrow();
-                    cap_bps = u64::from(next.bitrate_kbps) * 1000;
                     adapt.set_ceiling(next.bitrate_kbps);
                     adapt.set_target_fps(next.fps);
-                    link_fps = link_fps.min(next.fps);
+                    let aimed = aim.set_ceiling(next.bitrate_kbps);
+                    aim.set_target_fps(next.fps);
                     if room_ready {
-                        if let Some(applied) = link_bps {
-                            let bps = applied.min(cap_bps).max(800_000);
-                            link_bps = Some(bps);
-                            encoder.set_bitrate_bps(bps);
+                        encoder.set_fps(aim.fps());
+                        if aimed {
+                            encoder.set_bitrate_bps(aim.applied_bps());
                         }
                     } else {
                         let pace = adapt.pace();
@@ -2151,14 +2151,11 @@ async fn share_loop(
                     &room_media,
                     &mut room_ready,
                     &encoder,
-                    cap_bps,
-                    &mut link_bps,
+                    &aim,
                     &mut screen_pcm,
                     &participant,
                 );
-                if room_ready {
-                    follow_link(&source, &encoder, cap_bps, &mut link_bps, &mut link_fps, config.target_fps);
-                }
+                note_link(&source, &mut aim);
                 let timestamp_us = match unit.timestamp_us {
                     Some(timestamp) if timestamp > 0 => timestamp,
                     _ => {
@@ -2198,9 +2195,13 @@ async fn share_loop(
                 };
                 let _ = source.capture_encoded_frame(&frame);
                 if source.take_keyframe_request() {
+                    if room_ready {
+                        link_loss = link_loss.saturating_add(1);
+                    }
                     request_key(&encoder, &mut last_key);
                 }
                 if window.elapsed() >= Duration::from_secs(1) {
+                    settle_room(&encoder, &mut aim, &mut link_loss, &mut last_key, room_ready);
                     apply_pace(
                         &encoder,
                         &mut adapt,
@@ -2214,7 +2215,7 @@ async fn share_loop(
                         &mut keys,
                         &mut last_sent,
                         &mut last_skipped,
-                        link_bps.map(|bps| (bps, link_fps)),
+                        room_ready.then_some(&aim),
                     );
                     window = Instant::now();
                 }
@@ -2224,8 +2225,7 @@ async fn share_loop(
                     &room_media,
                     &mut room_ready,
                     &encoder,
-                    cap_bps,
-                    &mut link_bps,
+                    &aim,
                     &mut screen_pcm,
                     &participant,
                 );
@@ -2250,15 +2250,13 @@ async fn share_loop(
                     &room_media,
                     &mut room_ready,
                     &encoder,
-                    cap_bps,
-                    &mut link_bps,
+                    &aim,
                     &mut screen_pcm,
                     &participant,
                 );
-                if room_ready {
-                    follow_link(&source, &encoder, cap_bps, &mut link_bps, &mut link_fps, config.target_fps);
-                }
+                note_link(&source, &mut aim);
                 if window.elapsed() >= Duration::from_secs(1) {
+                    settle_room(&encoder, &mut aim, &mut link_loss, &mut last_key, room_ready);
                     apply_pace(
                         &encoder,
                         &mut adapt,
@@ -2272,7 +2270,7 @@ async fn share_loop(
                         &mut keys,
                         &mut last_sent,
                         &mut last_skipped,
-                        link_bps.map(|bps| (bps, link_fps)),
+                        room_ready.then_some(&aim),
                     );
                     window = Instant::now();
                 }
@@ -2305,12 +2303,12 @@ fn apply_pace(
     keys: &mut u64,
     last_sent: &mut u64,
     last_skipped: &mut u64,
-    link: Option<(u64, u32)>,
+    room: Option<&RoomAim>,
 ) {
     let sent = picture.sent().saturating_sub(*last_sent);
     let skipped = picture.skipped().saturating_sub(*last_skipped);
     let pace = adapt.observe(*encoded, sent, skipped);
-    if link.is_none() && pace.changed {
+    if room.is_none() && pace.changed {
         encoder.set_bitrate_bps(pace.bps);
         encoder.set_fps(pace.fps);
         note_log(&format!(
@@ -2320,7 +2318,10 @@ fn apply_pace(
             pace.fps
         ));
     }
-    let (pace_bps, pace_fps) = link.unwrap_or((pace.bps, pace.fps));
+    let (pace_bps, pace_fps, hint) = match room {
+        Some(aim) => (aim.applied_bps(), aim.fps(), aim.hint_bps()),
+        None => (pace.bps, pace.fps, None),
+    };
     log_share(
         picture,
         elapsed,
@@ -2334,6 +2335,7 @@ fn apply_pace(
         last_skipped,
         pace_bps,
         pace_fps,
+        hint,
     );
 }
 
@@ -2477,15 +2479,11 @@ async fn play_live_video(
     }
 }
 
-const ROOM_FLOOR_BPS: u64 = 800_000;
-const ROOM_START_BPS: u64 = 4_000_000;
-
 fn enter_room(
     room_media: &AtomicBool,
     entered: &mut bool,
     encoder: &ScreenEncoder,
-    cap_bps: u64,
-    link_bps: &mut Option<u64>,
+    aim: &RoomAim,
     screen_pcm: &mut Option<tokio::sync::mpsc::Sender<Vec<i16>>>,
     participant: &LocalParticipant,
 ) {
@@ -2493,13 +2491,13 @@ fn enter_room(
         return;
     }
     *entered = true;
-    let start = cap_bps.min(ROOM_START_BPS).max(ROOM_FLOOR_BPS);
-    encoder.set_bitrate_bps(start);
-    *link_bps = Some(start);
+    encoder.set_bitrate_bps(aim.applied_bps());
+    encoder.set_fps(aim.fps());
     encoder.request_keyframe();
     note_log(&format!(
-        "picture room: screen track at {}kbps until the link reports",
-        start / 1000
+        "picture room: aiming at {}kbps {}fps",
+        aim.applied_bps() / 1000,
+        aim.fps()
     ));
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     *screen_pcm = Some(tx);
@@ -2509,31 +2507,38 @@ fn enter_room(
     });
 }
 
-fn follow_link(
-    source: &NativeVideoSource,
+fn note_link(source: &NativeVideoSource, aim: &mut RoomAim) {
+    if let Some(target) = source.take_rate_control_request() {
+        aim.note_estimate(target.target_bitrate_bps);
+    }
+}
+
+fn settle_room(
     encoder: &ScreenEncoder,
-    cap_bps: u64,
-    link_bps: &mut Option<u64>,
-    link_fps: &mut u32,
-    fps_cap: u32,
+    aim: &mut RoomAim,
+    loss: &mut u32,
+    last_key: &mut Instant,
+    room_ready: bool,
 ) {
-    let Some(target) = source.take_rate_control_request() else {
+    if !room_ready {
         return;
-    };
-    let ceiling = cap_bps.max(ROOM_FLOOR_BPS);
-    let bps = target.target_bitrate_bps.clamp(ROOM_FLOOR_BPS, ceiling);
-    if link_bps.map(|applied| applied.abs_diff(bps) > 100_000).unwrap_or(true) {
-        encoder.set_bitrate_bps(bps);
-        *link_bps = Some(bps);
-        note_log(&format!("share pace: link {}kbps", bps / 1000));
     }
-    if target.framerate_fps.is_finite() && target.framerate_fps >= 15.0 {
-        let fps = (target.framerate_fps.round() as u32).clamp(15, fps_cap.max(15));
-        if fps != *link_fps {
-            *link_fps = fps;
-            encoder.set_fps(fps);
-        }
+    let pace = aim.decide(*loss);
+    *loss = 0;
+    if !pace.changed {
+        return;
     }
+    encoder.set_bitrate_bps(pace.bps);
+    if pace.reason == "easing" {
+        request_key(encoder, last_key);
+    }
+    note_log(&format!(
+        "share pace: {} {}kbps {}fps{}",
+        pace.reason,
+        pace.bps / 1000,
+        pace.fps,
+        aim.hint_note()
+    ));
 }
 
 async fn publish_screen_audio(
@@ -2878,12 +2883,17 @@ fn log_share(
     last_skipped: &mut u64,
     pace_bps: u64,
     pace_fps: u32,
+    hint_bps: Option<u64>,
 ) {
     let secs = elapsed.as_secs_f64().max(0.001);
     let sent = picture.sent();
     let skipped = picture.skipped();
+    let hint = match hint_bps {
+        Some(bps) => format!("{}", bps / 1000),
+        None => "-".to_string(),
+    };
     note_log(&format!(
-        "share: encoded={:.0} sent={:.0} skipped={:.0} late={} key={} audio={:.0} video_kbps={:.0} audio_kbps={:.0} pace_kbps={} pace_fps={}",
+        "share: encoded={:.0} sent={:.0} skipped={:.0} late={} key={} audio={:.0} video_kbps={:.0} audio_kbps={:.0} pace_kbps={} pace_fps={} hint_kbps={hint}",
         per_sec(*encoded, secs),
         per_sec(sent.saturating_sub(*last_sent), secs),
         per_sec(skipped.saturating_sub(*last_skipped), secs),
