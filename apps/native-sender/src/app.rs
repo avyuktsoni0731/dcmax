@@ -2197,6 +2197,18 @@ async fn share_loop(
                 if source.take_keyframe_request() {
                     if room_ready {
                         link_loss = link_loss.saturating_add(1);
+                        if !unit.keyframe {
+                            need_key = true;
+                        }
+                        if let Some(bps) = aim.recover(link_loss) {
+                            encoder.set_bitrate_bps(bps);
+                            note_log(&format!(
+                                "share pace: recovering {}kbps {}fps{}",
+                                bps / 1000,
+                                aim.fps(),
+                                aim.hint_note()
+                            ));
+                        }
                     }
                     request_key(&encoder, &mut last_key);
                 }

@@ -366,6 +366,18 @@ pub async fn run(
                     keyframe_requests += 1;
                     if room_media.load(Ordering::Relaxed) {
                         room_loss = room_loss.saturating_add(1);
+                        if !unit.keyframe {
+                            need_key = true;
+                        }
+                        if let Some(bps) = aim.recover(room_loss) {
+                            encoder.set_bitrate_bps(bps);
+                            eprintln!(
+                                "share pace: recovering {}kbps {}fps{}",
+                                bps / 1000,
+                                aim.fps(),
+                                aim.hint_note()
+                            );
+                        }
                     }
                     encoder.request_keyframe();
                 }

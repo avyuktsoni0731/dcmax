@@ -159,6 +159,8 @@ pub struct RoomAim {
     seen: u32,
     loss_seconds: u32,
     clean_seconds: u32,
+    /// This second already stepped the rate down because the chain broke.
+    recovered: bool,
     /// Clean seconds required before probing above a hint that is already below us.
     probe_wait: u32,
 }
@@ -174,6 +176,7 @@ impl RoomAim {
             seen: 0,
             loss_seconds: 0,
             clean_seconds: 0,
+            recovered: false,
             probe_wait: ROOM_CLIMB_WAIT,
         }
     }
@@ -226,12 +229,61 @@ impl RoomAim {
         self.estimate_bps = Some(bps.clamp(ROOM_FLOOR_BPS, ceiling));
     }
 
+    /// A repeated break in the picture. Returns the rate the recovery
+    /// keyframe should use. One request in a clean second does not cut,
+    /// and the opening seconds do not cut while the watcher attaches.
+    /// The caller stops forwarding deltas until that keyframe is sent.
+    pub fn recover(&mut self, breaks_this_second: u32) -> Option<u64> {
+        if self.seen < ROOM_WARMUP_SECONDS || self.recovered {
+            return None;
+        }
+        let repeated = breaks_this_second >= 2 || self.loss_seconds > 0;
+        if !repeated {
+            return None;
+        }
+        let previous = self.applied_bps;
+        let heavy = breaks_this_second >= 4 || self.loss_seconds > 0;
+        let (numer, denom) = if heavy { (1, 2) } else { (2, 3) };
+        let mut next = (previous.saturating_mul(numer) / denom).max(ROOM_FLOOR_BPS);
+        if let Some(hint) = self.estimate_bps {
+            if hint.saturating_add(500_000) < previous {
+                let fit = hint.saturating_mul(2).max(ROOM_FLOOR_BPS).min(self.ceiling_bps);
+                next = next.min(fit);
+            }
+        }
+        next = next.min(self.ceiling_bps).max(ROOM_FLOOR_BPS);
+        if next == previous {
+            return None;
+        }
+        self.applied_bps = next;
+        self.recovered = true;
+        self.clean_seconds = 0;
+        if self
+            .estimate_bps
+            .is_some_and(|hint| hint.saturating_add(500_000) < previous)
+        {
+            self.probe_wait = (self.probe_wait + 2).min(12);
+        }
+        Some(next)
+    }
+
     /// One observation is about one second. `keyframe_requests` counts how
     /// often the receiver lost the chain during that second.
     pub fn decide(&mut self, keyframe_requests: u32) -> Pace {
         let previous_bps = self.applied_bps;
         self.seen = self.seen.saturating_add(1);
         if self.seen <= ROOM_WARMUP_SECONDS {
+            self.recovered = false;
+            return self.finish(previous_bps, "holding");
+        }
+        if self.recovered {
+            self.recovered = false;
+            if keyframe_requests == 0 {
+                self.loss_seconds = 0;
+            } else {
+                self.loss_seconds = self.loss_seconds.saturating_add(1);
+            }
+            self.clean_seconds = 0;
             return self.finish(previous_bps, "holding");
         }
         let losing = keyframe_requests >= 2
@@ -411,6 +463,41 @@ mod tests {
         let pace = adapt.observe(57, 54, 3);
         assert_eq!(pace.bps, 20_000_000);
         assert_eq!(pace.reason, "holding");
+    }
+
+    #[test]
+    fn a_repeated_break_shrinks_the_recovery_frame_once() {
+        let mut aim = RoomAim::new(20_000, 60);
+        aim.decide(0);
+        aim.decide(0);
+        aim.note_estimate(4_000_000);
+        assert!(aim.recover(1).is_none());
+        let next = aim.recover(2).expect("a second break steps down");
+        assert_eq!(next, 8_000_000);
+        assert_eq!(aim.fps(), 60);
+        let pace = aim.decide(2);
+        assert_eq!(pace.bps, next);
+        assert!(!pace.changed);
+        assert_eq!(pace.fps, 60);
+    }
+
+    #[test]
+    fn a_break_while_the_watcher_attaches_keeps_the_target() {
+        let mut aim = RoomAim::new(20_000, 60);
+        assert!(aim.recover(4).is_none());
+        assert_eq!(aim.applied_bps(), 20_000_000);
+    }
+
+    #[test]
+    fn a_second_broken_second_cuts_on_the_first_request() {
+        let mut aim = RoomAim::new(20_000, 60);
+        aim.decide(0);
+        aim.decide(0);
+        let once = aim.decide(1);
+        assert!(!once.changed);
+        let next = aim.recover(1).expect("the following broken second steps down");
+        assert_eq!(next, 10_000_000);
+        assert_eq!(aim.fps(), 60);
     }
 
     #[test]
