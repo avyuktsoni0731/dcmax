@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ago, faceColor, initials, loadDesk, saveDesk, type Desk, type Friend } from "./desk";
+import ramenUrl from "./ramen.svg";
+import { ago, faceColor, initials, loadDesk, saveDesk, type Desk, type Friend, type Mail } from "./desk";
 import {
   AddIcon,
   ArrowIcon,
@@ -11,7 +12,6 @@ import {
   FullscreenIcon,
   HeadphonesIcon,
   HomeIcon,
-  LeaveIcon,
   MessagesIcon,
   MicIcon,
   MicOffIcon,
@@ -21,8 +21,7 @@ import {
   SearchIcon,
   SendIcon,
   SettingsIcon,
-  ShareIcon,
-  StopIcon
+  ShareIcon
 } from "./icons";
 import { playEnter, playExit, playJoined, playLeft, playMute, playUnmute, primeAudio } from "./sounds";
 
@@ -37,7 +36,7 @@ type Person = { name: string; local: boolean; speaking: boolean };
 
 type Page = "home" | "friends" | "messages" | "recents" | "settings";
 type Dialog = "create" | "join" | "friend" | null;
-type Menu = "share" | "audio" | null;
+type Menu = "share" | "audio" | "hear" | "devices" | "stream" | "resolution" | "fps" | "bitrate" | "screens" | null;
 type FriendTab = "online" | "all" | "requests";
 
 const RESOLUTIONS = [
@@ -213,14 +212,33 @@ export function App() {
         }
       ]
     });
-    setActive("souvlakee");
-    if (preview === "call") {
+    if (preview !== "inbox") setActive("souvlakee");
+    if (preview === "call" || preview === "share" || preview === "options" || preview === "mics" || preview === "screens") {
       setPhase("call");
+      setSharing(preview === "share" || preview === "options");
+      if (preview === "options") {
+        setMenu("resolution");
+        setPicker([
+          { id: 1, label: "LG ULTRAGEAR", width: 1920, height: 1080 },
+          { id: 2, label: "LG FHD", width: 1080, height: 1920 }
+        ]);
+      }
+      if (preview === "mics") setMenu("devices");
+      if (preview === "screens") {
+        setMenu("screens");
+        setPicker([
+          { id: 1, label: "LG ULTRAGEAR", width: 1920, height: 1080 },
+          { id: 2, label: "LG FHD", width: 1080, height: 1920 }
+        ]);
+      }
       setPeople([
         { name: "Avyukt", local: true, speaking: false },
         { name: "souvlakee", local: false, speaking: true }
       ]);
       setStatus("In the room");
+    } else if (preview === "inbox") {
+      setPage("messages");
+      setActive("");
     } else if (preview === "messages" || preview === "friends" || preview === "recents" || preview === "settings") {
       setPage(preview);
     }
@@ -362,10 +380,6 @@ export function App() {
     const node = document.getElementById("stage");
     if (!node) return;
     const post = () => {
-      if (picker) {
-        void invoke("stage_rect", { body: { x: 0, y: 0, width: 0, height: 0, visible: false } }).catch(() => {});
-        return;
-      }
       const rect = node.getBoundingClientRect();
       void invoke("stage_rect", {
         body: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, visible: true }
@@ -380,7 +394,7 @@ export function App() {
       window.removeEventListener("resize", post);
       void invoke("stage_rect", { body: { x: 0, y: 0, width: 0, height: 0, visible: false } }).catch(() => {});
     };
-  }, [phase, picker, fullscreen, chrome]);
+  }, [phase, fullscreen, chrome]);
 
   useEffect(() => {
     if (phase !== "call") return;
@@ -392,7 +406,7 @@ export function App() {
     if (!menu) return;
     const close = (event: PointerEvent) => {
       const target = event.target;
-      if (target instanceof Element && target.closest(".tool, .strip")) return;
+      if (target instanceof Element && target.closest(".tool, .strip, .flyout")) return;
       setMenu(null);
     };
     window.addEventListener("pointerdown", close);
@@ -436,24 +450,41 @@ export function App() {
     return { width: size.width, height: size.height, fps, bitrateKbps: bitrate, displayId };
   };
 
+  async function loadScreens() {
+    try {
+      return await invoke<ScreenChoice[]>("screens");
+    } catch {
+      return [];
+    }
+  }
+
   async function shareScreen() {
     if (sharingRef.current) {
       await invoke("stop_share");
       return;
     }
-    let found: ScreenChoice[] = [];
-    try {
-      found = await invoke<ScreenChoice[]>("screens");
-    } catch {
-      found = [];
-    }
+    const found = await loadScreens();
     if (found.length > 1) {
       setPicker(found);
+      setMenu("screens");
       return;
     }
     const next = found[0]?.id ?? null;
     setDisplayId(next);
     await invoke("share", { body: { ...picture(), displayId: next } });
+  }
+
+  async function showScreens() {
+    setPicker(await loadScreens());
+    setMenu("screens");
+  }
+
+  async function useScreen(id: number) {
+    setPicker(null);
+    setDisplayId(id);
+    setMenu(null);
+    if (sharingRef.current) await invoke("stop_share");
+    await invoke("share", { body: { ...picture(), displayId: id } });
   }
   shareRef.current = shareScreen;
 
@@ -550,202 +581,192 @@ export function App() {
     const featured = others.find((person) => person.speaking) ?? others[0];
     const you = people.find((person) => person.local);
     const talking = Boolean(featured && featured.speaking);
+    const size = RESOLUTIONS[resolution] ?? RESOLUTIONS[1];
+    const volumeOpen = menu === "audio" || menu === "hear";
     return (
-      <div className={`app${fullscreen ? " fullscreen" : ""}${fullscreen && chrome ? " chrome" : ""}`}>
-        <div className="call">
-          <header className="call-top">
-            <div className="brand">
-              <i>//</i> MyCord
-            </div>
-            <div className="call-room">
-              <FriendsIcon size={16} />
-              <strong>{room || "Room"}</strong>
-              <span>{Math.max(people.length, 1)} {Math.max(people.length, 1) === 1 ? "person" : "people"}</span>
-            </div>
-            <div className={`call-live${status && /microphone|could not|did not/i.test(status) ? " warn" : ""}`}>{notice ?? status}</div>
-          </header>
-          <div className="stage" id="stage">
-            <div className="stage-copy">{sharing ? "Sharing your screen." : "Waiting for a screen."}</div>
-          </div>
-          {menu === "audio" ? (
-            <div className="strip" role="dialog" aria-label="Audio boost">
-              <label>
-                Voice
-                <input type="range" min={0} max={200} step={5} value={voice} aria-label="Other person's volume" onChange={(event) => changeVoice(Number(event.target.value))} />
-              </label>
-              <strong className="boost-read">{voice}%</strong>
-              <label>
-                Screen
-                <input type="range" min={0} max={200} step={5} value={screen} aria-label="Screen audio volume" onChange={(event) => changeScreen(Number(event.target.value))} />
-              </label>
-              <strong className="boost-read">{screen}%</strong>
-              <DeviceSelect label="Microphone" value={inputId} devices={inputs} onChange={pickInput} />
-              <DeviceSelect label="Speakers" value={outputId} devices={outputs} onChange={pickOutput} />
-              <NoiseSwitch on={noise} onChange={pickNoise} />
-            </div>
-          ) : null}
-          {menu === "share" ? (
-            <div className="strip" role="dialog" aria-label="Screen share settings">
-              <label>
-                Resolution
-                <select aria-label="Resolution" value={resolution} onChange={(event) => tune({ resolution: Number(event.target.value) })}>
-                  {RESOLUTIONS.map((item, index) => (
-                    <option key={item.label} value={index}>{item.label}</option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Framerate
-                <select aria-label="Frame rate" value={fps} onChange={(event) => tune({ fps: Number(event.target.value) })}>
-                  <option value={30}>30 Hz</option>
-                  <option value={60}>60 Hz</option>
-                </select>
-              </label>
-              <label>
-                Bitrate
-                <select aria-label="Bitrate" value={bitrate} onChange={(event) => tune({ bitrate: Number(event.target.value) })}>
-                  {BITRATES.map((value) => (
-                    <option key={value} value={value}>{value / 1000} Mbps</option>
-                  ))}
-                </select>
-              </label>
-            </div>
-          ) : null}
-          <div className="call-dock">
-            <button
-              className={`who${talking ? " speaking" : ""}`}
-              type="button"
+      <div className={`app mock${fullscreen ? " fullscreen" : ""}${fullscreen && chrome ? " chrome" : ""}`}>
+        <div className="shell call-shell">
+          <Rail page={null} onPage={() => {}} />
+          <div className="workspace call">
+            <header className="topbar">
+              <span className="topbar-title"><PhoneIcon size={18} /> Call</span>
+              <span className={`call-live${status && /microphone|could not|did not/i.test(status) ? " warn" : ""}`}>{notice ?? status}</span>
+              <button
+                className="icon-quiet"
+                type="button"
+                aria-pressed={fullscreen}
+                aria-label={fullscreen ? "Exit full screen" : "Full screen"}
+                onClick={() => {
+                  const on = !fullscreen;
+                  setFullscreen(on);
+                  void invoke("set_fullscreen", { body: { on } });
+                }}
+              >
+                {fullscreen ? <FullscreenExitIcon size={18} /> : <FullscreenIcon size={18} />}
+              </button>
+            </header>
+            <div
+              className="call-panel"
               onContextMenu={(event) => {
                 event.preventDefault();
-                setMenu("audio");
+                setMenu(sharing ? "hear" : "audio");
               }}
             >
-              <Avatar name={featured?.name || name || "You"} online={Boolean(featured)} />
-              <span className="person-line">
-                <strong>{featured?.name || "Just you"}</strong>
-                <span className="bars" aria-hidden="true">
-                  <i /><i /><i /><i />
-                </span>
-              </span>
-            </button>
-            <div className="controls">
-              <div className={`tool${muted ? " muted" : ""}`} onPointerDown={(event) => event.stopPropagation()}>
-                <button
-                  type="button"
-                  aria-pressed={muted}
-                  aria-label={muted ? "Unmute" : "Mute"}
-                  onClick={() => {
-                    primeAudio();
-                    const next = !muted;
-                    void run(async () => {
-                      await invoke("set_muted", { body: { muted: next } });
-                      setMuted(next);
-                      if (next) playMute();
-                      else playUnmute();
-                    });
-                  }}
-                >
-                  {muted ? <MicOffIcon /> : <MicIcon />}
-                </button>
-                <button className="caret" type="button" aria-label="Voice volume" onClick={() => setMenu(menu === "audio" ? null : "audio")}>
-                  <ChevronIcon size={18} />
-                </button>
+              <div className="stage" id="stage">
+                <div className="stage-copy">{sharing ? "Sharing your screen." : "Waiting for a screen."}</div>
               </div>
-              <div className={`tool${deaf ? " muted" : ""}`} onPointerDown={(event) => event.stopPropagation()}>
-                <button type="button" aria-pressed={deaf} aria-label={deaf ? "Hear the room" : "Silence the room"} onClick={toggleDeaf}>
-                  <HeadphonesIcon />
-                </button>
+              <aside className="call-side" onContextMenu={(event) => event.stopPropagation()}>
+                {volumeOpen ? (
+                  <div className="flyout" role="dialog" aria-label={menu === "hear" ? "Screen audio" : "Voice"}>
+                    <p>Right Click Anywhere</p>
+                    {menu === "hear" ? (
+                      <VolumeRow label="Audio" value={screen} onChange={changeScreen} />
+                    ) : (
+                      <VolumeRow label="Voice" value={voice} onChange={changeVoice} />
+                    )}
+                    {menu === "hear" ? (
+                      <VolumeRow label="Voice" value={voice} onChange={changeVoice} />
+                    ) : (
+                      <VolumeRow label="Audio" value={screen} onChange={changeScreen} />
+                    )}
+                  </div>
+                ) : null}
+                {menu === "devices" ? (
+                  <div className="flyout devices" role="dialog" aria-label="Microphone settings">
+                    <DeviceSelect label="Input Device" value={inputId} devices={inputs} onChange={pickInput} />
+                    <DeviceSelect label="Output Device" value={outputId} devices={outputs} onChange={pickOutput} />
+                    <NoiseSwitch on={noise} onChange={pickNoise} />
+                  </div>
+                ) : null}
+                {menu === "share" ? (
+                  <div className="flyout menu-card" role="dialog" aria-label="Share">
+                    <button type="button" onClick={() => void showScreens()}>Select Screen <ChevronIcon size={16} /></button>
+                    <button type="button" onClick={() => setMenu("stream")}>Stream Options <ChevronIcon size={16} /></button>
+                  </div>
+                ) : null}
+                {menu === "screens" ? (
+                  <div className="flyout menu-card" role="dialog" aria-label="Select a screen">
+                    {picker && picker.length > 0 ? picker.map((choice) => (
+                      <button key={choice.id} type="button" onClick={() => void run(() => useScreen(choice.id))}>
+                        {choice.label} {choice.width}x{choice.height}
+                      </button>
+                    )) : <p>No screens found.</p>}
+                  </div>
+                ) : null}
+                {menu === "stream" ? (
+                  <div className="flyout menu-card" role="dialog" aria-label="Stream options">
+                    <button type="button" onClick={() => setMenu("resolution")}>Resolution <span>{size.label.replace(" × ", "x")}</span></button>
+                    <button type="button" onClick={() => setMenu("fps")}>Framerate <span>{fps} Hz</span></button>
+                    <button type="button" onClick={() => setMenu("bitrate")}>Bitrate <span>{bitrate / 1000} Mbps</span></button>
+                  </div>
+                ) : null}
+                {menu === "resolution" ? (
+                  <div className="flyout menu-card" role="dialog" aria-label="Resolution">
+                    {[...RESOLUTIONS].reverse().map((item) => {
+                      const index = RESOLUTIONS.indexOf(item);
+                      return (
+                        <button key={item.label} type="button" className={index === resolution ? "picked" : ""} onClick={() => tune({ resolution: index })}>
+                          <i /> {item.label.replace(" × ", "x")}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
+                {menu === "fps" ? (
+                  <div className="flyout menu-card" role="dialog" aria-label="Frame rate">
+                    {[30, 60].map((value) => (
+                      <button key={value} type="button" className={fps === value ? "picked" : ""} onClick={() => tune({ fps: value })}>
+                        <i /> {value} Hz
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {menu === "bitrate" ? (
+                  <div className="flyout menu-card" role="dialog" aria-label="Bitrate">
+                    {BITRATES.map((value) => (
+                      <button key={value} type="button" className={bitrate === value ? "picked" : ""} onClick={() => tune({ bitrate: value })}>
+                        <i /> {value / 1000} Mbps
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="tile-stack">
+                  {sharing && featured ? (
+                    <div className={`face-tile${talking ? " speaking" : ""}`}>
+                      <Avatar name={featured.name} large />
+                    </div>
+                  ) : null}
+                  <div className={`face-tile you-tile${you?.speaking && !muted ? " speaking" : ""}`}>
+                    <Avatar name={you?.name || name || "You"} large />
+                    <span>{you?.name || name || "You"}</span>
+                  </div>
+                </div>
+              </aside>
+              <div className="call-dock">
+                <div className={`name-pill${talking ? " speaking" : ""}`}>
+                  <strong>{featured?.name || "Just you"}</strong>
+                </div>
+                <div className="controls">
+                  <div className={`tool${muted ? " muted" : ""}`}>
+                    <button
+                      type="button"
+                      aria-pressed={muted}
+                      aria-label={muted ? "Unmute" : "Mute"}
+                      onClick={() => {
+                        primeAudio();
+                        const next = !muted;
+                        void run(async () => {
+                          await invoke("set_muted", { body: { muted: next } });
+                          setMuted(next);
+                          if (next) playMute();
+                          else playUnmute();
+                        });
+                      }}
+                    >
+                      {muted ? <MicOffIcon /> : <MicIcon />}
+                    </button>
+                    <button className="caret" type="button" aria-label="Microphone settings" onClick={() => setMenu(menu === "devices" ? null : "devices")}>
+                      <ChevronIcon size={16} />
+                    </button>
+                  </div>
+                  <div className={`tool${deaf ? " muted" : ""}`}>
+                    <button type="button" aria-pressed={deaf} aria-label={deaf ? "Hear the room" : "Silence the room"} onClick={toggleDeaf}>
+                      <HeadphonesIcon />
+                    </button>
+                    <button className="caret" type="button" aria-label="Volume" onClick={() => setMenu(volumeOpen ? null : sharing ? "hear" : "audio")}>
+                      <ChevronIcon size={16} />
+                    </button>
+                  </div>
+                  <span className="control-split" />
+                  <div className={`tool${sharing ? " on" : ""}`}>
+                    <button type="button" aria-pressed={sharing} aria-label={sharing ? "Stop sharing" : "Share screen"} onClick={() => void run(shareScreen)}>
+                      <ShareIcon size={18} />
+                    </button>
+                    <button className="caret" type="button" aria-label="Share settings" onClick={() => setMenu(menu === "share" ? null : "share")}>
+                      <ChevronIcon size={16} />
+                    </button>
+                  </div>
+                  <button className="hangup" type="button" disabled={busy} aria-label="Leave" onClick={() => { primeAudio(); void run(() => invoke("leave")); }}>
+                    <PhoneIcon size={20} />
+                  </button>
+                </div>
               </div>
-              <div className={`tool${sharing ? " on" : ""}`} onPointerDown={(event) => event.stopPropagation()}>
-                <button type="button" aria-pressed={sharing} onClick={() => void run(shareScreen)}>
-                  {sharing ? <StopIcon size={18} /> : <ShareIcon size={18} />}
-                  <span className="share-label">{sharing ? "Stop sharing" : "Share screen"}</span>
-                </button>
-                <button className="caret" type="button" aria-label="Share settings" onClick={() => setMenu(menu === "share" ? null : "share")}>
-                  <ChevronIcon size={18} />
-                </button>
-              </div>
-              <div className="tool">
-                <button
-                  type="button"
-                  aria-pressed={fullscreen}
-                  aria-label={fullscreen ? "Exit full screen" : "Full screen"}
-                  onClick={() => {
-                    const on = !fullscreen;
-                    setFullscreen(on);
-                    void invoke("set_fullscreen", { body: { on } });
-                  }}
-                >
-                  {fullscreen ? <FullscreenExitIcon /> : <FullscreenIcon />}
-                </button>
-              </div>
-              <button className="danger" type="button" disabled={busy} onClick={() => { primeAudio(); void run(() => invoke("leave")); }}>
-                <LeaveIcon size={18} /> Leave
-              </button>
-            </div>
-            <div className={`you-tile${you?.speaking && !muted ? " speaking" : ""}`}>
-              <Avatar name={you?.name || name || "You"} large />
-              You
             </div>
           </div>
         </div>
-        {picker ? (
-          <div className="picker" role="dialog" aria-modal="true" aria-label="Choose a screen">
-            <div className="picker-card">
-              <h2>Choose a screen</h2>
-              {picker.map((choice) => (
-                <button
-                  className="room"
-                  key={choice.id}
-                  type="button"
-                  onClick={() => {
-                    const next = choice.id;
-                    setPicker(null);
-                    setDisplayId(next);
-                    void run(() => invoke("share", { body: { ...picture(), displayId: next } }));
-                  }}
-                >
-                  <span className="room-mark"><MonitorIcon size={18} /></span>
-                  <span className="person-line">
-                    <strong>{choice.label}</strong>
-                    <span>{choice.width} × {choice.height}</span>
-                  </span>
-                </button>
-              ))}
-              <button className="outline" type="button" onClick={() => setPicker(null)}>Cancel</button>
-            </div>
-          </div>
-        ) : null}
       </div>
     );
   }
 
   const threadNames = conversationList(desk, query);
-  const selectedName = threadNames.some((item) => item.name === active) ? active : threadNames[0]?.name ?? null;
+  const selectedName = threadNames.some((item) => item.name === active) ? active : null;
   const selected = threadNames.find((item) => item.name === selectedName) ?? null;
   const thread = desk.threads.find((item) => item.name === selectedName);
 
   return (
-    <div className="app">
+    <div className={`app${page === "messages" ? " mock" : ""}`}>
       <div className="shell">
-        <aside className="sidebar">
-          <div className="brand"><i>//</i> <span>MyCord</span></div>
-          <nav className="nav-list" aria-label="Sections">
-            {NAV.map((item) => (
-              <button key={item.id} className={`nav-btn${page === item.id ? " active" : ""}`} type="button" onClick={() => setPage(item.id)}>
-                <item.icon size={20} />
-                <span>{item.label}</span>
-              </button>
-            ))}
-          </nav>
-          <button className="you" type="button" onClick={() => setPage("settings")}>
-            <Avatar name={name || "You"} online />
-            <span className="person-line">
-              <strong>{name || "Your name"}</strong>
-              <span>Online</span>
-            </span>
-          </button>
-        </aside>
+        <Rail page={page} onPage={setPage} />
         <main className="workspace">
           {page === "home" ? (
             <div className="home">
@@ -820,81 +841,93 @@ export function App() {
           ) : null}
           {page === "messages" ? (
             <div className="messages">
-              <section>
-                <div className="inbox-head">
-                  <div className="section-head">
-                    <h2>Messages</h2>
-                    <button className="icon-quiet" type="button" aria-label="Add a friend" onClick={() => setDialog("friend")}><AddIcon size={18} /></button>
-                  </div>
+              <header className="topbar">
+                <span className="topbar-title"><FriendsIcon size={18} /> Friends</span>
+              </header>
+              <div className="chat-board">
+                <section className="dm-col">
                   <label className="search">
                     <SearchIcon size={16} />
-                    <input id="thread-search" placeholder="Search conversations" value={query} onChange={(event) => setQuery(event.target.value)} />
-                    <kbd>⌘K</kbd>
+                    <input id="thread-search" placeholder="Find your friend" value={query} onChange={(event) => setQuery(event.target.value)} />
                   </label>
-                </div>
-                <div className="thread-scroll">
-                  {threadNames.length === 0 ? <p className="empty">Add a friend, then open a room together.</p> : null}
-                  {threadNames.map((item) => (
-                    <button className={`thread-row${item.name === selectedName ? " active" : ""}`} type="button" key={item.name} onClick={() => setActive(item.name)}>
-                      <Avatar name={item.name} online={online.has(item.name)} />
-                      <span className="thread-copy">
-                        <strong>{item.name}</strong>
-                        <span>{item.preview || item.room || "No notes yet"}</span>
-                      </span>
-                      <span>{item.at ? ago(item.at) : ""}</span>
-                    </button>
-                  ))}
-                </div>
-              </section>
-              <section className="thread-pane">
-                {selected ? (
-                  <>
-                    <header className="thread-top">
-                      <Avatar name={selected.name} online={online.has(selected.name)} />
-                      <span className="person-line">
-                        <strong>{selected.name}</strong>
-                        <span>{online.has(selected.name) ? "In the room" : "Last on this computer"}</span>
-                      </span>
-                      <span className="thread-tools">
-                        <button type="button" aria-label={`Call ${selected.name}`} onClick={() => joinRoom(selected.room)}><PhoneIcon size={18} /></button>
-                        <button type="button" aria-label={`Share with ${selected.name}`} onClick={() => joinRoom(selected.room, true)}><MonitorIcon size={18} /></button>
-                      </span>
-                    </header>
-                    <div className="transcript">
-                      {thread && thread.notes.length > 0 ? <div className="day">Today</div> : null}
-                      {thread?.notes.map((mail) => (
-                        <article className="bubble" key={mail.id}>
-                          <Avatar name={mail.author} small />
-                          <div>
-                            <strong>{mail.author}</strong>
-                            <p>{mail.text}</p>
-                            <time>{ago(mail.at)}</time>
-                          </div>
-                        </article>
-                      ))}
-                    </div>
-                    {selected.room ? (
-                      <div className="room-card pinned">
-                        <span className="room-mark"><MonitorIcon size={18} /></span>
+                  <div className="section-head">
+                    <h2>Direct Messages</h2>
+                    <button className="icon-quiet" type="button" aria-label="Add a friend" onClick={() => setDialog("friend")}><AddIcon size={16} /></button>
+                  </div>
+                  <div className="thread-scroll">
+                    {threadNames.length === 0 ? <p className="empty">Add a friend, then open a room together.</p> : null}
+                    {threadNames.map((item) => {
+                      const count = desk.threads.find((threadItem) => threadItem.name === item.name)?.notes.length ?? 0;
+                      const badge = item.name === selectedName || count === 0 ? "" : count > 9 ? "9+" : String(count);
+                      return (
+                        <button className={`thread-row${item.name === selectedName ? " active" : ""}`} type="button" key={item.name} onClick={() => setActive(item.name)}>
+                          <Avatar name={item.name} online={online.has(item.name)} />
+                          <span className="thread-copy">
+                            <strong>{item.name}</strong>
+                          </span>
+                          {badge ? <span className="badge">{badge}</span> : null}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="you dm-you">
+                    <Avatar name={name || "You"} online />
+                    <span className="person-line">
+                      <strong>{name || "Your name"}</strong>
+                      <span>Online</span>
+                    </span>
+                  </div>
+                </section>
+                <section className="thread-pane">
+                  {selected ? (
+                    <>
+                      <header className="thread-top">
+                        <Avatar name={selected.name} online={online.has(selected.name)} />
                         <span className="person-line">
-                          <strong>Room: {selected.room}</strong>
-                          <span>Voice and screen share</span>
+                          <strong>{selected.name}</strong>
                         </span>
-                        <button className="cream" type="button" onClick={() => joinRoom(selected.room)}>Join</button>
+                        <span className="thread-tools">
+                          <button type="button" aria-label={`Call ${selected.name}`} onClick={() => joinRoom(selected.room)}><PhoneIcon size={18} /></button>
+                          <button type="button" aria-label={`Share with ${selected.name}`} onClick={() => joinRoom(selected.room, true)}><MonitorIcon size={18} /></button>
+                        </span>
+                      </header>
+                      <div className="transcript">
+                        {noteDays(thread?.notes ?? []).map((group) => (
+                          <div key={group.day}>
+                            <div className="day"><span /><em>{group.day}</em><span /></div>
+                            {group.notes.map((mail) => {
+                              const mine = mail.author.trim().toLowerCase() === name.trim().toLowerCase();
+                              return (
+                                <article className={`bubble${mine ? " mine" : ""}`} key={mail.id}>
+                                  {mine ? null : <Avatar name={mail.author} small />}
+                                  <div>
+                                    <p>{mail.text}</p>
+                                    <time>{clock(mail.at)}</time>
+                                  </div>
+                                  {mine ? <Avatar name={mail.author} small /> : null}
+                                </article>
+                              );
+                            })}
+                          </div>
+                        ))}
                       </div>
-                    ) : null}
-                    <div className="composer">
-                      <form onSubmit={(event) => { event.preventDefault(); sendNote(selected.name, selected.room); }}>
-                        <input aria-label={`Message ${selected.name}`} placeholder={`Message ${selected.name}...`} value={draft} onChange={(event) => setDraft(event.target.value)} />
-                        <button className="send" type="submit" aria-label="Save note"><SendIcon size={16} /></button>
-                      </form>
-                      <p className="hint">Notes stay on this computer. Join the room to talk.</p>
+                      <div className="composer">
+                        <form onSubmit={(event) => { event.preventDefault(); sendNote(selected.name, selected.room); }}>
+                          <input aria-label={`Message ${selected.name}`} placeholder={`Message to ${selected.name}`} value={draft} onChange={(event) => setDraft(event.target.value)} />
+                          <button className="emoji" type="button" aria-label="Add an emoji" onClick={() => setDraft((current) => `${current}✨`)}>☺</button>
+                          <button className="send" type="submit" aria-label="Save note"><SendIcon size={16} /></button>
+                        </form>
+                        <p className="hint">Notes stay on this computer. The phone button joins the room.</p>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="chat-empty">
+                      <img src={ramenUrl} alt="" />
+                      <p>Ramen may have originated from China. Scholars believe that “shina shoba” (“Chinese style” noodle soup) was imported to Japan between the 17th and 20th centuries.</p>
                     </div>
-                  </>
-                ) : (
-                  <p className="empty">Pick a person, or add one, to keep a note and a room.</p>
-                )}
-              </section>
+                  )}
+                </section>
+              </div>
             </div>
           ) : null}
           {page === "recents" ? (
@@ -967,6 +1000,64 @@ export function App() {
       ) : null}
     </div>
   );
+}
+
+function Rail({ page, onPage }: { page: Page | null; onPage: (page: Page) => void }) {
+  const main = NAV.filter((item) => item.id !== "settings");
+  return (
+    <aside className="sidebar">
+      <button className="brand-mark" type="button" aria-label="Home" onClick={() => onPage("home")}>M</button>
+      <nav className="nav-list" aria-label="Sections">
+        {main.map((item) => (
+          <button key={item.id} className={`nav-btn${page === item.id ? " active" : ""}`} type="button" aria-label={item.label} onClick={() => onPage(item.id)}>
+            <item.icon size={22} />
+          </button>
+        ))}
+      </nav>
+      <button className={`nav-btn rail-end${page === "settings" ? " active" : ""}`} type="button" aria-label="Settings" onClick={() => onPage("settings")}>
+        <SettingsIcon size={22} />
+      </button>
+    </aside>
+  );
+}
+
+function VolumeRow({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {
+  return (
+    <label className="volume-row">
+      <span>{label}</span>
+      <input
+        type="range"
+        min={0}
+        max={200}
+        step={5}
+        value={value}
+        aria-label={label === "Voice" ? "Other person's volume" : "Screen audio volume"}
+        onChange={(event) => onChange(Number(event.target.value))}
+      />
+      <strong>{value}%</strong>
+    </label>
+  );
+}
+
+function clock(at: number) {
+  return new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).replace(" AM", " am").replace(" PM", " pm");
+}
+
+function dayTitle(at: number) {
+  const date = new Date(at);
+  const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  return `${months[date.getMonth()]} ${date.getDate()}, ${date.getFullYear()}`;
+}
+
+function noteDays(notes: Mail[]) {
+  const groups: { day: string; notes: Mail[] }[] = [];
+  for (const mail of notes) {
+    const day = dayTitle(mail.at);
+    const last = groups[groups.length - 1];
+    if (last && last.day === day) last.notes.push(mail);
+    else groups.push({ day, notes: [mail] });
+  }
+  return groups;
 }
 
 function NoiseSwitch({ on, onChange }: { on: boolean; onChange: (on: boolean) => void }) {
