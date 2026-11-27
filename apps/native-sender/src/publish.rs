@@ -1,4 +1,5 @@
 use crate::adapt::RoomAim;
+use crate::track_send::TrackSend;
 use crate::api;
 use crate::config::AppConfig;
 use crate::encoder::ScreenEncoder;
@@ -9,7 +10,6 @@ use livekit::options::{
     DegradationPreference, TrackPublishOptions, VideoCodec, VideoEncoderBackend, VideoEncoding,
 };
 use livekit::prelude::*;
-use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
 use livekit::webrtc::video_source::{native::NativeVideoSource, RtcVideoSource, VideoResolution};
 use reqwest::Client;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +55,9 @@ pub async fn run(
         height: encoder.height,
     };
     let source = NativeVideoSource::new_encoded(resolution.clone());
+    // The handoff thread is the only caller of the LiveKit send. This loop
+    // stays free to read loss and keep the direct picture moving.
+    let handoff = TrackSend::start(source.clone());
     let track =
         LocalVideoTrack::create_video_track("screen", RtcVideoSource::Native(source.clone()));
     let options = TrackPublishOptions {
@@ -258,17 +261,7 @@ pub async fn run(
             }
             _ = rate_tick.tick() => {
                 if room_media.load(Ordering::Relaxed) {
-                    if !room_ready {
-                        room_ready = true;
-                        encoder.set_bitrate_bps(aim.applied_bps());
-                        encoder.set_fps(config.target_fps);
-                        encoder.request_keyframe();
-                        eprintln!(
-                            "picture room: aiming at {}kbps {}fps",
-                            aim.applied_bps() / 1000,
-                            aim.fps()
-                        );
-                    }
+                    aim_room(encoder, &aim, &mut room_ready, &mut need_key);
                     let pace = aim.decide(room_loss);
                     room_loss = 0;
                     if pace.changed {
@@ -327,40 +320,63 @@ pub async fn run(
                     }
                     picture.offer(&unit.payload, unit.keyframe, timestamp_us, unit.cursor);
                 }
-                match admit(&mut need_key, unit.keyframe, unit.captured_at.elapsed()) {
-                    Admit::Send => {}
-                    Admit::TooLate => {
-                        // A delta dropped here breaks every frame after it.
-                        // Hold the picture until the next keyframe.
-                        late_drops += 1;
-                        encoder.request_keyframe();
-                        continue;
-                    }
-                    Admit::WaitForKey => {
-                        encoder.request_keyframe();
-                        continue;
-                    }
+                if room_media.load(Ordering::Relaxed) {
+                    aim_room(encoder, &aim, &mut room_ready, &mut need_key);
                 }
-                let frame = EncodedVideoFrame {
-                    codec: EncodedVideoCodec::H264,
-                    payload: &unit.payload,
-                    timestamp_us,
-                    frame_type: if unit.keyframe { EncodedFrameType::Key } else { EncodedFrameType::Delta },
-                    resolution: resolution.clone(),
-                    frame_metadata: None,
-                };
-                rate_frames += 1;
                 if let Some(cursor) = unit.cursor {
                     let _ = cursor_tx.send(Some(cursor));
                 }
-                if source.capture_encoded_frame(&frame) {
-                    produced += 1;
-                    window_frames += 1;
-                    window_bytes += unit.payload.len();
-                    window_latency_ms += unit.read_at.elapsed().as_secs_f64() * 1000.0;
-                } else {
-                    dropped += 1;
-                    rate_send_drops += 1;
+                // A direct picture does not go through the screen track, so a
+                // full LiveKit send cannot stop that picture.
+                let feed_track = room_ready || !config.picture_direct;
+                if feed_track {
+                    match admit(&mut need_key, unit.keyframe, unit.captured_at.elapsed()) {
+                        Admit::Send => {}
+                        Admit::TooLate => {
+                            // A delta dropped here breaks every frame after it.
+                            // Hold the picture until the next keyframe.
+                            late_drops += 1;
+                            encoder.request_keyframe();
+                            continue;
+                        }
+                        Admit::WaitForKey => {
+                            encoder.request_keyframe();
+                            continue;
+                        }
+                    }
+                    rate_frames += 1;
+                    let bytes = unit.payload.len();
+                    let keyframe = unit.keyframe;
+                    let latency_ms = unit.read_at.elapsed().as_secs_f64() * 1000.0;
+                    if handoff.try_submit(
+                        unit.payload,
+                        timestamp_us,
+                        keyframe,
+                        resolution.width,
+                        resolution.height,
+                    ) {
+                        produced += 1;
+                        window_frames += 1;
+                        window_bytes += bytes;
+                        window_latency_ms += latency_ms;
+                    } else {
+                        dropped += 1;
+                        rate_send_drops += 1;
+                        need_key = true;
+                        if room_ready {
+                            room_loss = room_loss.saturating_add(1);
+                            if let Some(bps) = aim.note_stuck() {
+                                encoder.set_bitrate_bps(bps);
+                                eprintln!(
+                                    "share pace: recovering {}kbps {}fps{}",
+                                    bps / 1000,
+                                    aim.fps(),
+                                    aim.hint_note()
+                                );
+                            }
+                        }
+                        encoder.request_keyframe();
+                    }
                 }
                 if source.take_keyframe_request() {
                     keyframe_requests += 1;
@@ -435,6 +451,27 @@ fn live_timestamp_us(last_us: &mut i64) -> i64 {
 /// The first frame on the wire is a keyframe. A frame that has already missed
 /// the live window is dropped, and nothing after it is sent until the next
 /// keyframe, because a missing delta makes the rest of the group undecodable.
+fn aim_room(
+    encoder: &ScreenEncoder,
+    aim: &RoomAim,
+    room_ready: &mut bool,
+    need_key: &mut bool,
+) {
+    if *room_ready {
+        return;
+    }
+    *room_ready = true;
+    *need_key = true;
+    encoder.set_bitrate_bps(aim.applied_bps());
+    encoder.set_fps(aim.fps());
+    encoder.request_keyframe();
+    eprintln!(
+        "picture room: aiming at {}kbps {}fps",
+        aim.applied_bps() / 1000,
+        aim.fps()
+    );
+}
+
 fn admit(need_key: &mut bool, keyframe: bool, age: Duration) -> Admit {
     if age > MAX_FRAME_AGE {
         *need_key = true;

@@ -18,6 +18,7 @@ mod present_macos;
 mod publish;
 mod relay;
 mod room_media;
+mod track_send;
 mod watch;
 
 use anyhow::{Context, Result};

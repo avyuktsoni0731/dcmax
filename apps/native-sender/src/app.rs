@@ -9,6 +9,7 @@ use crate::encoder::ScreenEncoder;
 pub use crate::encoder::{screens, ScreenChoice};
 use crate::h264::{unix_us_now, MAX_FRAME_AGE};
 use crate::picture::{accept_picture, listen, FrameReader, PictureSender};
+use crate::track_send::TrackSend;
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use futures_util::StreamExt;
@@ -19,7 +20,6 @@ use livekit::prelude::*;
 use livekit::webrtc::audio_frame::AudioFrame;
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
-use livekit::webrtc::video_frame::{EncodedFrameType, EncodedVideoCodec, EncodedVideoFrame};
 use livekit::webrtc::video_source::{native::NativeVideoSource, RtcVideoSource, VideoResolution};
 use livekit::webrtc::video_stream::native::{NativeVideoStream, NativeVideoStreamOptions};
 use std::collections::VecDeque;
@@ -2069,6 +2069,9 @@ async fn share_loop(
         height: encoder.height,
     };
     let source = NativeVideoSource::new_encoded(resolution.clone());
+    // The handoff thread is the only caller of the LiveKit send. The share
+    // loop stays free to read loss and write the once-a-second line.
+    let handoff = TrackSend::start(source.clone());
     let track = LocalVideoTrack::create_video_track("screen", RtcVideoSource::Native(source.clone()));
     let options = TrackPublishOptions {
         video_codec: VideoCodec::H264,
@@ -2100,6 +2103,7 @@ async fn share_loop(
     let mut audio_pkts = 0u64;
     let mut audio_bytes = 0u64;
     let mut late = 0u64;
+    let mut held = 0u64;
     let mut keys = 0u64;
     let mut last_sent = picture.sent();
     let mut last_skipped = picture.skipped();
@@ -2154,6 +2158,7 @@ async fn share_loop(
                     &aim,
                     &mut screen_pcm,
                     &participant,
+                    &mut need_key,
                 );
                 note_link(&source, &mut aim);
                 let timestamp_us = match unit.timestamp_us {
@@ -2180,20 +2185,34 @@ async fn share_loop(
                     request_key(&encoder, &mut last_key);
                     continue;
                 }
-                if need_key && !unit.keyframe {
-                    request_key(&encoder, &mut last_key);
-                    continue;
+                if room_ready {
+                    let keyframe = unit.keyframe;
+                    if need_key && !keyframe {
+                        request_key(&encoder, &mut last_key);
+                    } else if handoff.try_submit(
+                        unit.payload,
+                        timestamp_us,
+                        keyframe,
+                        resolution.width,
+                        resolution.height,
+                    ) {
+                        need_key = false;
+                    } else {
+                        held += 1;
+                        need_key = true;
+                        link_loss = link_loss.saturating_add(1);
+                        if let Some(bps) = aim.note_stuck() {
+                            encoder.set_bitrate_bps(bps);
+                            note_log(&format!(
+                                "share pace: recovering {}kbps {}fps{}",
+                                bps / 1000,
+                                aim.fps(),
+                                aim.hint_note()
+                            ));
+                        }
+                        request_key(&encoder, &mut last_key);
+                    }
                 }
-                need_key = false;
-                let frame = EncodedVideoFrame {
-                    codec: EncodedVideoCodec::H264,
-                    payload: &unit.payload,
-                    timestamp_us,
-                    frame_type: if unit.keyframe { EncodedFrameType::Key } else { EncodedFrameType::Delta },
-                    resolution: resolution.clone(),
-                    frame_metadata: None,
-                };
-                let _ = source.capture_encoded_frame(&frame);
                 if source.take_keyframe_request() {
                     if room_ready {
                         link_loss = link_loss.saturating_add(1);
@@ -2224,6 +2243,7 @@ async fn share_loop(
                         &mut audio_pkts,
                         &mut audio_bytes,
                         &mut late,
+                        &mut held,
                         &mut keys,
                         &mut last_sent,
                         &mut last_skipped,
@@ -2240,6 +2260,7 @@ async fn share_loop(
                     &aim,
                     &mut screen_pcm,
                     &participant,
+                    &mut need_key,
                 );
                 if let Some(audio) = audio {
                     if !audio_noted {
@@ -2265,6 +2286,7 @@ async fn share_loop(
                     &aim,
                     &mut screen_pcm,
                     &participant,
+                    &mut need_key,
                 );
                 note_link(&source, &mut aim);
                 if window.elapsed() >= Duration::from_secs(1) {
@@ -2279,6 +2301,7 @@ async fn share_loop(
                         &mut audio_pkts,
                         &mut audio_bytes,
                         &mut late,
+                        &mut held,
                         &mut keys,
                         &mut last_sent,
                         &mut last_skipped,
@@ -2312,6 +2335,7 @@ fn apply_pace(
     audio_pkts: &mut u64,
     audio_bytes: &mut u64,
     late: &mut u64,
+    held: &mut u64,
     keys: &mut u64,
     last_sent: &mut u64,
     last_skipped: &mut u64,
@@ -2342,6 +2366,7 @@ fn apply_pace(
         audio_pkts,
         audio_bytes,
         late,
+        held,
         keys,
         last_sent,
         last_skipped,
@@ -2498,11 +2523,13 @@ fn enter_room(
     aim: &RoomAim,
     screen_pcm: &mut Option<tokio::sync::mpsc::Sender<Vec<i16>>>,
     participant: &LocalParticipant,
+    need_key: &mut bool,
 ) {
     if *entered || !room_media.load(Ordering::Relaxed) {
         return;
     }
     *entered = true;
+    *need_key = true;
     encoder.set_bitrate_bps(aim.applied_bps());
     encoder.set_fps(aim.fps());
     encoder.request_keyframe();
@@ -2890,6 +2917,7 @@ fn log_share(
     audio_pkts: &mut u64,
     audio_bytes: &mut u64,
     late: &mut u64,
+    held: &mut u64,
     keys: &mut u64,
     last_sent: &mut u64,
     last_skipped: &mut u64,
@@ -2905,11 +2933,12 @@ fn log_share(
         None => "-".to_string(),
     };
     note_log(&format!(
-        "share: encoded={:.0} sent={:.0} skipped={:.0} late={} key={} audio={:.0} video_kbps={:.0} audio_kbps={:.0} pace_kbps={} pace_fps={} hint_kbps={hint}",
+        "share: encoded={:.0} sent={:.0} skipped={:.0} late={} held={} key={} audio={:.0} video_kbps={:.0} audio_kbps={:.0} pace_kbps={} pace_fps={} hint_kbps={hint}",
         per_sec(*encoded, secs),
         per_sec(sent.saturating_sub(*last_sent), secs),
         per_sec(skipped.saturating_sub(*last_skipped), secs),
         *late,
+        *held,
         *keys,
         per_sec(*audio_pkts, secs),
         per_sec(*video_bytes * 8 / 1000, secs),
@@ -2922,6 +2951,7 @@ fn log_share(
     *audio_pkts = 0;
     *audio_bytes = 0;
     *late = 0;
+    *held = 0;
     *keys = 0;
     *last_sent = sent;
     *last_skipped = skipped;

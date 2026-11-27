@@ -6,8 +6,9 @@
 //! The screen track keeps that chosen frame rate. LiveKit's estimate is a hint
 //! about the path. A low hint does not become the encode rate: a static screen
 //! makes the estimate fall, and copying it is what leaves the moving picture
-//! soft. The bitrate steps down only while the receiver is losing the chain,
-//! and it steps back toward the chosen number once those requests stop.
+//! soft. The bitrate steps down when the receiver loses the chain, and when the
+//! screen-track send is still inside the previous frame. It steps back toward
+//! the chosen number once those breaks stop.
 
 const FLOOR_BPS: u64 = 1_500_000;
 const WARMUP_SECONDS: u32 = 2;
@@ -227,6 +228,13 @@ impl RoomAim {
     pub fn note_estimate(&mut self, bps: u64) {
         let ceiling = self.ceiling_bps.max(ROOM_FLOOR_BPS);
         self.estimate_bps = Some(bps.clamp(ROOM_FLOOR_BPS, ceiling));
+    }
+
+    /// The screen-track handoff has not accepted this frame because it is
+    /// still sending the previous one. The next keyframe uses a smaller rate.
+    /// A second report in the same second does not cut again.
+    pub fn note_stuck(&mut self) -> Option<u64> {
+        self.recover(4)
     }
 
     /// A repeated break in the picture. Returns the rate the recovery
@@ -479,6 +487,28 @@ mod tests {
         assert_eq!(pace.bps, next);
         assert!(!pace.changed);
         assert_eq!(pace.fps, 60);
+    }
+
+    #[test]
+    fn a_stuck_screen_track_shrinks_the_next_keyframe_once() {
+        let mut aim = RoomAim::new(20_000, 60);
+        aim.decide(0);
+        aim.decide(0);
+        aim.note_estimate(9_000_000);
+        let next = aim.note_stuck().expect("a stuck send steps down");
+        assert_eq!(next, 10_000_000);
+        assert_eq!(aim.fps(), 60);
+        assert!(aim.note_stuck().is_none());
+        let pace = aim.decide(4);
+        assert_eq!(pace.bps, next);
+        assert!(!pace.changed);
+        assert_eq!(pace.fps, 60);
+
+        let mut hinted = RoomAim::new(20_000, 60);
+        hinted.decide(0);
+        hinted.decide(0);
+        hinted.note_estimate(4_000_000);
+        assert_eq!(hinted.note_stuck(), Some(8_000_000));
     }
 
     #[test]
