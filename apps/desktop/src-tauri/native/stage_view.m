@@ -1,4 +1,5 @@
 #import <AppKit/AppKit.h>
+#import <QuartzCore/QuartzCore.h>
 
 // Owned for the life of the process. The Rust side used to keep the raw
 // content view and pass it back in. After a share stopped, that pointer was
@@ -59,5 +60,47 @@ void *dcmax_stage_place(void *ns_window, void *ns_content, void *existing, doubl
             [child orderOut:nil];
         }
         return (__bridge void *)view;
+    }
+}
+
+void dcmax_stage_holes(void *ns_view, const double *xywh, int count, double radius) {
+    @autoreleasepool {
+        if (!ns_view) {
+            return;
+        }
+        NSView *view = (__bridge NSView *)ns_view;
+        CALayer *layer = view.layer;
+        if (!layer) {
+            return;
+        }
+        CGFloat width = NSWidth(view.bounds);
+        CGFloat height = NSHeight(view.bounds);
+        if (width < 2.0 || height < 2.0) {
+            return;
+        }
+        CGMutablePathRef path = CGPathCreateMutable();
+        CGRect bounds = CGRectMake(0.0, 0.0, width, height);
+        if (radius > 0.5) {
+            CGPathAddRoundedRect(path, nil, bounds, radius, radius);
+        } else {
+            CGPathAddRect(path, nil, bounds);
+        }
+        for (int index = 0; index < count; index++) {
+            double x = xywh[index * 4];
+            double y = xywh[index * 4 + 1];
+            double holeWidth = xywh[index * 4 + 2];
+            double holeHeight = xywh[index * 4 + 3];
+            if (holeWidth < 1.0 || holeHeight < 1.0) {
+                continue;
+            }
+            CGRect hole = CGRectMake(x, height - y - holeHeight, holeWidth, holeHeight);
+            CGPathAddRoundedRect(path, nil, hole, 12.0, 12.0);
+        }
+        CAShapeLayer *mask = [CAShapeLayer layer];
+        mask.frame = bounds;
+        mask.fillRule = kCAFillRuleEvenOdd;
+        mask.path = path;
+        layer.mask = mask;
+        CGPathRelease(path);
     }
 }

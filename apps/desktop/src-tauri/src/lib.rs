@@ -10,7 +10,9 @@ struct Rect {
     y: f64,
     width: f64,
     height: f64,
+    radius: f64,
     visible: bool,
+    holes: Vec<[f64; 4]>,
 }
 
 struct DesktopState {
@@ -23,6 +25,8 @@ struct JoinBody {
     name: String,
     room: String,
     invite: Option<String>,
+    #[serde(default)]
+    session: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -47,12 +51,24 @@ struct GainBody {
 }
 
 #[derive(Deserialize)]
+struct HoleBody {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Deserialize)]
 struct RectBody {
     x: f64,
     y: f64,
     width: f64,
     height: f64,
     visible: bool,
+    #[serde(default)]
+    radius: f64,
+    #[serde(default)]
+    holes: Vec<HoleBody>,
 }
 
 #[derive(Deserialize)]
@@ -106,7 +122,24 @@ enum NoteEvent {
     Joined,
     Left,
     Sharing { on: bool },
+    Watching { on: bool },
     People { people: Vec<PersonEvent> },
+}
+
+fn emit_watching(handle: &AppHandle, on: bool) {
+    thread_local! {
+        static LAST: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    let changed = LAST.with(|slot| {
+        if slot.get() == Some(on) {
+            return false;
+        }
+        slot.set(Some(on));
+        true
+    });
+    if changed {
+        let _ = handle.emit("engine", NoteEvent::Watching { on });
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -115,6 +148,7 @@ struct PersonEvent {
     name: String,
     local: bool,
     speaking: bool,
+    muted: bool,
 }
 
 fn map_note(note: native_sender::EngineNote) -> NoteEvent {
@@ -130,6 +164,7 @@ fn map_note(note: native_sender::EngineNote) -> NoteEvent {
                     name: person.name,
                     local: person.local,
                     speaking: person.speaking,
+                    muted: person.muted,
                 })
                 .collect(),
         },
@@ -157,6 +192,7 @@ fn join(state: State<DesktopState>, body: JoinBody) -> Result<(), String> {
             name: body.name,
             room: body.room,
             invite: body.invite,
+            session: body.session,
         })
     })
 }
@@ -259,6 +295,43 @@ fn remember(body: ProfileBody) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct AccountBody {
+    action: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    login: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    day: String,
+    #[serde(default)]
+    month: String,
+    #[serde(default)]
+    year: String,
+    #[serde(default)]
+    session: String,
+}
+
+#[tauri::command]
+fn account(body: AccountBody) -> Result<native_sender::AccountSession, String> {
+    let payload = serde_json::json!({
+        "action": body.action,
+        "email": body.email,
+        "username": body.username,
+        "login": body.login,
+        "password": body.password,
+        "day": body.day,
+        "month": body.month,
+        "year": body.year,
+        "session": body.session,
+    });
+    native_sender::account_blocking(&payload).map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 fn stage_rect(state: State<DesktopState>, body: RectBody) -> Result<(), String> {
     let mut rect = state.rect.lock().map_err(|_| "the stage is unavailable".to_string())?;
@@ -267,7 +340,13 @@ fn stage_rect(state: State<DesktopState>, body: RectBody) -> Result<(), String> 
         y: body.y,
         width: body.width,
         height: body.height,
+        radius: body.radius,
         visible: body.visible,
+        holes: body
+            .holes
+            .into_iter()
+            .map(|hole| [hole.x, hole.y, hole.width, hole.height])
+            .collect(),
     };
     Ok(())
 }
@@ -374,6 +453,7 @@ fn present_on_main(handle: &AppHandle) {
             h: f64,
             visible: i32,
         ) -> *mut c_void;
+        fn dcmax_stage_holes(view: *mut c_void, xywh: *const f64, count: i32, radius: f64);
     }
 
     let Some(window) = handle.get_webview_window("main") else {
@@ -395,7 +475,9 @@ fn present_on_main(handle: &AppHandle) {
             y: rect.y,
             width: rect.width,
             height: rect.height,
+            radius: rect.radius,
             visible: rect.visible,
+            holes: rect.holes.clone(),
         }
     };
     // `showing` means a frame has been drawn and should stay up. `armed` means
@@ -441,6 +523,14 @@ fn present_on_main(handle: &AppHandle) {
         let want = showing || engine.picture_ready();
         let view = place(surface.view, want);
         surface.view = view;
+        let punch = |view: *mut c_void| {
+            if view.is_null() {
+                return;
+            }
+            let packed: Vec<f64> = rect.holes.iter().flat_map(|hole| hole.iter().copied()).collect();
+            let ptr = if packed.is_empty() { std::ptr::null() } else { packed.as_ptr() };
+            unsafe { dcmax_stage_holes(view, ptr, (packed.len() / 4) as i32, rect.radius) };
+        };
         if surface.presenter.is_none() && !view.is_null() {
             match Presenter::attach(view) {
                 Ok(presenter) => surface.presenter = Some(presenter),
@@ -449,14 +539,17 @@ fn present_on_main(handle: &AppHandle) {
         }
         if !want || surface.presenter.is_none() {
             ARMED.with(|slot| slot.set(false));
+            punch(surface.view);
             return;
         }
         let armed = ARMED.with(|slot| slot.get());
         if !armed {
             ARMED.with(|slot| slot.set(true));
+            punch(surface.view);
             return;
         }
         let Some(presenter) = surface.presenter.as_ref() else {
+            punch(surface.view);
             return;
         };
         let drew = engine
@@ -478,7 +571,9 @@ fn present_on_main(handle: &AppHandle) {
         if drew {
             SHOWING.with(|slot| slot.set(true));
         }
+        punch(surface.view);
     });
+    emit_watching(handle, SHOWING.with(|slot| slot.get()));
 }
 
 #[cfg(target_os = "windows")]
@@ -514,6 +609,7 @@ fn present_on_main(handle: &AppHandle) {
             height: i32,
             full_range: i32,
         ) -> i32;
+        fn dcmax_stage_holes(window: *mut c_void, xywh: *const f64, count: i32, radius: f64);
     }
 
     let Some(window) = handle.get_webview_window("main") else {
@@ -533,7 +629,13 @@ fn present_on_main(handle: &AppHandle) {
             y: rect.y * scale,
             width: rect.width * scale,
             height: rect.height * scale,
+            radius: rect.radius * scale,
             visible: rect.visible,
+            holes: rect
+                .holes
+                .iter()
+                .map(|hole| [hole[0] * scale, hole[1] * scale, hole[2] * scale, hole[3] * scale])
+                .collect(),
         }
     };
     SURFACE.with(|slot| {
@@ -569,16 +671,27 @@ fn present_on_main(handle: &AppHandle) {
         let showing = SHOWING.with(|slot| slot.get());
         let want = showing || engine.picture_ready();
         surface.window = place(surface.window, want);
+        let punch = |window: *mut c_void| {
+            if window.is_null() {
+                return;
+            }
+            let packed: Vec<f64> = rect.holes.iter().flat_map(|hole| hole.iter().copied()).collect();
+            let ptr = if packed.is_empty() { std::ptr::null() } else { packed.as_ptr() };
+            unsafe { dcmax_stage_holes(window, ptr, (packed.len() / 4) as i32, rect.radius) };
+        };
         if !want || surface.window.is_null() {
             ARMED.with(|slot| slot.set(false));
+            punch(surface.window);
             return;
         }
         let armed = ARMED.with(|slot| slot.get());
         if !armed {
             ARMED.with(|slot| slot.set(true));
+            punch(surface.window);
             return;
         }
         if unsafe { dcmax_stage_ready(surface.window) } == 0 {
+            punch(surface.window);
             return;
         }
         let view = surface.window;
@@ -593,7 +706,9 @@ fn present_on_main(handle: &AppHandle) {
         if drew {
             SHOWING.with(|slot| slot.set(true));
         }
+        punch(surface.window);
     });
+    emit_watching(handle, SHOWING.with(|slot| slot.get()));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -606,7 +721,9 @@ pub fn run() {
                 y: 0.0,
                 width: 0.0,
                 height: 0.0,
+                radius: 0.0,
                 visible: false,
+                holes: Vec::new(),
             }),
         })
         .invoke_handler(tauri::generate_handler![
@@ -626,6 +743,7 @@ pub fn run() {
             set_fullscreen,
             profile,
             remember,
+            account,
             stage_rect,
             screens
         ])

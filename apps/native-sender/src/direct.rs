@@ -137,6 +137,7 @@ pub async fn join_watch(config: crate::config::AppConfig, playback: SocketAddr) 
         &config.identity,
         &config.client_type,
         config.invite.as_deref(),
+        None,
     )
     .await?;
     let mut options = RoomOptions::default();

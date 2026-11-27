@@ -20,10 +20,13 @@
         "title": "MyCord Shell",
         "width": 1080,
         "height": 720,
-        "minWidth": 860,
-        "minHeight": 560,
+        "minWidth": 720,
+        "minHeight": 480,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "decorations": true
       }
     ]
   },

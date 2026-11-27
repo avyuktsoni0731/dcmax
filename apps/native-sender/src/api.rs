@@ -91,6 +91,7 @@ pub async fn fetch_token(
     identity: &str,
     client_type: &str,
     invite: Option<&str>,
+    session: Option<&str>,
 ) -> Result<TokenResponse> {
     let endpoint = format!("{}/token", api_base_url.trim_end_matches('/'));
     let req = TokenRequest {
@@ -100,8 +101,7 @@ pub async fn fetch_token(
         invite,
     };
 
-    let res = client
-        .post(endpoint)
+    let res = authed(client.post(endpoint), session)
         .json(&req)
         .send()
         .await
@@ -127,6 +127,7 @@ pub fn fetch_token_blocking(
     identity: &str,
     client_type: &str,
     invite: Option<&str>,
+    session: Option<&str>,
 ) -> Result<TokenResponse> {
     let endpoint = format!("{}/token", api_base_url.trim_end_matches('/'));
     let req = TokenRequest {
@@ -139,8 +140,7 @@ pub fn fetch_token_blocking(
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .context("token client")?;
-    let res = client
-        .post(endpoint)
+    let res = authed_blocking(client.post(endpoint), session)
         .json(&req)
         .send()
         .context("token request failed")?;
@@ -230,4 +230,68 @@ pub async fn report_native_publisher_event(
         anyhow::bail!("native publisher event returned {}: {}", status, body);
     }
     Ok(())
+}
+
+fn authed(builder: reqwest::RequestBuilder, session: Option<&str>) -> reqwest::RequestBuilder {
+    match session.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(session) => builder.header("authorization", format!("Bearer {session}")),
+        None => builder,
+    }
+}
+
+fn authed_blocking(
+    builder: reqwest::blocking::RequestBuilder,
+    session: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    match session.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(session) => builder.header("authorization", format!("Bearer {session}")),
+        None => builder,
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AccountSession {
+    pub username: String,
+    pub email: String,
+    pub session: String,
+}
+
+/// Register, sign in, resume, or end an account. The password is sent once
+/// over HTTPS and is not kept here.
+pub fn account_blocking(body: &serde_json::Value) -> Result<AccountSession> {
+    let endpoint = match body.get("action").and_then(|value| value.as_str()) {
+        Some("register") => "register",
+        Some("login") => "login",
+        Some("session") => "session",
+        Some("logout") => "logout",
+        _ => anyhow::bail!("unknown account action"),
+    };
+    let api_base_url = std::env::var("API_BASE_URL")
+        .unwrap_or_else(|_| "https://dcmax-token.soniavyukt.workers.dev".to_string());
+    let url = format!("{}/{}", api_base_url.trim_end_matches('/'), endpoint);
+    let session = body.get("session").and_then(|value| value.as_str());
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .context("account client")?;
+    let response = authed_blocking(client.post(url), session)
+        .json(body)
+        .send()
+        .context("Could not reach the account service.")?;
+    let status = response.status();
+    let text = response.text().context("account response")?;
+    if !status.is_success() {
+        let message = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|item| item.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|item| !item.trim().is_empty())
+            .unwrap_or_else(|| "The account service did not accept that.".to_string());
+        anyhow::bail!(message);
+    }
+    serde_json::from_str(&text).context("account response parse failed")
 }

@@ -281,6 +281,12 @@ static int build_program(Stage* stage) {
 }
 
 static LRESULT CALLBACK stage_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg == WM_NCHITTEST) {
+        return HTTRANSPARENT;
+    }
+    if (msg == WM_MOUSEACTIVATE) {
+        return MA_NOACTIVATE;
+    }
     if (msg == WM_ERASEBKGND) {
         return 1;
     }
@@ -404,22 +410,39 @@ extern "C" void* dcmax_stage_place(void* owner_ptr, void* existing, double x, do
     UINT flags = SWP_NOACTIVATE | SWP_NOZORDER;
     flags |= visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW;
     SetWindowPos(hwnd, nullptr, origin.x + (int)x, origin.y + (int)y, width, height, flags);
-    Stage* stage = (Stage*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    if (stage && (stage->win_w != width || stage->win_h != height)) {
-        stage->win_w = width;
-        stage->win_h = height;
-        RECT client = {0, 0, 0, 0};
-        GetClientRect(owner, &client);
-        int owner_w = client.right - client.left;
-        int owner_h = client.bottom - client.top;
-        int radius = width < 48 || height < 48 ? 0 : 24;
-        if (width >= owner_w - 2 && height >= owner_h - 2) {
-            radius = 0;
-        }
-        HRGN region = radius > 0 ? CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius) : nullptr;
-        SetWindowRgn(hwnd, region, TRUE);
-    }
     return hwnd;
+}
+
+extern "C" void dcmax_stage_holes(void* window, const double* xywh, int count, double radius) {
+    HWND hwnd = (HWND)window;
+    if (!hwnd || !IsWindow(hwnd)) {
+        return;
+    }
+    RECT client = {0, 0, 0, 0};
+    GetClientRect(hwnd, &client);
+    int width = client.right - client.left;
+    int height = client.bottom - client.top;
+    if (width < 2 || height < 2) {
+        return;
+    }
+    int curve = (int)(radius * 2.0);
+    if (curve < 0) {
+        curve = 0;
+    }
+    HRGN region = curve > 0 ? CreateRoundRectRgn(0, 0, width + 1, height + 1, curve, curve) : CreateRectRgn(0, 0, width, height);
+    for (int index = 0; index < count; index++) {
+        int x = (int)xywh[index * 4];
+        int y = (int)xywh[index * 4 + 1];
+        int hole_w = (int)xywh[index * 4 + 2];
+        int hole_h = (int)xywh[index * 4 + 3];
+        if (hole_w < 1 || hole_h < 1) {
+            continue;
+        }
+        HRGN hole = CreateRoundRectRgn(x, y, x + hole_w, y + hole_h, 24, 24);
+        CombineRgn(region, region, hole, RGN_DIFF);
+        DeleteObject(hole);
+    }
+    SetWindowRgn(hwnd, region, TRUE);
 }
 
 extern "C" int dcmax_stage_ready(void* window) {
@@ -473,9 +496,9 @@ extern "C" int dcmax_stage_draw_nv12(void* window, const uint8_t* y, const uint8
     float fit_x = 1.f;
     float fit_y = 1.f;
     if (view > content) {
-        fit_x = content / view;
-    } else if (content > 0.f) {
         fit_y = view / content;
+    } else if (content > 0.f) {
+        fit_x = content / view;
     }
     glViewport(0, 0, view_w, view_h);
     glDisable(GL_BLEND);

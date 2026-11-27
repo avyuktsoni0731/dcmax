@@ -46,7 +46,7 @@
   --danger-ink: #fff8f6;
   --green: #1f9d4e;
   --shadow: 0 18px 50px rgba(40, 32, 20, 0.08);
-  font-family: "SF Pro Text", "SF Pro Display", "Helvetica Neue", sans-serif;
+  font-family: "SF Pro Text", "SF Pro Display", "Plus Jakarta Sans", "Helvetica Neue", sans-serif;
 }
 
 :root[data-theme="dark"] {
@@ -77,6 +77,13 @@ html, body, #root {
   height: 100%;
   background: var(--bg);
   color: var(--text);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+input, textarea, [contenteditable] {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 button, input, select, textarea { font: inherit; color: inherit; }
@@ -88,18 +95,18 @@ button {
 }
 
 button:disabled { opacity: 0.45; cursor: default; }
-button:active:not(:disabled) { transform: scale(0.98); }
+button:active:not(:disabled):not(.tile-stack button) { transform: scale(0.98); }
 button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible {
   outline: 2px solid var(--cream);
   outline-offset: 2px;
 }
 
-.app { height: 100%; }
+.app { height: 100%; font-family: "Plus Jakarta Sans", "Helvetica Neue", sans-serif; }
 
 .shell {
   height: 100%;
   display: grid;
-  grid-template-columns: 88px minmax(0, 1fr);
+  grid-template-columns: 64px minmax(0, 1fr);
   min-height: 0;
 }
 
@@ -108,19 +115,19 @@ button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-
   flex-direction: column;
   align-items: center;
   gap: 12px;
-  padding: 16px 10px;
+  padding: 16px 8px;
   background: transparent;
   min-height: 0;
 }
 
 .brand-mark {
-  width: 48px;
-  height: 48px;
+  width: 44px;
+  height: 44px;
   border-radius: 50%;
   background: #5865f2;
   color: #fff;
   font-weight: 700;
-  font-size: 18px;
+  font-size: 16px;
 }
 
 .brand {
@@ -144,10 +151,10 @@ button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-
 .nav-btn {
   display: grid;
   place-items: center;
-  width: 48px;
-  height: 48px;
+  width: 44px;
+  height: 44px;
   padding: 0;
-  border-radius: 16px;
+  border-radius: 12px;
   color: var(--muted);
 }
 
@@ -751,28 +758,40 @@ input[type="range"] {
 .picker-card .room, .picker-card .outline, .picker-card .cream { width: 100%; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
-.app.fullscreen:not(.chrome) .stage {
-  position: fixed;
-  inset: 0;
-  z-index: 2;
-  margin: 0;
-  border: 0;
-  border-radius: 0;
-}
 .app.fullscreen:not(.chrome) .topbar,
 .app.fullscreen:not(.chrome) .sidebar,
-.app.fullscreen:not(.chrome) .call-chrome,
-.app.fullscreen:not(.chrome) .call-dock {
+.app.fullscreen:not(.chrome) .name-pill,
+.app.fullscreen:not(.chrome) .tile-stack {
   opacity: 0;
   pointer-events: none;
 }
-.app.fullscreen .call-top,
-.app.fullscreen .call-dock { transition: opacity 180ms ease; }
-.app.fullscreen.chrome .call-top,
-.app.fullscreen.chrome .call-dock { position: relative; z-index: 3; }
+.app.fullscreen:not(.chrome) .call-dock {
+  opacity: 0;
+  transform: translate(-50%, 18px);
+  pointer-events: none;
+}
+.app.fullscreen.chrome .topbar,
+.app.fullscreen.chrome .sidebar {
+  opacity: 0;
+  pointer-events: none;
+}
+.app.fullscreen .name-pill,
+.app.fullscreen .tile-stack {
+  transition: opacity 220ms cubic-bezier(0.22, 1, 0.36, 1), transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.app.fullscreen .call-dock {
+  transition: opacity 220ms cubic-bezier(0.22, 1, 0.36, 1), transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.app.fullscreen.chrome .call-dock {
+  opacity: 1;
+  transform: translate(-50%, 0);
+  position: relative;
+  z-index: 3;
+}
+.app.fullscreen.chrome .call-top { position: relative; z-index: 3; }
 
 @media (max-width: 980px) {
-  .shell { grid-template-columns: 76px minmax(0, 1fr); }
+  .shell { grid-template-columns: 64px minmax(0, 1fr); }
   .home { grid-template-columns: 1fr; }
   .side-col { display: none; }
   .chat-board { grid-template-columns: 1fr; }
@@ -808,6 +827,8 @@ input[type="range"] {
   --hover: rgba(255, 255, 255, 0.06);
   --stage: #000000;
   --danger: #d42828;
+  --green: #3dce6e;
+  --shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
   height: 100%;
   display: flex;
   flex-direction: column;
@@ -816,6 +837,32 @@ input[type="range"] {
   background: #212121;
   color: #ffffff;
   font-family: "Plus Jakarta Sans", "Helvetica Neue", sans-serif;
+}
+
+/* Settings page inside mock mode */
+.app.mock .page { color: #ffffff; }
+.app.mock .page h1 { color: #ffffff; }
+.app.mock .settings label { color: rgba(255, 255, 255, 0.7); }
+.app.mock .settings input,
+.app.mock .settings select {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+}
+.app.mock .settings .outline {
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+}
+.app.mock .settings .outline:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.app.mock .settings .switch i {
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);
+}
+.app.mock .settings .switch.on i {
+  background: var(--green);
+  box-shadow: none;
 }
 
 .app.mock .shell {
@@ -869,10 +916,15 @@ input[type="range"] {
   justify-content: center;
   gap: 8px;
   padding: 0 14px;
+  padding-left: 80px;
   flex: none;
   position: relative;
   border-radius: 12px;
   background: rgba(0, 0, 0, 0.2);
+  -webkit-app-region: drag;
+}
+.topbar button, .topbar a, .topbar input {
+  -webkit-app-region: no-drag;
 }
 .topbar-title {
   display: inline-flex;
@@ -1009,6 +1061,7 @@ input[type="range"] {
   color: #ffffff;
   font-family: "Work Sans", sans-serif;
   font-size: 14px;
+  -webkit-app-region: no-drag;
 }
 .friend-pop {
   position: absolute;
@@ -1096,6 +1149,44 @@ input[type="range"] {
   color: #ffffff;
   border: 1px solid rgba(255, 255, 255, 0.2);
 }
+.app.mock.fullscreen {
+  padding: 0;
+  gap: 0;
+}
+.app.mock.fullscreen .topbar {
+  position: absolute;
+  z-index: 6;
+  top: 12px;
+  left: 16px;
+  right: 16px;
+  width: auto;
+}
+.app.mock.fullscreen .shell {
+  position: relative;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+.app.mock.fullscreen .sidebar {
+  position: absolute;
+  z-index: 6;
+  left: 12px;
+  top: 64px;
+  bottom: 12px;
+  height: auto;
+}
+.app.mock.fullscreen .workspace,
+.app.mock.fullscreen .call-panel,
+.app.mock.fullscreen .stage,
+.app.mock.fullscreen:not(.chrome) .stage {
+  border-radius: 0;
+}
+.app.mock.fullscreen .stage,
+.app.mock.fullscreen:not(.chrome) .stage {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  margin: 0;
+}
 .app.mock.fullscreen.chrome .call-dock {
   position: absolute;
   left: 50%;
@@ -1111,8 +1202,9 @@ input[type="range"] {
   white-space: nowrap;
   color: rgba(255, 255, 255, 0.7);
   font-size: 13px;
+  -webkit-app-region: no-drag;
 }
-.app.mock .topbar .icon-quiet { position: absolute; right: 10px; color: #ffffff; }
+.app.mock .topbar .icon-quiet { position: absolute; right: 10px; color: #ffffff; -webkit-app-region: no-drag; }
 
 .call-panel {
   position: relative;
@@ -1121,7 +1213,7 @@ input[type="range"] {
   border-radius: 15px;
   background: rgba(0, 0, 0, 0.3);
   border: 1px solid rgba(255, 255, 255, 0.2);
-  overflow: hidden;
+  overflow: clip;
 }
 .app.mock .stage {
   position: absolute;
@@ -1138,9 +1230,12 @@ input[type="range"] {
   position: absolute;
   left: 50%;
   top: 44%;
-  transform: translate(-50%, -50%);
+  transform: translate(-50%, -46%) scale(0.94);
+  opacity: 0;
   pointer-events: none;
+  transition: opacity 320ms ease, transform 420ms cubic-bezier(0.22, 1.15, 0.36, 1);
 }
+.center-face.shown { opacity: 1; transform: translate(-50%, -50%) scale(1); }
 .app.mock .center-face .avatar.lg { width: 76px; height: 76px; font-size: 20px; }
 .tile-stack {
   position: absolute;
@@ -1150,14 +1245,29 @@ input[type="range"] {
   z-index: 4;
   display: flex;
   flex-direction: column;
-  gap: 8px;
   cursor: grab;
   touch-action: none;
   user-select: none;
-  transition: left 480ms cubic-bezier(0.22, 1.35, 0.36, 1), top 480ms cubic-bezier(0.22, 1.35, 0.36, 1);
+  transition: left 480ms cubic-bezier(0.22, 1.35, 0.36, 1), top 480ms cubic-bezier(0.22, 1.35, 0.36, 1), opacity 320ms ease;
+  will-change: left, top;
+  contain: layout;
 }
+.tile-stack.corner-tl { left: 12px; top: 12px; right: auto; bottom: auto; }
+.tile-stack.corner-tr { left: auto; top: 12px; right: 12px; bottom: auto; }
+.tile-stack.corner-bl { left: 12px; top: auto; right: auto; bottom: 12px; }
+.tile-stack.corner-br { left: auto; top: auto; right: 12px; bottom: 12px; }
 .tile-stack.placed { right: auto; bottom: auto; }
 .tile-stack.dragging { transition: none; cursor: grabbing; }
+.tile-slot {
+  display: grid;
+  grid-template-rows: 1fr;
+  min-height: 0;
+  transition: grid-template-rows 460ms cubic-bezier(0.22, 1.12, 0.36, 1), margin-top 460ms cubic-bezier(0.22, 1.12, 0.36, 1), opacity 280ms ease;
+}
+.tile-slot + .tile-slot { margin-top: 8px; }
+.tile-slot.shut { grid-template-rows: 0fr; opacity: 0; margin-top: 0; pointer-events: none; }
+.tile-slot.shut + .tile-slot { margin-top: 0; }
+.tile-clip { min-height: 0; overflow: hidden; }
 .face-tile {
   height: 116px;
   display: flex;
@@ -1166,14 +1276,15 @@ input[type="range"] {
   justify-content: center;
   gap: 6px;
   border-radius: 12px;
-  background: rgba(0, 0, 0, 0.3);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(28, 28, 32, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   color: #ffffff;
   font-size: 13px;
   font-weight: 700;
 }
 .face-tile .avatar.lg { width: 48px; height: 48px; font-size: 14px; }
-.face-tile.you-tile { height: 116px; border: 1px solid rgba(255, 255, 255, 0.2); background: rgba(0, 0, 0, 0.3); }
+.face-tile.you-tile { height: 116px; border: 1px solid rgba(255, 255, 255, 0.14); background: rgba(28, 28, 32, 0.92); }
 .name-pill {
   position: absolute;
   left: 12px;
@@ -1184,12 +1295,14 @@ input[type="range"] {
   height: 34px;
   padding: 0 12px 0 8px;
   border-radius: 12px;
-  background: rgba(0, 0, 0, 0.3);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(28, 28, 32, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   color: #ffffff;
   font-size: 14px;
   font-weight: 700;
 }
+.name-pill:not(:has(svg)) { padding-left: 12px; }
 .name-pill .muted-mic { color: #d42828; }
 .call-dock {
   position: absolute;
@@ -1208,8 +1321,9 @@ input[type="range"] {
   gap: 0;
   flex-wrap: nowrap;
   border-radius: 12px;
-  background: rgba(0, 0, 0, 0.3);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(28, 28, 32, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
 }
 .app.mock .tool {
   position: relative;
@@ -1229,6 +1343,21 @@ input[type="range"] {
   padding: 0 2px;
   color: #ffffff;
 }
+.app.mock .tool > button svg,
+.app.mock .name-pill svg,
+.app.mock .hangup svg {
+  display: block;
+  flex: none;
+  width: 18px;
+  height: 18px;
+}
+.app.mock .name-pill svg { width: 16px; height: 16px; }
+.app.mock .tool.on > button:first-child { color: #d42828; }
+.app.mock .tool.live > button:first-child {
+  color: #111111;
+  background: rgba(255, 255, 255, 0.88);
+  border-radius: 8px;
+}
 .app.mock .tool .caret { width: 22px; border: 0; color: #ffffff; }
 .app.mock .tool .caret.open svg { transform: rotate(180deg); }
 .control-split { width: 1px; height: 26px; background: rgba(255, 255, 255, 0.35); margin: 0 6px; }
@@ -1236,8 +1365,9 @@ input[type="range"] {
   width: 48px;
   height: 48px;
   border-radius: 12px;
-  background: rgba(212, 40, 40, 0.65);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(212, 40, 40, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   color: #ffffff;
   display: grid;
   place-items: center;
@@ -1258,7 +1388,7 @@ input[type="range"] {
   font-family: "Work Sans", sans-serif;
   font-size: 12px;
 }
-.menu-row { right: 208px; bottom: 68px; }
+.menu-row { right: 208px; bottom: 68px; max-height: calc(100% - 80px); }
 .tool .pop-anchor {
   position: absolute;
   left: 0;
@@ -1340,6 +1470,19 @@ label.slider-card strong { font-weight: 400; text-align: right; font-size: 12px;
   .menu-row { right: 176px; }
   .auth-card { flex-direction: column; gap: 20px; }
 }
+
+.home-topbar {
+  background: transparent;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  height: 32px;
+  pointer-events: none;
+  -webkit-app-region: drag;
+}
+.home-topbar .topbar-title { display: none; }
 
 .auth {
   height: 100%;

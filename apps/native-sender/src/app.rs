@@ -95,6 +95,7 @@ struct CallSettings {
     name: String,
     room: String,
     invite: Option<String>,
+    session: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -121,6 +122,7 @@ pub struct Person {
     pub name: String,
     pub local: bool,
     pub speaking: bool,
+    pub muted: bool,
 }
 
 struct Joined {
@@ -148,6 +150,7 @@ pub struct CallRequest {
     pub name: String,
     pub room: String,
     pub invite: Option<String>,
+    pub session: Option<String>,
 }
 
 pub struct ShareRequest {
@@ -224,11 +227,16 @@ impl Engine {
                 Some(trimmed)
             }
         });
+        let session = request.session.and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        });
         self.commands
             .send(Cmd::Join(CallSettings {
                 name: name.to_string(),
                 room: room.to_string(),
                 invite,
+                session,
             }))
             .map_err(|_| anyhow!("the call runtime stopped"))?;
         Ok(())
@@ -1113,7 +1121,7 @@ impl MyCord {
         );
         self.joining = true;
         self.status = "Joining…".to_string();
-        self.send(Cmd::Join(CallSettings { name, room, invite }));
+        self.send(Cmd::Join(CallSettings { name, room, invite, session: None }));
     }
 }
 
@@ -1588,6 +1596,20 @@ fn person_name(identity: impl std::fmt::Display, name: &str) -> String {
     }
 }
 
+fn microphone_muted(participant: &Participant) -> bool {
+    let mut saw = false;
+    for publication in participant.track_publications().values() {
+        if publication.source() != TrackSource::Microphone {
+            continue;
+        }
+        saw = true;
+        if !publication.is_muted() {
+            return false;
+        }
+    }
+    saw
+}
+
 fn roster(call: &Joined, speaking: &std::collections::HashSet<String>) -> Vec<Person> {
     let local = call.room.local_participant();
     let local_id = local.identity().to_string();
@@ -1595,6 +1617,7 @@ fn roster(call: &Joined, speaking: &std::collections::HashSet<String>) -> Vec<Pe
         name: person_name(&local_id, &local.name()),
         local: true,
         speaking: speaking.contains(&local_id),
+        muted: microphone_muted(&Participant::Local(local.clone())),
     }];
     let mut remote: Vec<_> = call.room.remote_participants().into_values().collect();
     remote.sort_by(|left, right| {
@@ -1602,10 +1625,12 @@ fn roster(call: &Joined, speaking: &std::collections::HashSet<String>) -> Vec<Pe
     });
     for person in remote {
         let id = person.identity().to_string();
+        let muted = microphone_muted(&Participant::Remote(person.clone()));
         people.push(Person {
             name: person_name(&id, &person.name()),
             local: false,
             speaking: speaking.contains(&id),
+            muted,
         });
     }
     people
@@ -1620,7 +1645,7 @@ fn note_people(
     let people = roster(call, speaking);
     let next = people
         .iter()
-        .map(|person| format!("{}:{}:{}", person.name, u8::from(person.local), u8::from(person.speaking)))
+        .map(|person| format!("{}:{}:{}:{}", person.name, u8::from(person.local), u8::from(person.speaking), u8::from(person.muted)))
         .collect::<Vec<_>>()
         .join("\n");
     if next == *key {
@@ -1698,6 +1723,7 @@ async fn session(
                             } else {
                                 call.mic.unmute();
                             }
+                            note_people(call, &speaking, &notes, &mut people_key);
                         }
                     }
                     Cmd::Voice(percent) => {
@@ -1785,6 +1811,9 @@ async fn session(
                         }
                     }
                     Some(RoomEvent::TrackSubscribed { track, publication, participant }) => {
+                        if let Some(call) = call.as_ref() {
+                            note_people(call, &speaking, &notes, &mut people_key);
+                        }
                         match track {
                             RemoteTrack::Audio(audio) => {
                                 audio.enable();
@@ -1841,6 +1870,11 @@ async fn session(
                             }
                         }
                     }
+                    Some(RoomEvent::TrackMuted { .. }) | Some(RoomEvent::TrackUnmuted { .. }) => {
+                        if let Some(call) = call.as_ref() {
+                            note_people(call, &speaking, &notes, &mut people_key);
+                        }
+                    }
                     Some(RoomEvent::TrackSubscriptionFailed { error, track_sid, .. }) => {
                         crate::audio::session_log(&format!("voice subscribe failed {track_sid}: {error}"));
                     }
@@ -1876,6 +1910,7 @@ async fn connect(settings: &CallSettings, stage: Arc<Stage>) -> Result<(Joined, 
         &config.identity,
         &config.client_type,
         config.invite.as_deref(),
+        settings.session.as_deref(),
     )
     .await
     .context("Could not join this room")?;
@@ -2006,6 +2041,7 @@ async fn start_share(call: &mut Joined, picture: PictureSettings, notes: &std::s
             name: call.room.local_participant().identity().to_string(),
             room: call.room.name(),
             invite: None,
+            session: None,
         },
         &picture,
     );

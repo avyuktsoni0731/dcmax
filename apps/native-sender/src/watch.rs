@@ -352,6 +352,7 @@ fn picture_link(config: &AppConfig) -> Option<PictureLink> {
             &config.identity,
             &config.client_type,
             config.invite.as_deref(),
+            None,
         )
         .ok()?;
         let addr = token.relay?.parse().ok()?;
@@ -612,6 +613,7 @@ async fn session(
         &config.identity,
         &config.client_type,
         config.invite.as_deref(),
+        None,
     )
     .await?;
     println!(

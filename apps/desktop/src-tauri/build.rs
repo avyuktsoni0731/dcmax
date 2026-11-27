@@ -6,6 +6,7 @@ fn main() {
             .flag("-fobjc-arc")
             .compile("stage_view");
         println!("cargo:rustc-link-lib=framework=AppKit");
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
         println!("cargo:rerun-if-changed=native/stage_view.m");
         // LiveKit's WebRTC static library registers NSString categories. A
         // dependency cannot pass this flag through, and without it Join calls
