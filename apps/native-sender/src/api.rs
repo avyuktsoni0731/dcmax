@@ -332,3 +332,36 @@ pub fn people_blocking(session: &str, query: &str) -> Result<Vec<String>> {
         })
         .unwrap_or_default())
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Circle {
+    pub friends: Vec<String>,
+    pub incoming: Vec<String>,
+    pub outgoing: Vec<String>,
+}
+
+/// Friend list plus the requests waiting in either direction.
+pub fn circle_blocking(session: &str, action: &str, username: &str) -> Result<Circle> {
+    let api_base_url = std::env::var("API_BASE_URL")
+        .unwrap_or_else(|_| "https://dcmax-token.soniavyukt.workers.dev".to_string());
+    let url = format!("{}/circle", api_base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .context("account client")?;
+    let response = authed_blocking(client.post(url), Some(session))
+        .json(&serde_json::json!({ "action": action, "username": username, "session": session }))
+        .send()
+        .context("Could not reach the account service.")?;
+    let status = response.status();
+    let text = response.text().context("account response")?;
+    if !status.is_success() {
+        let message = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| value.get("error").and_then(|item| item.as_str()).map(str::to_string))
+            .filter(|item| !item.trim().is_empty())
+            .unwrap_or_else(|| "The account service did not accept that.".to_string());
+        anyhow::bail!(message);
+    }
+    serde_json::from_str(&text).context("account response parse failed")
+}

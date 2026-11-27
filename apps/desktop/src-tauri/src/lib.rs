@@ -355,6 +355,24 @@ async fn people(body: PeopleBody) -> Result<Vec<String>, String> {
     .map_err(|err| err.to_string())?
 }
 
+#[derive(Deserialize)]
+struct CircleBody {
+    session: String,
+    action: String,
+    #[serde(default)]
+    username: String,
+}
+
+#[tauri::command]
+async fn circle(body: CircleBody) -> Result<native_sender::Circle, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        native_sender::circle_blocking(&body.session, &body.action, &body.username)
+            .map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
 #[tauri::command]
 fn stage_rect(state: State<DesktopState>, body: RectBody) -> Result<(), String> {
     let mut rect = state.rect.lock().map_err(|_| "the stage is unavailable".to_string())?;
@@ -781,6 +799,7 @@ pub fn run() {
             remember,
             account,
             people,
+            circle,
             stage_rect,
             screens
         ])

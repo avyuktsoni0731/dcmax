@@ -56,6 +56,7 @@ const RESOLUTIONS = [
 const BITRATES = [8000, 12000, 20000, 40000, 80000, 100000];
 
 type Ask = { name: string; direction: "in" | "out" };
+type Circle = { friends: string[]; incoming: string[]; outgoing: string[] };
 
 function pairRoom(mine: string, theirs: string) {
   const names = [mine, theirs]
@@ -749,6 +750,27 @@ export function App() {
   }, [session]);
 
   useEffect(() => {
+    if (!session) return;
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has("preview")) return;
+    let cancel = false;
+    const pull = () => {
+      const saved = localStorage.getItem("mycord.session");
+      if (!saved || saved === "1") return;
+      void invoke<Circle>("circle", { body: { session: saved, action: "list", username: "" } })
+        .then((circle) => {
+          if (!cancel) applyCircle(circle);
+        })
+        .catch(() => { });
+    };
+    pull();
+    const timer = window.setInterval(pull, 4000);
+    return () => {
+      cancel = true;
+      window.clearInterval(timer);
+    };
+  }, [session]);
+
+  useEffect(() => {
     const typed = (friendOpen ? friendQuery : query).trim().replace(/^@/, "");
     if (typed.length < 2) {
       setFoundPeople([]);
@@ -768,10 +790,10 @@ export function App() {
           setFriendNote("");
           setLooking(false);
         })
-        .catch(() => {
+        .catch((err: unknown) => {
           if (cancel) return;
           setFoundPeople([]);
-          setFriendNote("Couldn't look up people.");
+          setFriendNote(accountError(err));
           setLooking(false);
         });
     }, 180);
@@ -788,41 +810,92 @@ export function App() {
     setAuthPass("");
     setAuthNote("");
     setPrefsOpen(false);
+    setAsks([]);
     setSession(false);
     if (phase === "call" || phase === "joining") void invoke("leave").catch(() => { });
     if (saved && saved !== "1") void invoke("account", { body: { action: "logout", session: saved } }).catch(() => { });
   }
 
+  function applyCircle(circle: Circle) {
+    const mine = (localStorage.getItem("mycord.user") || name).trim();
+    setAsks([
+      ...circle.incoming.map((person) => ({ name: person, direction: "in" as const })),
+      ...circle.outgoing.map((person) => ({ name: person, direction: "out" as const }))
+    ]);
+    commit((current) => {
+      const wanted = new Map(circle.friends.map((person) => [person.toLowerCase(), person]));
+      const kept = current.friends.filter((friend) => wanted.has(friend.name.toLowerCase()));
+      const have = new Set(kept.map((friend) => friend.name.toLowerCase()));
+      const fresh = [...wanted.entries()].filter(([key]) => !have.has(key)).map(([, person]) => ({
+        name: person,
+        room: pairRoom(mine, person),
+        at: Date.now(),
+        added: true
+      }));
+      return {
+        ...current,
+        friends: [...fresh, ...kept.map((friend) => ({ ...friend, added: true, room: friend.room || pairRoom(mine, friend.name) }))].slice(0, 40)
+      };
+    });
+  }
+
+  function postCircle(action: string, username: string) {
+    const saved = localStorage.getItem("mycord.session");
+    if (!saved || saved === "1") return Promise.reject(new Error("Sign in again."));
+    return invoke<Circle>("circle", { body: { session: saved, action, username } }).then((circle) => {
+      applyCircle(circle);
+      setFriendNote("");
+      return circle;
+    });
+  }
+
   function sendFriendRequest(foundName: string) {
     const nextName = foundName.replace(/^@/, "").trim();
     if (!nextName) return;
-    const known = desk.friends.some((friend) => friend.added && friend.name.toLowerCase() === nextName.toLowerCase());
-    if (known) return;
-    setAsks((current) => (
-      current.some((ask) => ask.name.toLowerCase() === nextName.toLowerCase())
-        ? current
-        : [{ name: nextName, direction: "out" }, ...current]
-    ));
-    setFriendQuery("");
-    setQuery("");
-    setFriendOpen(false);
-    setPendingOpen(true);
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has("preview")) {
+      setAsks((current) => (
+        current.some((ask) => ask.name.toLowerCase() === nextName.toLowerCase())
+          ? current
+          : [{ name: nextName, direction: "out" }, ...current]
+      ));
+      setFriendQuery("");
+      setQuery("");
+      setFriendOpen(false);
+      setPendingOpen(true);
+      return;
+    }
+    void postCircle("ask", nextName)
+      .then(() => {
+        setFriendQuery("");
+        setQuery("");
+        setFriendOpen(false);
+        setPendingOpen(true);
+      })
+      .catch((err: unknown) => setFriendNote(accountError(err)));
   }
 
   function acceptAsk(askName: string) {
     const nextName = askName.trim();
     if (!nextName) return;
-    const mine = (localStorage.getItem("mycord.user") || name).trim();
-    const target = pairRoom(mine, nextName);
-    commit((current) => ({
-      ...current,
-      friends: [{ name: nextName, room: target, at: Date.now(), added: true }, ...current.friends.filter((friend) => friend.name.toLowerCase() !== nextName.toLowerCase())].slice(0, 40)
-    }));
-    setAsks((current) => current.filter((ask) => !(ask.direction === "in" && ask.name.toLowerCase() === nextName.toLowerCase())));
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has("preview")) {
+      const mine = (localStorage.getItem("mycord.user") || name).trim();
+      const target = pairRoom(mine, nextName);
+      commit((current) => ({
+        ...current,
+        friends: [{ name: nextName, room: target, at: Date.now(), added: true }, ...current.friends.filter((friend) => friend.name.toLowerCase() !== nextName.toLowerCase())].slice(0, 40)
+      }));
+      setAsks((current) => current.filter((ask) => !(ask.direction === "in" && ask.name.toLowerCase() === nextName.toLowerCase())));
+      return;
+    }
+    void postCircle("accept", nextName).catch((err: unknown) => setFriendNote(accountError(err)));
   }
 
   function dismissAsk(askName: string, direction: Ask["direction"]) {
-    setAsks((current) => current.filter((ask) => !(ask.direction === direction && ask.name.toLowerCase() === askName.toLowerCase())));
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has("preview")) {
+      setAsks((current) => current.filter((ask) => !(ask.direction === direction && ask.name.toLowerCase() === askName.toLowerCase())));
+      return;
+    }
+    void postCircle(direction === "in" ? "reject" : "cancel", askName).catch((err: unknown) => setFriendNote(accountError(err)));
   }
 
   function openFriend(friend: { name: string; room: string }) {
@@ -1444,6 +1517,7 @@ export function App() {
                               </button>
                               {pendingOpen ? (
                                 <div className="pending-card" role="dialog" aria-label="Pending requests">
+                                  {friendNote ? <p className="pop-note">{friendNote}</p> : null}
                                   <p className="pending-label">Received</p>
                                   {received.map((ask) => (
                                     <div className="pending-row" key={`in-${ask.name}`}>
@@ -1491,7 +1565,8 @@ export function App() {
                                   <button type="button" aria-label={`Add ${hit}`} onClick={() => sendFriendRequest(hit)}><PersonAddIcon size={18} /></button>
                                 </div>
                               ))}
-                              {friendQuery.trim().replace(/^@/, "").length >= 2 && !looking && suggestions.length === 0 ? <p className="empty">{friendNote || "No one online matches that."}</p> : null}
+                              {friendNote ? <p className="pop-note">{friendNote}</p> : null}
+                              {friendQuery.trim().replace(/^@/, "").length >= 2 && !looking && suggestions.length === 0 && !friendNote ? <p className="pop-note">No one online matches that.</p> : null}
                             </div>
                           ) : null}
                           <div className="chat-empty">

@@ -46,6 +46,9 @@ export default {
     if (request.method === "POST" && url.pathname === "/people") {
       return cors(await people(request, env));
     }
+    if (request.method === "POST" && url.pathname === "/circle") {
+      return cors(await circle(request, env));
+    }
     return cors(new Response("not found", { status: 404 }));
   },
 };
@@ -57,6 +60,7 @@ async function register(request, env) {
   if (account.error) return Response.json({ error: account.error }, { status: 400 });
   const database = await accounts(env);
   if (database.error) return database.error;
+  try {
   const salt = newSalt();
   const passwordHash = await hashPassword(account.password, salt);
   try {
@@ -80,6 +84,9 @@ async function register(request, env) {
   }
   const opened = await openSession(database, account);
   return Response.json(opened, { status: 201 });
+  } finally {
+    await release(database);
+  }
 }
 
 async function login(request, env) {
@@ -89,6 +96,7 @@ async function login(request, env) {
   if (account.error) return Response.json({ error: account.error }, { status: 400 });
   const database = await accounts(env);
   if (database.error) return database.error;
+  try {
   const user = account.email
     ? await database.users.findOne({ email: account.login })
     : await database.users.findOne({ username: account.login }, { collation: { locale: "en", strength: 2 } });
@@ -100,11 +108,15 @@ async function login(request, env) {
   }
   const opened = await openSession(database, user);
   return Response.json(opened);
+  } finally {
+    await release(database);
+  }
 }
 
 async function session(request, env) {
   const database = await accounts(env);
   if (database.error) return database.error;
+  try {
   const body = await readJson(request);
   if (body.error) return body.error;
   const user = await userForRequest(request, database, body);
@@ -115,22 +127,30 @@ async function session(request, env) {
     email: user.email,
     session: bearer(request) || String(body.value.session ?? ""),
   });
+  } finally {
+    await release(database);
+  }
 }
 
 async function here(request, env) {
   const database = await accounts(env);
   if (database.error) return database.error;
+  try {
   const body = await readJson(request);
   if (body.error) return body.error;
   const user = await userForRequest(request, database, body);
   if (!user) return Response.json({ error: "Sign in again." }, { status: 401 });
   await markSeen(database, user.username);
   return Response.json({ username: user.username, email: "", session: "" });
+  } finally {
+    await release(database);
+  }
 }
 
 async function people(request, env) {
   const database = await accounts(env);
   if (database.error) return database.error;
+  try {
   const body = await readJson(request);
   if (body.error) return body.error;
   const user = await userForRequest(request, database, body);
@@ -150,6 +170,100 @@ async function people(request, env) {
     .map((item) => item.username)
     .filter((name) => name && name.toLowerCase() !== user.username.toLowerCase());
   return Response.json({ people: names });
+  } finally {
+    await release(database);
+  }
+}
+
+const NAME = { locale: "en", strength: 2 };
+
+async function circle(request, env) {
+  const database = await accounts(env);
+  if (database.error) return database.error;
+  try {
+  const body = await readJson(request);
+  if (body.error) return body.error;
+  const user = await userForRequest(request, database, body);
+  if (!user) return Response.json({ error: "Sign in again." }, { status: 401 });
+  await markSeen(database, user.username);
+  const action = String(body.value.action ?? "list");
+  if (action === "list") return Response.json(await loadCircle(database, user.username));
+  const other = await namedUser(database, body.value.username);
+  if (!other) return Response.json({ error: "No one uses that username." }, { status: 404 });
+  if (other.username.toLowerCase() === user.username.toLowerCase()) {
+    return Response.json({ error: "You can't add yourself." }, { status: 400 });
+  }
+  if (action === "ask") {
+    const already = await database.friendships.findOne(
+      { user: user.username, friend: other.username },
+      { collation: NAME, projection: { _id: 1 } },
+    );
+    if (!already) {
+      const reverse = await database.requests.findOne(
+        { from: other.username, to: user.username },
+        { collation: NAME, projection: { _id: 1 } },
+      );
+      if (reverse) {
+        const saved = await befriend(database, user.username, other.username);
+        if (saved) return saved;
+      } else {
+        try {
+          await database.requests.insertOne({ from: user.username, to: other.username, at: new Date() });
+        } catch (err) {
+          if (!err || err.code !== 11000) return Response.json({ error: "The request could not be saved." }, { status: 500 });
+        }
+      }
+    }
+  } else if (action === "accept") {
+    const pending = await database.requests.findOne(
+      { from: other.username, to: user.username },
+      { collation: NAME, projection: { _id: 1 } },
+    );
+    if (!pending) return Response.json({ error: "That request is gone." }, { status: 404 });
+    const saved = await befriend(database, user.username, other.username);
+    if (saved) return saved;
+  } else if (action === "reject") {
+    await database.requests.deleteOne({ from: other.username, to: user.username }, { collation: NAME });
+  } else if (action === "cancel") {
+    await database.requests.deleteOne({ from: user.username, to: other.username }, { collation: NAME });
+  } else {
+    return Response.json({ error: "Unknown request." }, { status: 400 });
+  }
+  return Response.json(await loadCircle(database, user.username));
+  } finally {
+    await release(database);
+  }
+}
+
+async function namedUser(database, username) {
+  const name = String(username ?? "").trim().replace(/^@/, "");
+  if (!/^[A-Za-z0-9_-]{2,32}$/.test(name)) return null;
+  return database.users.findOne({ username: name }, { collation: NAME, projection: { username: 1 } });
+}
+
+async function loadCircle(database, username) {
+  const [friends, incoming, outgoing] = await Promise.all([
+    database.friendships.find({ user: username }, { collation: NAME, projection: { friend: 1, _id: 0 } }).limit(40).toArray(),
+    database.requests.find({ to: username }, { collation: NAME, projection: { from: 1, _id: 0 } }).sort({ at: -1 }).limit(40).toArray(),
+    database.requests.find({ from: username }, { collation: NAME, projection: { to: 1, _id: 0 } }).sort({ at: -1 }).limit(40).toArray(),
+  ]);
+  return {
+    friends: friends.map((item) => item.friend).filter(Boolean),
+    incoming: incoming.map((item) => item.from).filter(Boolean),
+    outgoing: outgoing.map((item) => item.to).filter(Boolean),
+  };
+}
+
+async function befriend(database, a, b) {
+  await database.requests.deleteMany({ $or: [{ from: a, to: b }, { from: b, to: a }] });
+  for (const [user, friend] of [[a, b], [b, a]]) {
+    try {
+      await database.friendships.insertOne({ user, friend, at: new Date() });
+    } catch (err) {
+      if (!err || err.code !== 11000) return Response.json({ error: "The friend could not be saved." }, { status: 500 });
+    }
+  }
+  return null;
 }
 
 async function markSeen(database, username) {
@@ -163,12 +277,16 @@ async function markSeen(database, username) {
 async function logout(request, env) {
   const database = await accounts(env);
   if (database.error) return database.error;
+  try {
   const token = bearer(request);
   if (token) {
     const tokenHash = await hashSecret(token);
     await database.sessions.deleteOne({ tokenHash });
   }
   return Response.json({ username: "", email: "", session: "" });
+  } finally {
+    await release(database);
+  }
 }
 
 async function openSession(database, user) {
@@ -203,17 +321,18 @@ async function accounts(env) {
   if (!env.MONGODB_URI) {
     return { error: Response.json({ error: "Accounts are not configured." }, { status: 500 }) };
   }
+  const client = new MongoClient(env.MONGODB_URI, {
+    serverSelectionTimeoutMS: 5000,
+    connectTimeoutMS: 5000,
+    socketTimeoutMS: 8000,
+    maxPoolSize: 1,
+    family: 4,
+  });
   try {
-    if (!globalThis.__mycordMongo) {
-      globalThis.__mycordMongo = new MongoClient(env.MONGODB_URI, {
-        serverSelectionTimeoutMS: 8000,
-        family: 4,
-      });
-    }
-    await globalThis.__mycordMongo.connect();
-    const database = globalThis.__mycordMongo.db(databaseName(env.MONGODB_URI));
-    if (!globalThis.__mycordIndexes) {
-      globalThis.__mycordIndexes = Promise.all([
+    await client.connect();
+    const database = client.db(databaseName(env.MONGODB_URI));
+    if (!globalThis.__mycordReady) {
+      await Promise.all([
         database.collection("users").createIndex({ email: 1 }, { unique: true }),
         database.collection("users").createIndex(
           { username: 1 },
@@ -222,15 +341,40 @@ async function accounts(env) {
         database.collection("sessions").createIndex({ tokenHash: 1 }, { unique: true }),
         database.collection("sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
         database.collection("users").createIndex({ lastSeen: -1 }),
+        database.collection("requests").createIndex(
+          { from: 1, to: 1 },
+          { unique: true, collation: NAME },
+        ),
+        database.collection("friendships").createIndex(
+          { user: 1, friend: 1 },
+          { unique: true, collation: NAME },
+        ),
       ]);
+      globalThis.__mycordReady = true;
     }
-    await globalThis.__mycordIndexes;
     return {
       users: database.collection("users"),
       sessions: database.collection("sessions"),
+      requests: database.collection("requests"),
+      friendships: database.collection("friendships"),
+      close: () => client.close(),
     };
   } catch {
+    globalThis.__mycordReady = false;
+    try { await client.close(); } catch { /* already failed */ }
     return { error: Response.json({ error: "The account service is unavailable." }, { status: 500 }) };
+  }
+}
+
+async function release(database) {
+  if (!database?.close) return;
+  try {
+    await Promise.race([
+      database.close(),
+      new Promise((resolve) => setTimeout(resolve, 400)),
+    ]);
+  } catch {
+    // A finished answer matters more than closing the socket.
   }
 }
 
@@ -245,12 +389,17 @@ async function issueToken(request, env) {
   let identity = String(body.identity ?? "");
   const invite = body.invite ? String(body.invite) : "";
   const presented = bearer(request);
+  let database;
   if (presented) {
-    const database = await accounts(env);
+    database = await accounts(env);
     if (database.error) return database.error;
-    const user = await userForRequest(request, database, { value: {} });
-    if (!user) return Response.json({ error: "Sign in again." }, { status: 401 });
-    identity = user.username;
+    try {
+      const user = await userForRequest(request, database, { value: {} });
+      if (!user) return Response.json({ error: "Sign in again." }, { status: 401 });
+      identity = user.username;
+    } finally {
+      await release(database);
+    }
   }
   if (!/^[a-zA-Z0-9_-]{2,64}$/.test(roomName) || !/^[a-zA-Z0-9_-]{2,64}$/.test(identity)) {
     return Response.json({ error: "Invalid payload" }, { status: 400 });

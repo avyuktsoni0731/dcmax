@@ -1177,13 +1177,24 @@ input[type="range"] {
   top: calc(var(--pad-top) + var(--search-h) + var(--rule-gap) + 12px);
   right: var(--inset);
   z-index: 3;
-  width: min(240px, calc(100% - 28px));
+  width: min(280px, calc(100% - 28px));
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 0;
-  background: transparent;
-  border: 0;
+  padding: 10px;
+  border-radius: 12px;
+  background: #2a2a2a;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+.friend-pop .pop-note,
+.pending-card .pop-note {
+  margin: 0;
+  padding: 2px 4px 4px;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.72);
+  font-family: "Work Sans", sans-serif;
+  font-size: 13px;
+  line-height: 1.35;
 }
 .friend-hit {
   display: flex;

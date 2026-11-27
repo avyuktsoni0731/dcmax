@@ -30,7 +30,7 @@ pub use app::{
     audio_inputs, audio_outputs, choose_input, choose_output, prepare_voice, screens, AudioGear, CallRequest, Engine,
     EngineNote, Person, ScreenChoice, ShareRequest,
 };
-pub use api::{account_blocking, people_blocking, AccountSession};
+pub use api::{account_blocking, circle_blocking, people_blocking, AccountSession, Circle};
 pub use noise::set_noise_suppression;
 pub use present_gl::Picture;
 #[cfg(target_os = "macos")]
