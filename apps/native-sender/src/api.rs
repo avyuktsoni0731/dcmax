@@ -313,7 +313,12 @@ pub fn people_blocking(session: &str, query: &str) -> Result<Vec<String>> {
     let status = response.status();
     let text = response.text().context("account response")?;
     if !status.is_success() {
-        anyhow::bail!("The account service did not accept that.");
+        let message = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| value.get("error").and_then(|item| item.as_str()).map(str::to_string))
+            .filter(|item| !item.trim().is_empty())
+            .unwrap_or_else(|| "The account service did not accept that.".to_string());
+        anyhow::bail!(message);
     }
     let value: serde_json::Value = serde_json::from_str(&text).context("account response parse failed")?;
     Ok(value

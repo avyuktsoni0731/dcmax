@@ -138,8 +138,8 @@ async function people(request, env) {
   await markSeen(database, user.username);
   const query = String(body.value.query ?? "").trim().replace(/^@/, "").slice(0, 32);
   if (query.length < 2) return Response.json({ people: [] });
-  const pattern = `^${query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`;
-  const since = new Date(Date.now() - 90_000);
+  const pattern = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const since = new Date(Date.now() - 3 * 60_000);
   const found = await database.users
     .find(
       { username: { $regex: pattern, $options: "i" }, lastSeen: { $gt: since } },
@@ -153,7 +153,11 @@ async function people(request, env) {
 }
 
 async function markSeen(database, username) {
-  await database.users.updateOne({ username }, { $set: { lastSeen: new Date() } });
+  await database.users.updateOne(
+    { username },
+    { $set: { lastSeen: new Date() } },
+    { collation: { locale: "en", strength: 2 } },
+  );
 }
 
 async function logout(request, env) {
@@ -177,6 +181,7 @@ async function openSession(database, user) {
     email: user.email,
     expiresAt,
   });
+  await markSeen(database, user.username);
   return { username: user.username, email: user.email, session };
 }
 
@@ -216,6 +221,7 @@ async function accounts(env) {
         ),
         database.collection("sessions").createIndex({ tokenHash: 1 }, { unique: true }),
         database.collection("sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+        database.collection("users").createIndex({ lastSeen: -1 }),
       ]);
     }
     await globalThis.__mycordIndexes;

@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import discordMark from "./discord-mark.png";
 import ramenUrl from "./ramen.svg";
 import { faceColor, initials, loadDesk, saveDesk, type Desk, type Mail } from "./desk";
 import {
@@ -18,6 +19,7 @@ import {
   PersonAddIcon,
   PersonSearchIcon,
   PhoneIcon,
+  PhoneInTalkIcon,
   RamenMark,
   SendIcon,
   SettingsIcon,
@@ -141,6 +143,8 @@ export function App() {
   const [friendOpen, setFriendOpen] = useState(false);
   const [friendQuery, setFriendQuery] = useState("");
   const [foundPeople, setFoundPeople] = useState<string[]>([]);
+  const [friendNote, setFriendNote] = useState("");
+  const [looking, setLooking] = useState(false);
   const sharingRef = useRef(false);
   const remotesRef = useRef<Set<string> | null>(null);
   const noticeTimer = useRef(0);
@@ -243,11 +247,11 @@ export function App() {
         { room: "game-night", people: 3, at: now - 86_400_000 }
       ],
       friends: [
-        { name: "souvlakee", room: "project-sync", at: now - 120_000 },
-        { name: "Asna Fatimah", room: "project-sync", at: now - 3_600_000 },
-        { name: "malubulu", room: "mycord-room", at: now - 7_200_000 },
-        { name: "Divyank Shandilya", room: "project-sync", at: now - 86_400_000 },
-        { name: "beat_n", room: "game-night", at: now - 172_800_000 }
+        { name: "souvlakee", room: "project-sync", at: now - 120_000, added: true },
+        { name: "Asna Fatimah", room: "project-sync", at: now - 3_600_000, added: true },
+        { name: "malubulu", room: "mycord-room", at: now - 7_200_000, added: true },
+        { name: "Divyank Shandilya", room: "project-sync", at: now - 86_400_000, added: true },
+        { name: "beat_n", room: "game-night", at: now - 172_800_000, added: true }
       ],
       threads: [
         {
@@ -734,32 +738,37 @@ export function App() {
   }, [session]);
 
   useEffect(() => {
-    if (!friendOpen) {
+    const typed = (friendOpen ? friendQuery : query).trim().replace(/^@/, "");
+    if (typed.length < 2) {
       setFoundPeople([]);
-      return;
-    }
-    const query = friendQuery.trim().replace(/^@/, "");
-    if (query.length < 2) {
-      setFoundPeople([]);
+      setFriendNote("");
+      setLooking(false);
       return;
     }
     const saved = localStorage.getItem("mycord.session");
     if (!saved || saved === "1") return;
     let cancel = false;
+    setLooking(true);
     const timer = window.setTimeout(() => {
-      void invoke<string[]>("people", { body: { session: saved, query } })
+      void invoke<string[]>("people", { body: { session: saved, query: typed } })
         .then((names) => {
-          if (!cancel) setFoundPeople(names);
+          if (cancel) return;
+          setFoundPeople(Array.isArray(names) ? names : []);
+          setFriendNote("");
+          setLooking(false);
         })
         .catch(() => {
-          if (!cancel) setFoundPeople([]);
+          if (cancel) return;
+          setFoundPeople([]);
+          setFriendNote("Couldn't look up people.");
+          setLooking(false);
         });
     }, 180);
     return () => {
       cancel = true;
       window.clearTimeout(timer);
     };
-  }, [friendOpen, friendQuery]);
+  }, [friendOpen, friendQuery, query]);
 
   function logOut() {
     const saved = localStorage.getItem("mycord.session");
@@ -783,6 +792,7 @@ export function App() {
       friends: [{ name: nextName, room: target, at: Date.now(), added: true }, ...current.friends.filter((friend) => friend.name.toLowerCase() !== nextName.toLowerCase())].slice(0, 40)
     }));
     setFriendQuery("");
+    setQuery("");
     setFriendOpen(false);
     openFriend({ name: nextName, room: target });
   }
@@ -911,7 +921,7 @@ export function App() {
     return (
       <div className={`app mock${fullscreen ? " fullscreen" : ""}${fullscreen && chrome ? " chrome" : ""}`}>
           <header className="topbar" data-tauri-drag-region>
-            <span className="topbar-title"><img className="name-mark" src={ramenUrl} alt="" /> Yatai</span>
+            <span className="topbar-title"><PhoneInTalkIcon size={16} /> Call</span>
             {notice || status ? <span className={`call-live${status && /microphone|could not|did not/i.test(status) ? " warn" : ""}`}>{notice ?? status}</span> : null}
             <button
               className="icon-quiet"
@@ -1218,21 +1228,21 @@ export function App() {
             <label>
               <span>{authMode === "login" ? "Email or Username" : "Email"} <i>*</i></span>
               <span className="auth-field">
-                <input value={authEmail} autoComplete="username" onChange={(event) => setAuthEmail(event.target.value)} />
+                <input value={authEmail} autoComplete="username" spellCheck={false} autoCorrect="off" autoCapitalize="off" onChange={(event) => setAuthEmail(event.target.value)} />
               </span>
             </label>
             {authMode === "register" ? (
               <label>
                 <span>Username <i>*</i></span>
                 <span className="auth-field">
-                  <input value={authUser} autoComplete="nickname" onChange={(event) => setAuthUser(event.target.value)} />
+                  <input value={authUser} autoComplete="nickname" spellCheck={false} autoCorrect="off" autoCapitalize="off" onChange={(event) => setAuthUser(event.target.value)} />
                 </span>
               </label>
             ) : null}
             <label>
               <span>Password <i>*</i></span>
               <span className="auth-field">
-                <input type={showPassword ? "text" : "password"} value={authPass} autoComplete={authMode === "login" ? "current-password" : "new-password"} onChange={(event) => setAuthPass(event.target.value)} />
+                <input type={showPassword ? "text" : "password"} value={authPass} autoComplete={authMode === "login" ? "current-password" : "new-password"} spellCheck={false} autoCorrect="off" autoCapitalize="off" onChange={(event) => setAuthPass(event.target.value)} />
                 <button type="button" aria-label={showPassword ? "Hide password" : "Show password"} onClick={() => setShowPassword((current) => !current)}>
                   {showPassword ? <VisibilityOffIcon size={18} /> : <VisibilityIcon size={18} />}
                 </button>
@@ -1301,7 +1311,7 @@ export function App() {
   return (
     <div className="app mock">
           <header className="topbar" data-tauri-drag-region>
-            <span className="topbar-title"><img className="name-mark" src={ramenUrl} alt="" /> Yatai</span>
+            <span className="topbar-title"><ChatBubbleIcon size={16} /> Chat</span>
           </header>
           <div className="shell">
             {rail}
@@ -1310,8 +1320,8 @@ export function App() {
                   <div className="chat-board">
                     <section className="dm-col">
                       <label className="search">
-                        <PersonSearchIcon size={18} />
-                        <input id="thread-search" placeholder="Find your friend" value={query} onChange={(event) => setQuery(event.target.value)} />
+                        <PersonSearchIcon size={20} />
+                        <input id="thread-search" placeholder="Find your friend" value={query} spellCheck={false} autoCorrect="off" autoCapitalize="off" onChange={(event) => setQuery(event.target.value)} />
                       </label>
                       <hr className="dm-rule" />
                       <div className="thread-scroll">
@@ -1332,11 +1342,18 @@ export function App() {
                         })}
                         <hr className="dm-rule" />
                         <p className="dm-label">Friends</p>
-                        {needle && friendRows.length === 0 ? <p className="empty">No matches.</p> : null}
+                        {needle && friendRows.length === 0 && (friendOpen || (suggestions.length === 0 && !looking)) ? <p className="empty">{!friendOpen && friendNote ? friendNote : "No matches."}</p> : null}
                         {friendRows.map((friend) => (
                           <button className="thread-row" type="button" key={friend.name} onClick={() => openFriend(friend)}>
                             <Avatar name={friend.name} />
                             <span className="thread-copy"><strong>{friend.name}</strong></span>
+                          </button>
+                        ))}
+                        {friendOpen ? null : suggestions.map((hit) => (
+                          <button className="thread-row" type="button" key={hit} onClick={() => addFoundFriend(hit)}>
+                            <Avatar name={hit} />
+                            <span className="thread-copy"><strong>{hit}</strong></span>
+                            <PersonAddIcon size={18} />
                           </button>
                         ))}
                       </div>
@@ -1379,7 +1396,7 @@ export function App() {
                           </div>
                           <div className="composer">
                             <form onSubmit={(event) => { event.preventDefault(); sendNote(selected.name, selected.room); }}>
-                              <input aria-label={`Message ${selected.name}`} placeholder={`Message to ${selected.name}`} value={draft} onChange={(event) => setDraft(event.target.value)} />
+                              <input aria-label={`Message ${selected.name}`} placeholder={`Message to ${selected.name}`} value={draft} spellCheck={false} autoCorrect="off" autoCapitalize="off" onChange={(event) => setDraft(event.target.value)} />
                               <button className="emoji" type="button" aria-label="Add an emoji" onClick={() => setDraft((current) => `${current}✨`)}><SmileIcon size={18} /></button>
                               <button className="send" type="submit" aria-label="Save note"><SendIcon size={18} /></button>
                             </form>
@@ -1387,14 +1404,15 @@ export function App() {
                         </>
                       ) : (
                         <div className="home-empty">
+                          <hr className="pane-rule" />
                           <button className="add-friend" type="button" onClick={() => setFriendOpen((open) => !open)}>
                             <PersonAddIcon size={18} /> Add Friend
                           </button>
                           {friendOpen ? (
                             <div className="friend-pop" role="dialog" aria-label="Search for a friend">
                               <label className="search">
-                                <PersonSearchIcon size={18} />
-                                <input placeholder="Find someone online" value={friendQuery} onChange={(event) => setFriendQuery(event.target.value)} />
+                                <PersonSearchIcon size={20} />
+                                <input placeholder="Search for a friend" value={friendQuery} spellCheck={false} autoCorrect="off" autoCapitalize="off" onChange={(event) => setFriendQuery(event.target.value)} />
                               </label>
                               {suggestions.map((hit) => (
                                 <div className="friend-hit" key={hit}>
@@ -1406,7 +1424,7 @@ export function App() {
                                   <button type="button" aria-label={`Add ${hit}`} onClick={() => addFoundFriend(hit)}><PersonAddIcon size={18} /></button>
                                 </div>
                               ))}
-                              {friendQuery.trim().replace(/^@/, "").length >= 2 && suggestions.length === 0 ? <p className="empty">No one online matches that.</p> : null}
+                              {friendQuery.trim().replace(/^@/, "").length >= 2 && !looking && suggestions.length === 0 ? <p className="empty">{friendNote || "No one online matches that."}</p> : null}
                             </div>
                           ) : null}
                           <div className="chat-empty">
@@ -1427,8 +1445,8 @@ export function App() {
 function Rail({ prefsOpen, onPrefs, onTheme, onLogOut, dark }: { prefsOpen: boolean; onPrefs: () => void; onTheme: () => void; onLogOut: () => void; dark: boolean }) {
   return (
     <aside className="sidebar">
-      <div className="brand-mark" aria-label="Yatai">
-        <img src={ramenUrl} alt="" />
+      <div className="brand-mark" aria-label="Home">
+        <img src={discordMark} alt="" />
       </div>
       <button className="nav-btn active" type="button" aria-label="Messages">
         <ChatBubbleIcon size={20} />

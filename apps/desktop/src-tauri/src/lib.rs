@@ -20,6 +20,10 @@ struct DesktopState {
     rect: Mutex<Rect>,
 }
 
+// True only while the picture window is on screen. The present loop stays off
+// the main thread until a call actually shows a picture.
+static STAGE_LIVE: AtomicBool = AtomicBool::new(false);
+
 #[derive(Deserialize)]
 struct JoinBody {
     name: String,
@@ -317,19 +321,23 @@ struct AccountBody {
 }
 
 #[tauri::command]
-fn account(body: AccountBody) -> Result<native_sender::AccountSession, String> {
-    let payload = serde_json::json!({
-        "action": body.action,
-        "email": body.email,
-        "username": body.username,
-        "login": body.login,
-        "password": body.password,
-        "day": body.day,
-        "month": body.month,
-        "year": body.year,
-        "session": body.session,
-    });
-    native_sender::account_blocking(&payload).map_err(|err| err.to_string())
+async fn account(body: AccountBody) -> Result<native_sender::AccountSession, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let payload = serde_json::json!({
+            "action": body.action,
+            "email": body.email,
+            "username": body.username,
+            "login": body.login,
+            "password": body.password,
+            "day": body.day,
+            "month": body.month,
+            "year": body.year,
+            "session": body.session,
+        });
+        native_sender::account_blocking(&payload).map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[derive(Deserialize)]
@@ -339,8 +347,12 @@ struct PeopleBody {
 }
 
 #[tauri::command]
-fn people(body: PeopleBody) -> Result<Vec<String>, String> {
-    native_sender::people_blocking(&body.session, &body.query).map_err(|err| err.to_string())
+async fn people(body: PeopleBody) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        native_sender::people_blocking(&body.session, &body.query).map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -419,6 +431,15 @@ fn watch_picture(handle: AppHandle) {
     std::thread::Builder::new()
         .name("mycord-present".to_string())
         .spawn(move || loop {
+            let picture_up = {
+                let state = handle.state::<DesktopState>();
+                let visible = state.rect.lock().map(|rect| rect.visible).unwrap_or(false);
+                visible || STAGE_LIVE.load(Ordering::Acquire)
+            };
+            if !picture_up {
+                std::thread::sleep(Duration::from_millis(40));
+                continue;
+            }
             if QUEUED
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
@@ -517,8 +538,10 @@ fn present_on_main(handle: &AppHandle) {
             surface.view = place(surface.view, false);
             SHOWING.with(|slot| slot.set(false));
             ARMED.with(|slot| slot.set(false));
+            STAGE_LIVE.store(false, Ordering::Release);
             return;
         }
+        STAGE_LIVE.store(true, Ordering::Release);
         let state = handle.state::<DesktopState>();
         let Ok(engine) = state.engine.lock() else {
             return;
@@ -666,8 +689,10 @@ fn present_on_main(handle: &AppHandle) {
             surface.window = place(surface.window, false);
             SHOWING.with(|slot| slot.set(false));
             ARMED.with(|slot| slot.set(false));
+            STAGE_LIVE.store(false, Ordering::Release);
             return;
         }
+        STAGE_LIVE.store(true, Ordering::Release);
         let state = handle.state::<DesktopState>();
         let Ok(engine) = state.engine.lock() else {
             return;

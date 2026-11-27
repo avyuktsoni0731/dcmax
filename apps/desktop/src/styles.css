@@ -77,13 +77,12 @@ html, body, #root {
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  -webkit-user-select: none;
-  user-select: none;
 }
 
-input, textarea, [contenteditable] {
+input, textarea, select, [contenteditable] {
   -webkit-user-select: text;
   user-select: text;
+  -webkit-app-region: no-drag;
 }
 
 button, input, select, textarea { font: inherit; color: inherit; }
@@ -957,22 +956,30 @@ input[type="range"] {
 }
 
 .chat-board {
+  --search-h: 42px;
+  --pad-top: 14px;
+  --rule-gap: 10px;
+  --inset: 14px;
   height: 100%;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(200px, 280px) minmax(0, 1fr);
+  grid-template-columns: minmax(220px, 27%) minmax(0, 1fr);
 }
 .dm-col {
   display: flex;
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
-  padding: 15px 12px 16px;
+  padding: var(--pad-top) var(--inset) 14px;
   border-right: 1px solid rgba(255, 255, 255, 0.2);
 }
 .app.mock .thread-pane { position: relative; border-left: 0; background: transparent; }
 .app.mock .search {
-  height: 42px;
+  height: var(--search-h);
+  min-height: var(--search-h);
+  max-height: var(--search-h);
+  flex: none;
+  overflow: hidden;
   padding: 0 12px;
   gap: 8px;
   border-radius: 12px;
@@ -980,13 +987,18 @@ input[type="range"] {
   border: 1px solid rgba(255, 255, 255, 0.2);
   color: #ffffff;
   font-family: "Work Sans", sans-serif;
-  font-size: 14px;
+  font-size: 15px;
 }
-.app.mock .search input { font-size: 14px; }
+.app.mock .search svg { flex: none; }
+.app.mock .search input {
+  height: 100%;
+  min-height: 0;
+  font-size: 15px;
+}
 .app.mock .search input::placeholder { color: #ffffff; opacity: 1; }
 .dm-rule {
   height: 1px;
-  margin: 12px 0 8px;
+  margin: var(--rule-gap) 0 10px;
   border: 0;
   background: rgba(255, 255, 255, 0.2);
   flex: none;
@@ -998,7 +1010,7 @@ input[type="range"] {
   font-weight: 400;
   color: rgba(255, 255, 255, 0.7);
 }
-.thread-scroll { padding: 0; }
+.thread-scroll { flex: 1; min-height: 0; overflow: auto; padding: 0; }
 .app.mock .thread-row {
   width: 100%;
   min-height: 52px;
@@ -1045,19 +1057,15 @@ input[type="range"] {
 }
 .dm-you strong { font-size: 14px; font-weight: 700; }
 .home-empty {
+  position: relative;
   flex: 1;
+  height: 100%;
   min-height: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 18px;
 }
-.home-empty .add-friend,
-.home-empty .friend-pop {
-  position: static;
-}
-.home-empty .friend-pop { width: min(280px, 86%); }
 .chat-empty {
   margin: 0;
   width: min(523px, 86%);
@@ -1071,9 +1079,9 @@ input[type="range"] {
 }
 .pane-rule {
   position: absolute;
-  left: 0;
-  right: 0;
-  top: 69px;
+  left: var(--inset);
+  right: var(--inset);
+  top: calc(var(--pad-top) + var(--search-h) + var(--rule-gap));
   height: 1px;
   margin: 0;
   border: 0;
@@ -1081,10 +1089,10 @@ input[type="range"] {
 }
 .add-friend {
   position: absolute;
-  top: 12px;
-  right: 14px;
+  top: var(--pad-top);
+  right: var(--inset);
   z-index: 2;
-  height: 42px;
+  height: var(--search-h);
   padding: 0 14px;
   display: inline-flex;
   align-items: center;
@@ -1099,23 +1107,26 @@ input[type="range"] {
 }
 .friend-pop {
   position: absolute;
-  top: 62px;
-  right: 14px;
+  top: calc(var(--pad-top) + var(--search-h) + var(--rule-gap) + 12px);
+  right: var(--inset);
   z-index: 3;
   width: min(240px, calc(100% - 28px));
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding: 8px;
-  border-radius: 12px;
-  background: rgba(0, 0, 0, 0.45);
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  padding: 0;
+  background: transparent;
+  border: 0;
 }
 .friend-hit {
   display: flex;
   align-items: center;
   gap: 8px;
   min-height: 52px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.2);
   color: #ffffff;
 }
 .friend-hit span { min-width: 0; display: flex; flex-direction: column; }
@@ -1135,44 +1146,58 @@ input[type="range"] {
 }
 .chat-empty img { width: 160px; height: 160px; }
 .chat-empty p { margin: 0; font-size: 13px; line-height: 1.35; }
-.thread-top {
-  height: 56px;
-  padding: 0 16px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+.app.mock .thread-top {
+  position: relative;
+  box-sizing: border-box;
+  height: calc(var(--pad-top) + var(--search-h) + var(--rule-gap) + 1px);
+  padding: var(--pad-top) var(--inset) var(--rule-gap);
+  border-bottom: 0;
+  align-items: center;
+}
+.app.mock .thread-top::after {
+  content: "";
+  position: absolute;
+  left: var(--inset);
+  right: var(--inset);
+  top: calc(var(--pad-top) + var(--search-h) + var(--rule-gap));
+  height: 1px;
+  background: rgba(255, 255, 255, 0.2);
 }
 .thread-top strong { font-size: 15px; font-weight: 700; }
 .thread-tools { margin-left: auto; }
 .thread-tools button { color: #ffffff; }
-.transcript { padding: 16px 16px 8px; gap: 12px; }
-.app.mock .bubble { align-items: flex-end; gap: 8px; max-width: min(440px, 86%); }
+.app.mock .transcript { padding: 22px var(--inset) 8px; gap: 14px; }
+.app.mock .bubble { align-items: flex-end; gap: 8px; max-width: min(300px, 68%); }
 .app.mock .bubble > div {
   display: flex;
   align-items: flex-end;
-  gap: 10px;
-  min-height: 40px;
-  padding: 8px 12px;
+  gap: 12px;
+  min-height: var(--search-h);
+  padding: 10px 12px;
   background: rgba(0, 0, 0, 0.3);
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 12px 12px 12px 0;
 }
 .app.mock .bubble.mine > div { border-radius: 12px 12px 0 12px; }
-.app.mock .bubble p { margin: 0; font-size: 14px; line-height: 20px; font-weight: 400; }
-.app.mock .bubble time { font-family: "Plus Jakarta Sans", sans-serif; font-size: 12px; color: rgba(255, 255, 255, 0.5); white-space: nowrap; }
-.app.mock .bubble .avatar, .app.mock .avatar.sm { width: 28px; height: 28px; font-size: 11px; }
+.app.mock .bubble p { margin: 0; font-size: 15px; line-height: 20px; font-weight: 400; }
+.app.mock .bubble time { font-family: "Plus Jakarta Sans", sans-serif; font-size: 13px; color: rgba(255, 255, 255, 0.55); white-space: nowrap; }
+.app.mock .bubble .avatar, .app.mock .avatar.sm { width: 24px; height: 24px; font-size: 10px; }
 .day { color: #ffffff; font-family: "Plus Jakarta Sans", sans-serif; font-size: 13px; }
 .day span { background: rgba(255, 255, 255, 0.35); }
-.composer {
+.app.mock .composer {
   border-top: 0;
-  padding: 0 18px 16px;
+  padding: 0 var(--inset) 14px;
 }
-.composer form {
-  height: 48px;
-  padding: 0 6px 0 14px;
+.app.mock .composer form {
+  flex: none;
+  height: 54px;
+  min-height: 54px;
+  padding: 0 8px 0 14px;
   border-radius: 12px;
   background: rgba(0, 0, 0, 0.3);
   border: 1px solid rgba(255, 255, 255, 0.2);
 }
-.composer input { font-family: "Work Sans", sans-serif; font-size: 14px; }
+.composer input { font-family: "Work Sans", sans-serif; font-size: 15px; }
 .composer input::placeholder { color: #ffffff; opacity: 1; }
 .composer .emoji { width: 32px; height: 32px; color: #ffffff; display: grid; place-items: center; }
 .composer .send {
