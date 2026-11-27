@@ -10,8 +10,6 @@ import {
   ChatBubbleIcon,
   ChevronIcon,
   ChevronRightIcon,
-  EmojiPeopleIcon,
-  ForumIcon,
   FriendsIcon,
   FullscreenExitIcon,
   FullscreenIcon,
@@ -21,15 +19,19 @@ import {
   MicIcon,
   MicOffIcon,
   MonitorIcon,
+  PersonAddIcon,
   PersonSearchIcon,
   PhoneIcon,
   PhoneInTalkIcon,
+  RamenMark,
   RecentsIcon,
   SendIcon,
   SettingsIcon,
   ShareIcon,
   SmileIcon,
-  VideoIcon
+  VideoIcon,
+  VisibilityIcon,
+  VisibilityOffIcon
 } from "./icons";
 import { playEnter, playExit, playJoined, playLeft, playMute, playUnmute, primeAudio } from "./sounds";
 
@@ -128,6 +130,25 @@ export function App() {
   const [draft, setDraft] = useState("");
   const [friendName, setFriendName] = useState("");
   const [friendRoom, setFriendRoom] = useState("");
+  const [session, setSession] = useState(() => {
+    const preview = import.meta.env.DEV ? new URLSearchParams(window.location.search).get("preview") : null;
+    if (preview === "login" || preview === "register") return false;
+    if (preview) return true;
+    return localStorage.getItem("mycord.session") === "1";
+  });
+  const [authMode, setAuthMode] = useState<"login" | "register">(() => (
+    import.meta.env.DEV && new URLSearchParams(window.location.search).get("preview") === "register" ? "register" : "login"
+  ));
+  const [showPassword, setShowPassword] = useState(false);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authUser, setAuthUser] = useState("");
+  const [authPass, setAuthPass] = useState("");
+  const [dobDay, setDobDay] = useState("");
+  const [dobMonth, setDobMonth] = useState("");
+  const [dobYear, setDobYear] = useState("");
+  const [authNote, setAuthNote] = useState("");
+  const [friendOpen, setFriendOpen] = useState(false);
+  const [friendQuery, setFriendQuery] = useState("");
   const sharingRef = useRef(false);
   const remotesRef = useRef<Set<string> | null>(null);
   const noticeTimer = useRef(0);
@@ -219,9 +240,10 @@ export function App() {
       ],
       friends: [
         { name: "souvlakee", room: "project-sync", at: now - 120_000 },
-        { name: "malubulu", room: "mycord-room", at: now - 3_600_000 },
-        { name: "Divyank Shandilya", room: "project-sync", at: now - 7_200_000 },
-        { name: "beat_n", room: "game-night", at: now - 86_400_000 }
+        { name: "Asna Fatimah", room: "project-sync", at: now - 3_600_000 },
+        { name: "malubulu", room: "mycord-room", at: now - 7_200_000 },
+        { name: "Divyank Shandilya", room: "project-sync", at: now - 86_400_000 },
+        { name: "beat_n", room: "game-night", at: now - 172_800_000 }
       ],
       threads: [
         {
@@ -236,6 +258,19 @@ export function App() {
         }
       ]
     });
+    if (preview === "login" || preview === "register") {
+      setSession(false);
+      setAuthMode(preview);
+      return;
+    }
+    setSession(true);
+    if (preview === "inbox" || preview === "add" || preview === "search") {
+      setPage("messages");
+      setActive("");
+      if (preview === "add" || preview === "search") setFriendOpen(true);
+      if (preview === "search") setFriendQuery("asna");
+      return;
+    }
     if (preview !== "inbox") setActive("souvlakee");
     if (preview === "call" || preview === "share" || preview === "options" || preview === "mics" || preview === "screens") {
       setPhase("call");
@@ -601,6 +636,36 @@ export function App() {
     setStatus("Joining the room.");
     persist({ name: nextName, room: target });
     void run(() => invoke("join", { body: { name: nextName, room: target, invite: invite.trim() ? invite.trim() : null } }), false);
+  }
+
+  function enterApp(displayName: string) {
+    const next = displayName.trim();
+    if (next) {
+      setName(next);
+      persist({ name: next });
+    }
+    localStorage.setItem("mycord.session", "1");
+    setSession(true);
+    setAuthNote("");
+  }
+
+  function addFoundFriend(foundName: string) {
+    const nextName = foundName.replace(/^@/, "").trim();
+    if (!nextName) return;
+    const target = room.trim() || "lobby";
+    commit((current) => ({
+      ...current,
+      friends: [{ name: nextName, room: target, at: Date.now() }, ...current.friends.filter((friend) => friend.name.toLowerCase() !== nextName.toLowerCase())].slice(0, 40)
+    }));
+    setFriendQuery("");
+  }
+
+  function openFriend(friend: { name: string; room: string }) {
+    setActive(friend.name);
+    commit((current) => {
+      if (current.threads.some((item) => item.name === friend.name)) return current;
+      return { ...current, threads: [{ name: friend.name, room: friend.room, notes: [] }, ...current.threads] };
+    });
   }
 
   function addFriend() {
@@ -975,6 +1040,101 @@ export function App() {
     );
   }
 
+  if (!session) {
+    const days = Array.from({ length: 31 }, (_, index) => String(index + 1));
+    const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    const years = Array.from({ length: 80 }, (_, index) => String(2012 - index));
+    const loginReady = authEmail.trim().length > 0 && authPass.length > 0;
+    const registerReady = authEmail.trim().length > 0 && authUser.trim().length > 0 && authPass.length > 0 && dobDay && dobMonth && dobYear;
+    return (
+      <div className="auth">
+        <div className="auth-card">
+          <form
+            className="auth-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (authMode === "login") {
+                if (!loginReady) return;
+                const typed = authEmail.trim();
+                enterApp(typed.includes("@") ? name : typed);
+              } else {
+                if (!registerReady) return;
+                enterApp(authUser);
+              }
+            }}
+          >
+            <h1>{authMode === "login" ? "Hey, there!" : "Create an account"}</h1>
+            {authMode === "login" ? <p className="auth-sub">Great to see you, again!</p> : null}
+            <label>
+              <span>{authMode === "login" ? "Email or Username" : "Email"} <i>*</i></span>
+              <span className="auth-field">
+                <input value={authEmail} autoComplete="username" onChange={(event) => setAuthEmail(event.target.value)} />
+              </span>
+            </label>
+            {authMode === "register" ? (
+              <label>
+                <span>Username <i>*</i></span>
+                <span className="auth-field">
+                  <input value={authUser} autoComplete="nickname" onChange={(event) => setAuthUser(event.target.value)} />
+                </span>
+              </label>
+            ) : null}
+            <label>
+              <span>Password <i>*</i></span>
+              <span className="auth-field">
+                <input type={showPassword ? "text" : "password"} value={authPass} autoComplete={authMode === "login" ? "current-password" : "new-password"} onChange={(event) => setAuthPass(event.target.value)} />
+                <button type="button" aria-label={showPassword ? "Hide password" : "Show password"} onClick={() => setShowPassword((current) => !current)}>
+                  {showPassword ? <VisibilityOffIcon size={18} /> : <VisibilityIcon size={18} />}
+                </button>
+              </span>
+            </label>
+            {authMode === "login" ? (
+              <button className="auth-link" type="button" onClick={() => setAuthNote("Password reset isn't available yet.")}>Forget your password?</button>
+            ) : (
+              <label>
+                <span>Date of Birth <i>*</i></span>
+                <span className="dob-row">
+                  <span className="auth-field">
+                    <select value={dobDay} onChange={(event) => setDobDay(event.target.value)} aria-label="Day">
+                      <option value="">Day</option>
+                      {days.map((day) => <option key={day} value={day}>{day}</option>)}
+                    </select>
+                    <ChevronIcon size={16} />
+                  </span>
+                  <span className="auth-field">
+                    <select value={dobMonth} onChange={(event) => setDobMonth(event.target.value)} aria-label="Month">
+                      <option value="">Month</option>
+                      {months.map((month) => <option key={month} value={month}>{month}</option>)}
+                    </select>
+                    <ChevronIcon size={16} />
+                  </span>
+                  <span className="auth-field">
+                    <select value={dobYear} onChange={(event) => setDobYear(event.target.value)} aria-label="Year">
+                      <option value="">Year</option>
+                      {years.map((year) => <option key={year} value={year}>{year}</option>)}
+                    </select>
+                    <ChevronIcon size={16} />
+                  </span>
+                </span>
+              </label>
+            )}
+            <button className="auth-submit" type="submit">{authMode === "login" ? "Log In" : "Create Account"}</button>
+            {authNote ? <p className="auth-note">{authNote}</p> : null}
+            {authMode === "login" ? (
+              <p className="auth-switch">Need an account? <button type="button" onClick={() => { setAuthMode("register"); setAuthNote(""); }}>Register</button></p>
+            ) : (
+              <p className="auth-switch">Already have an account? <button type="button" onClick={() => { setAuthMode("login"); setAuthNote(""); }}>Log in</button></p>
+            )}
+          </form>
+          <div className="auth-mark">
+            <RamenMark size={150} />
+            <strong>Yatai</strong>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const threadNames = conversationList(desk, query);
   const selectedName = threadNames.some((item) => item.name === active) ? active : null;
   const selected = threadNames.find((item) => item.name === selectedName) ?? null;
@@ -984,7 +1144,7 @@ export function App() {
     <div className={`app${page === "messages" ? " mock" : ""}`}>
       {page === "messages" ? (
         <header className="topbar">
-          <span className="topbar-title">{selected ? <ForumIcon size={16} /> : <EmojiPeopleIcon size={16} />} Friends</span>
+          <span className="topbar-title"><ChatBubbleIcon size={16} /> Chat</span>
         </header>
       ) : null}
       <div className="shell">
@@ -1069,15 +1229,22 @@ export function App() {
                     <PersonSearchIcon size={18} />
                     <input id="thread-search" placeholder="Find your friend" value={query} onChange={(event) => setQuery(event.target.value)} />
                   </label>
-                  <p className="dm-label">Direct Messages</p>
+                  <hr className="dm-rule" />
                   <div className="thread-scroll">
-                    {threadNames.length === 0 ? <p className="empty">Add a friend, then open a room together.</p> : null}
-                    {threadNames.map((item) => {
-                      const count = desk.threads.find((threadItem) => threadItem.name === item.name)?.notes.length ?? 0;
+                    <p className="dm-label">Direct Messages</p>
+                    {desk.threads.filter((item) => {
+                      const needle = query.trim().toLowerCase();
+                      return !needle || item.name.toLowerCase().includes(needle);
+                    }).length === 0 ? <p className="empty">No conversations yet.</p> : null}
+                    {desk.threads.filter((item) => {
+                      const needle = query.trim().toLowerCase();
+                      return !needle || item.name.toLowerCase().includes(needle);
+                    }).map((item) => {
+                      const count = item.notes.length;
                       const badge = item.name === selectedName || count === 0 ? "" : count > 9 ? "9+" : String(count);
                       return (
                         <button className={`thread-row${item.name === selectedName ? " active" : ""}`} type="button" key={item.name} onClick={() => setActive(item.name)}>
-                          <Avatar name={item.name} online={online.has(item.name)} />
+                          <Avatar name={item.name} />
                           <span className="thread-copy">
                             <strong>{item.name}</strong>
                           </span>
@@ -1085,6 +1252,17 @@ export function App() {
                         </button>
                       );
                     })}
+                    <hr className="dm-rule" />
+                    <p className="dm-label">Friends</p>
+                    {desk.friends.filter((friend) => {
+                      const needle = query.trim().toLowerCase();
+                      return !needle || friend.name.toLowerCase().includes(needle) || handleOf(friend.name).includes(needle);
+                    }).map((friend) => (
+                      <button className="thread-row" type="button" key={friend.name} onClick={() => openFriend(friend)}>
+                        <Avatar name={friend.name} />
+                        <span className="thread-copy"><strong>{friend.name}</strong></span>
+                      </button>
+                    ))}
                   </div>
                   <div className="you dm-you">
                     <Avatar name={name || "You"} />
@@ -1132,10 +1310,34 @@ export function App() {
                       </div>
                     </>
                   ) : (
-                    <div className="chat-empty">
-                      <img src={ramenUrl} alt="" />
-                      <p>Ramen may have originated from China. Scholars believe that “shina shoba” (“Chinese style” noodle soup) was imported to Japan between the 17th and 20th centuries.</p>
-                    </div>
+                    <>
+                      <hr className="pane-rule" />
+                      <button className="add-friend" type="button" onClick={() => setFriendOpen((open) => !open)}>
+                        <PersonAddIcon size={18} /> Add Friend
+                      </button>
+                      {friendOpen ? (
+                        <div className="friend-pop" role="dialog" aria-label="Search for a friend">
+                          <label className="search">
+                            <PersonSearchIcon size={18} />
+                            <input placeholder="Search for a friend" value={friendQuery} onChange={(event) => setFriendQuery(event.target.value)} />
+                          </label>
+                          {friendQuery.trim() ? friendHits(desk.friends, friendQuery).map((hit) => (
+                            <div className="friend-hit" key={hit.name}>
+                              <Avatar name={hit.name} />
+                              <span>
+                                <strong>{hit.name}</strong>
+                                <small>{handleOf(hit.name)}</small>
+                              </span>
+                              <button type="button" aria-label={`Add ${hit.name}`} onClick={() => addFoundFriend(hit.name)}><PersonAddIcon size={18} /></button>
+                            </div>
+                          )) : null}
+                        </div>
+                      ) : null}
+                      <div className="chat-empty">
+                        <img src={ramenUrl} alt="" />
+                        <p>Ramen may have originated from China. Scholars believe that “shina shoba” (“Chinese style” noodle soup) was imported to Japan between the 17th and 20th centuries.</p>
+                      </div>
+                    </>
                   )}
                 </section>
               </div>
@@ -1266,6 +1468,19 @@ function VolumeRow({ label, value, onChange }: { label: string; value: number; o
       <strong>{value}%</strong>
     </label>
   );
+}
+
+function handleOf(name: string) {
+  return `@${name.toLowerCase().replace(/[^a-z0-9]+/g, "")}`;
+}
+
+function friendHits(friends: { name: string; room: string }[], query: string) {
+  const needle = query.trim().toLowerCase().replace(/^@/, "");
+  if (!needle) return [];
+  const matches = friends.filter((friend) => friend.name.toLowerCase().includes(needle) || handleOf(friend.name).includes(needle));
+  if (matches.length > 0) return matches.slice(0, 4);
+  const typed = query.trim().replace(/^@/, "");
+  return typed ? [{ name: typed, room: "" }] : [];
 }
 
 function clock(at: number) {
