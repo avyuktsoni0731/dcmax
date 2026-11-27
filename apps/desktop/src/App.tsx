@@ -2,7 +2,6 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import discordMark from "./discord-mark.png";
 import ramenUrl from "./ramen.svg";
 import { faceColor, initials, loadDesk, saveDesk, type Desk, type Mail } from "./desk";
 import {
@@ -22,6 +21,7 @@ import {
   PersonSearchIcon,
   PhoneIcon,
   PhoneInTalkIcon,
+  RamenIcon,
   RamenMark,
   SendIcon,
   SettingsIcon,
@@ -1588,7 +1588,7 @@ function Rail({ prefsOpen, onPrefs, onTheme, onLogOut, dark }: { prefsOpen: bool
   return (
     <aside className="sidebar">
       <div className="brand-mark" aria-label="Home">
-        <img src={discordMark} alt="" />
+        <RamenIcon size={30} />
       </div>
       <button className="nav-btn active" type="button" aria-label="Messages">
         <ChatBubbleIcon size={20} />
