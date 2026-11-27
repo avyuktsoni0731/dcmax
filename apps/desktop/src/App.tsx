@@ -7,7 +7,9 @@ import ramenUrl from "./ramen.svg";
 import { faceColor, initials, loadDesk, saveDesk, type Desk, type Mail } from "./desk";
 import {
   ChatBubbleIcon,
+  CheckIcon,
   ChevronIcon,
+  CloseIcon,
   ChevronRightIcon,
   FullscreenExitIcon,
   FullscreenIcon,
@@ -52,6 +54,8 @@ const RESOLUTIONS = [
 ];
 
 const BITRATES = [8000, 12000, 20000, 40000, 80000, 100000];
+
+type Ask = { name: string; direction: "in" | "out" };
 
 function pairRoom(mine: string, theirs: string) {
   const names = [mine, theirs]
@@ -141,6 +145,12 @@ export function App() {
   const [authNote, setAuthNote] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [friendOpen, setFriendOpen] = useState(false);
+  const [pendingOpen, setPendingOpen] = useState(false);
+  const [asks, setAsks] = useState<Ask[]>(() => (
+    import.meta.env.DEV && new URLSearchParams(window.location.search).get("preview") === "pending"
+      ? [{ name: "Asna Fatimah", direction: "in" }, { name: "Asna Fatimah", direction: "out" }]
+      : []
+  ));
   const [friendQuery, setFriendQuery] = useState("");
   const [foundPeople, setFoundPeople] = useState<string[]>([]);
   const [friendNote, setFriendNote] = useState("");
@@ -272,10 +282,11 @@ export function App() {
       return;
     }
     setSession(true);
-    if (preview === "inbox" || preview === "add" || preview === "search") {
+    if (preview === "inbox" || preview === "add" || preview === "search" || preview === "pending") {
       setActive("");
       if (preview === "add" || preview === "search") setFriendOpen(true);
       if (preview === "search") setFriendQuery("asna");
+      if (preview === "pending") setPendingOpen(true);
       return;
     }
     if (preview !== "inbox") setActive("souvlakee");
@@ -782,8 +793,24 @@ export function App() {
     if (saved && saved !== "1") void invoke("account", { body: { action: "logout", session: saved } }).catch(() => { });
   }
 
-  function addFoundFriend(foundName: string) {
+  function sendFriendRequest(foundName: string) {
     const nextName = foundName.replace(/^@/, "").trim();
+    if (!nextName) return;
+    const known = desk.friends.some((friend) => friend.added && friend.name.toLowerCase() === nextName.toLowerCase());
+    if (known) return;
+    setAsks((current) => (
+      current.some((ask) => ask.name.toLowerCase() === nextName.toLowerCase())
+        ? current
+        : [{ name: nextName, direction: "out" }, ...current]
+    ));
+    setFriendQuery("");
+    setQuery("");
+    setFriendOpen(false);
+    setPendingOpen(true);
+  }
+
+  function acceptAsk(askName: string) {
+    const nextName = askName.trim();
     if (!nextName) return;
     const mine = (localStorage.getItem("mycord.user") || name).trim();
     const target = pairRoom(mine, nextName);
@@ -791,10 +818,11 @@ export function App() {
       ...current,
       friends: [{ name: nextName, room: target, at: Date.now(), added: true }, ...current.friends.filter((friend) => friend.name.toLowerCase() !== nextName.toLowerCase())].slice(0, 40)
     }));
-    setFriendQuery("");
-    setQuery("");
-    setFriendOpen(false);
-    openFriend({ name: nextName, room: target });
+    setAsks((current) => current.filter((ask) => !(ask.direction === "in" && ask.name.toLowerCase() === nextName.toLowerCase())));
+  }
+
+  function dismissAsk(askName: string, direction: Ask["direction"]) {
+    setAsks((current) => current.filter((ask) => !(ask.direction === direction && ask.name.toLowerCase() === askName.toLowerCase())));
   }
 
   function openFriend(friend: { name: string; room: string }) {
@@ -1306,7 +1334,10 @@ export function App() {
   const selected = direct.find((item) => item.name === selectedName) ?? null;
   const thread = selected ? desk.threads.find((item) => item.name.toLowerCase() === selected.name.toLowerCase()) : null;
   const already = new Set(added.map((friend) => friend.name.toLowerCase()));
-  const suggestions = foundPeople.filter((person) => !already.has(person.toLowerCase()));
+  const waiting = new Set(asks.map((ask) => ask.name.toLowerCase()));
+  const suggestions = foundPeople.filter((person) => !already.has(person.toLowerCase()) && !waiting.has(person.toLowerCase()));
+  const received = asks.filter((ask) => ask.direction === "in");
+  const sent = asks.filter((ask) => ask.direction === "out");
 
   return (
     <div className="app mock">
@@ -1350,7 +1381,7 @@ export function App() {
                           </button>
                         ))}
                         {friendOpen ? null : suggestions.map((hit) => (
-                          <button className="thread-row" type="button" key={hit} onClick={() => addFoundFriend(hit)}>
+                          <button className="thread-row" type="button" key={hit} onClick={() => sendFriendRequest(hit)}>
                             <Avatar name={hit} />
                             <span className="thread-copy"><strong>{hit}</strong></span>
                             <PersonAddIcon size={18} />
@@ -1405,9 +1436,45 @@ export function App() {
                       ) : (
                         <div className="home-empty">
                           <hr className="pane-rule" />
-                          <button className="add-friend" type="button" onClick={() => setFriendOpen((open) => !open)}>
-                            <PersonAddIcon size={18} /> Add Friend
-                          </button>
+                          <div className="friend-tools">
+                            <div className="pending-slot">
+                              <button className="pending-open" type="button" onClick={() => { setFriendOpen(false); setPendingOpen((open) => !open); }}>
+                                Pending
+                                {asks.length > 0 ? <span className="badge">{asks.length > 9 ? "9+" : asks.length}</span> : null}
+                              </button>
+                              {pendingOpen ? (
+                                <div className="pending-card" role="dialog" aria-label="Pending requests">
+                                  <p className="pending-label">Received</p>
+                                  {received.map((ask) => (
+                                    <div className="pending-row" key={`in-${ask.name}`}>
+                                      <Avatar name={ask.name} />
+                                      <span>
+                                        <strong>{ask.name}</strong>
+                                        <small>{handleOf(ask.name)}</small>
+                                      </span>
+                                      <button type="button" aria-label={`Accept ${ask.name}`} onClick={() => acceptAsk(ask.name)}><CheckIcon size={16} /></button>
+                                      <button type="button" aria-label={`Reject ${ask.name}`} onClick={() => dismissAsk(ask.name, "in")}><CloseIcon size={16} /></button>
+                                    </div>
+                                  ))}
+                                  <hr />
+                                  <p className="pending-label">Sent</p>
+                                  {sent.map((ask) => (
+                                    <div className="pending-row" key={`out-${ask.name}`}>
+                                      <Avatar name={ask.name} />
+                                      <span>
+                                        <strong>{ask.name}</strong>
+                                        <small>{handleOf(ask.name)}</small>
+                                      </span>
+                                      <button type="button" aria-label={`Cancel request to ${ask.name}`} onClick={() => dismissAsk(ask.name, "out")}><CloseIcon size={16} /></button>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : null}
+                            </div>
+                            <button className="add-friend" type="button" onClick={() => { setPendingOpen(false); setFriendOpen((open) => !open); }}>
+                              <PersonAddIcon size={18} /> Add Friend
+                            </button>
+                          </div>
                           {friendOpen ? (
                             <div className="friend-pop" role="dialog" aria-label="Search for a friend">
                               <label className="search">
@@ -1421,7 +1488,7 @@ export function App() {
                                     <strong>{hit}</strong>
                                     <small>{handleOf(hit)}</small>
                                   </span>
-                                  <button type="button" aria-label={`Add ${hit}`} onClick={() => addFoundFriend(hit)}><PersonAddIcon size={18} /></button>
+                                  <button type="button" aria-label={`Add ${hit}`} onClick={() => sendFriendRequest(hit)}><PersonAddIcon size={18} /></button>
                                 </div>
                               ))}
                               {friendQuery.trim().replace(/^@/, "").length >= 2 && !looking && suggestions.length === 0 ? <p className="empty">{friendNote || "No one online matches that."}</p> : null}

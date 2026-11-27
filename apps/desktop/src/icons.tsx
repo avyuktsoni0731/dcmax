@@ -290,6 +290,22 @@ export function PersonAddIcon(props: IconProps) {
   );
 }
 
+export function CheckIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
+    </Glyph>
+  );
+}
+
+export function CloseIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+    </Glyph>
+  );
+}
+
 export function RamenMark({ size = 150 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 300 300" aria-hidden="true">
