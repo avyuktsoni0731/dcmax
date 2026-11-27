@@ -434,3 +434,40 @@ pub fn chat_blocking(
     }
     serde_json::from_str(&body).context("account response parse failed")
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Line {
+    pub name: String,
+    pub room: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LineBook {
+    pub lines: Vec<Line>,
+}
+
+/// Who is already in a call with this account, so the other person can join.
+pub fn line_blocking(session: &str, action: &str, username: &str, at: i64) -> Result<LineBook> {
+    let api_base_url = std::env::var("API_BASE_URL")
+        .unwrap_or_else(|_| "https://dcmax-token.soniavyukt.workers.dev".to_string());
+    let url = format!("{}/call", api_base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .context("account client")?;
+    let response = authed_blocking(client.post(url), Some(session))
+        .json(&serde_json::json!({ "action": action, "username": username, "session": session, "at": at }))
+        .send()
+        .context("Could not reach the account service.")?;
+    let status = response.status();
+    let body = response.text().context("account response")?;
+    if !status.is_success() {
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("error").and_then(|item| item.as_str()).map(str::to_string))
+            .filter(|item| !item.trim().is_empty())
+            .unwrap_or_else(|| "The account service did not accept that.".to_string());
+        anyhow::bail!(message);
+    }
+    serde_json::from_str(&body).context("account response parse failed")
+}

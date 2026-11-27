@@ -52,6 +52,9 @@ export default {
     if (request.method === "POST" && url.pathname === "/chat") {
       return cors(await chat(request, env));
     }
+    if (request.method === "POST" && url.pathname === "/call") {
+      return cors(await call(request, env));
+    }
     return cors(new Response("not found", { status: 404 }));
   },
 };
@@ -379,6 +382,79 @@ async function chat(request, env) {
   }
 }
 
+function roomFor(a, b) {
+  const names = [a, b]
+    .map((item) => item.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, ""))
+    .filter(Boolean)
+    .sort();
+  return names.length ? `yatai-${names.join("-")}`.slice(0, 64) : "";
+}
+
+async function loadCalls(database, me) {
+  const since = new Date(Date.now() - 15_000);
+  const rows = await database.calls.find({ between: me, at: { $gt: since } }).sort({ at: -1 }).limit(10).toArray();
+  const lines = [];
+  for (const row of rows) {
+    const who = (Array.isArray(row.members) ? row.members : []).filter((name) => name && name.toLowerCase() !== me.toLowerCase());
+    for (const name of who) lines.push({ name, room: row.room });
+  }
+  return { lines };
+}
+
+async function call(request, env) {
+  const database = await accounts(env);
+  if (database.error) return database.error;
+  try {
+    const body = await readJson(request);
+    if (body.error) return body.error;
+    const user = await userForRequest(request, database, body);
+    if (!user) return Response.json({ error: "Sign in again." }, { status: 401 });
+    await markSeen(database, user.username);
+    const me = user.username;
+    const action = String(body.value.action ?? "list");
+    if (action === "list") return Response.json(await loadCalls(database, me));
+    const other = await namedUser(database, body.value.username);
+    if (!other) return Response.json({ error: "No one uses that username." }, { status: 404 });
+    if (other.username.toLowerCase() === me.toLowerCase()) {
+      return Response.json({ error: "You can't call yourself." }, { status: 400 });
+    }
+    const friend = await database.friendships.findOne(
+      { user: me, friend: other.username },
+      { collation: NAME, projection: { _id: 1 } },
+    );
+    if (!friend) return Response.json({ error: "Add each other before calling." }, { status: 403 });
+    const pair = pairKey(me, other.username);
+    const beat = Number(body.value.at) || Date.now();
+    if (action === "live") {
+      const room = roomFor(me, other.username);
+      const between = [me, other.username].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+      const existing = await database.calls.findOne({ pair }, { projection: { closed: 1, _id: 0 } });
+      if (!existing || !(existing.closed > beat)) {
+        try {
+          await database.calls.updateOne(
+            { pair },
+            { $set: { room, at: new Date(), between, closed: 0 }, $addToSet: { members: me } },
+            { upsert: true },
+          );
+        } catch (err) {
+          if (!err || err.code !== 11000) return Response.json({ error: "The call could not be saved." }, { status: 500 });
+          await database.calls.updateOne(
+            { pair },
+            { $set: { room, at: new Date(), between, closed: 0 }, $addToSet: { members: me } },
+          );
+        }
+      }
+    } else if (action === "end") {
+      await database.calls.updateOne({ pair }, { $pull: { members: me }, $max: { closed: beat } });
+    } else {
+      return Response.json({ error: "Unknown call action." }, { status: 400 });
+    }
+    return Response.json(await loadCalls(database, me));
+  } finally {
+    await release(database);
+  }
+}
+
 async function namedUser(database, username) {
   const name = String(username ?? "").trim().replace(/^@/, "");
   if (!/^[A-Za-z0-9_-]{2,32}$/.test(name)) return null;
@@ -497,6 +573,8 @@ async function accounts(env) {
         database.collection("messages").createIndex({ to: 1, at: 1 }),
         database.collection("messages").createIndex({ id: 1 }, { unique: true }),
         database.collection("reads").createIndex({ user: 1, peer: 1 }, { unique: true }),
+        database.collection("calls").createIndex({ pair: 1 }, { unique: true }),
+        database.collection("calls").createIndex({ between: 1, at: -1 }),
       ]);
       globalThis.__mycordReady = true;
     }
@@ -507,6 +585,7 @@ async function accounts(env) {
       friendships: database.collection("friendships"),
       messages: database.collection("messages"),
       reads: database.collection("reads"),
+      calls: database.collection("calls"),
       close: () => client.close(),
     };
   } catch {

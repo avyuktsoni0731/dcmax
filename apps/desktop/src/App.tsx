@@ -60,6 +60,8 @@ type Circle = { friends: string[]; incoming: string[]; outgoing: string[] };
 type ChatNote = { id: string; author: string; to: string; text: string; at: number };
 type ChatRow = { name: string; text: string; at: number; unread: number; from: string };
 type ChatSync = { messages: ChatNote[]; inbox: ChatRow[]; full: boolean };
+type Line = { name: string; room: string };
+type LineBook = { lines: Line[] };
 
 function openEmojiPanel() {
   const field = document.getElementById("composer-field");
@@ -179,6 +181,7 @@ export function App() {
   const [friendNote, setFriendNote] = useState("");
   const [chatNote, setChatNote] = useState("");
   const [inbox, setInbox] = useState<ChatRow[]>([]);
+  const [lines, setLines] = useState<Line[]>([]);
   const [looking, setLooking] = useState(false);
   const sharingRef = useRef(false);
   const remotesRef = useRef<Set<string> | null>(null);
@@ -188,6 +191,7 @@ export function App() {
   const heard = useRef({ voice: 100, screen: 100 });
   const transcriptRef = useRef<HTMLDivElement>(null);
   const stickTranscript = useRef(true);
+  const dialPeer = useRef<string | null>(null);
   const shareRef = useRef<() => Promise<void>>(async () => { });
   const panelRef = useRef<HTMLDivElement>(null);
   const micMenuRef = useRef<HTMLDivElement>(null);
@@ -380,7 +384,11 @@ export function App() {
       const note = event.payload;
       if (note.kind === "status") {
         setStatus(note.text);
-        setPhase((current) => (current === "joining" ? "home" : current));
+        setPhase((current) => {
+          if (current !== "joining") return current;
+          dropDial();
+          return "home";
+        });
         setBusy(false);
       } else if (note.kind === "joined") {
         setPhase("call");
@@ -394,6 +402,7 @@ export function App() {
           recents: [{ room: roomName, people: 1, at: Date.now() }, ...current.recents.filter((item) => item.room !== roomName)].slice(0, 20)
         }));
       } else if (note.kind === "left") {
+        dropDial();
         setPhase("home");
         setPeople([]);
         setSharing(false);
@@ -716,8 +725,44 @@ export function App() {
     const saved = localStorage.getItem("mycord.session");
     void run(() => invoke("join", { body: { name: nextName, room: target, invite: invite.trim() ? invite.trim() : null, session: saved && saved !== "1" ? saved : null } }), false);
   }
-  // Call buttons stay inactive until calling is turned on.
-  void joinRoom;
+
+  function dropDial() {
+    const peer = dialPeer.current;
+    dialPeer.current = null;
+    if (!peer) return;
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has("preview")) return;
+    const saved = localStorage.getItem("mycord.session");
+    if (!saved || saved === "1") return;
+    void invoke("line", { body: { session: saved, action: "end", username: peer, at: Date.now() } }).catch(() => { });
+  }
+
+  function callFriend(friendName: string, roomName?: string) {
+    if (phase === "call" || phase === "joining") return;
+    const person = friendName.trim();
+    const mine = (localStorage.getItem("mycord.user") || name).trim();
+    const target = (roomName || pairRoom(mine, person)).trim();
+    if (!mine || !person || !target) {
+      setStatus("Choose a friend to call.");
+      return;
+    }
+    dialPeer.current = person;
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has("preview")) {
+      joinRoom(target);
+      return;
+    }
+    const saved = localStorage.getItem("mycord.session");
+    if (!saved || saved === "1") {
+      dialPeer.current = null;
+      setStatus("Sign in again.");
+      return;
+    }
+    void invoke<LineBook>("line", { body: { session: saved, action: "live", username: person, at: Date.now() } })
+      .then(() => joinRoom(target))
+      .catch((err: unknown) => {
+        dialPeer.current = null;
+        setStatus(accountError(err));
+      });
+  }
 
   function rememberAccount(account: { username: string; session: string }) {
     localStorage.setItem("mycord.session", account.session);
@@ -795,6 +840,43 @@ export function App() {
       window.clearInterval(timer);
     };
   }, [session]);
+
+  useEffect(() => {
+    if (!session) return;
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has("preview")) return;
+    let cancel = false;
+    const pull = () => {
+      const saved = localStorage.getItem("mycord.session");
+      if (!saved || saved === "1") return;
+      void invoke<LineBook>("line", { body: { session: saved, action: "list", username: "", at: 0 } })
+        .then((book) => {
+          if (!cancel) setLines(Array.isArray(book.lines) ? book.lines : []);
+        })
+        .catch(() => { });
+    };
+    pull();
+    const timer = window.setInterval(pull, 2000);
+    return () => {
+      cancel = true;
+      window.clearInterval(timer);
+    };
+  }, [session]);
+
+  useEffect(() => {
+    if (phase !== "call" && phase !== "joining") return;
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has("preview")) return;
+    const peer = dialPeer.current;
+    if (!peer) return;
+    const beat = () => {
+      if (dialPeer.current !== peer) return;
+      const saved = localStorage.getItem("mycord.session");
+      if (!saved || saved === "1") return;
+      void invoke("line", { body: { session: saved, action: "live", username: peer, at: Date.now() } }).catch(() => { });
+    };
+    beat();
+    const timer = window.setInterval(beat, 4000);
+    return () => window.clearInterval(timer);
+  }, [phase]);
 
   useEffect(() => {
     if (!session) return;
@@ -1096,6 +1178,7 @@ export function App() {
   }
 
   const online = new Set(people.filter((person) => !person.local).map((person) => person.name));
+  const ringing = lines[0] ?? null;
   const rail = (
     <Rail
       prefsOpen={prefsOpen}
@@ -1107,6 +1190,16 @@ export function App() {
       }}
       onLogOut={logOut}
       dark={theme === "dark"}
+      live={Boolean(ringing)}
+      onCall={() => {
+        if (ringing) {
+          callFriend(ringing.name, ringing.room);
+          return;
+        }
+        if (!active) return;
+        const friend = desk.friends.find((item) => item.added && item.name === active);
+        if (friend) callFriend(friend.name, friend.room);
+      }}
     />
   );
 
@@ -1625,7 +1718,10 @@ export function App() {
                               <strong>{selected.name}</strong>
                             </span>
                             <span className="thread-tools">
-                              <button type="button" aria-label="Call"><PhoneIcon size={18} /></button>
+                              <button className={lines.some((item) => item.name.toLowerCase() === selected.name.toLowerCase()) ? "live" : ""} type="button" aria-label={lines.some((item) => item.name.toLowerCase() === selected.name.toLowerCase()) ? `Join ${selected.name}` : `Call ${selected.name}`} onClick={() => {
+                                const open = lines.find((item) => item.name.toLowerCase() === selected.name.toLowerCase());
+                                callFriend(selected.name, open?.room || selected.room);
+                              }}><PhoneIcon size={18} /></button>
                             </span>
                           </header>
                           <div className="transcript" ref={transcriptRef} onScroll={(event) => {
@@ -1738,7 +1834,7 @@ export function App() {
       );
 }
 
-function Rail({ prefsOpen, onPrefs, onTheme, onLogOut, dark }: { prefsOpen: boolean; onPrefs: () => void; onTheme: () => void; onLogOut: () => void; dark: boolean }) {
+function Rail({ prefsOpen, onPrefs, onTheme, onLogOut, dark, live, onCall }: { prefsOpen: boolean; onPrefs: () => void; onTheme: () => void; onLogOut: () => void; dark: boolean; live: boolean; onCall: () => void }) {
   return (
     <aside className="sidebar">
       <div className="brand-mark" aria-label="Home">
@@ -1747,7 +1843,7 @@ function Rail({ prefsOpen, onPrefs, onTheme, onLogOut, dark }: { prefsOpen: bool
       <button className="nav-btn active" type="button" aria-label="Messages">
         <ChatBubbleIcon size={20} />
       </button>
-      <button className="nav-btn plain" type="button" aria-label="Call">
+      <button className={`nav-btn plain${live ? " live" : ""}`} type="button" aria-label={live ? "Join call" : "Call"} onClick={onCall}>
         <PhoneIcon size={20} />
       </button>
       <button className={`nav-btn plain rail-end${prefsOpen ? " active" : ""}`} type="button" aria-label="Settings" onClick={onPrefs}>

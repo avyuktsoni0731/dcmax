@@ -410,6 +410,25 @@ async fn chat(body: ChatBody) -> Result<native_sender::ChatSync, String> {
     .map_err(|err| err.to_string())?
 }
 
+#[derive(Deserialize)]
+struct LineBody {
+    session: String,
+    action: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    at: i64,
+}
+
+#[tauri::command]
+async fn line(body: LineBody) -> Result<native_sender::LineBook, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        native_sender::line_blocking(&body.session, &body.action, &body.username, body.at).map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
 #[tauri::command]
 fn stage_rect(state: State<DesktopState>, body: RectBody) -> Result<(), String> {
     let mut rect = state.rect.lock().map_err(|_| "the stage is unavailable".to_string())?;
@@ -849,6 +868,7 @@ pub fn run() {
             people,
             circle,
             chat,
+            line,
             stage_rect,
             screens,
             emoji_panel
