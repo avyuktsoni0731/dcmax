@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import discordMark from "./discord-mark.png";
@@ -45,6 +45,8 @@ type Person = { name: string; local: boolean; speaking: boolean };
 type Page = "home" | "friends" | "messages" | "recents" | "settings";
 type Dialog = "create" | "join" | "friend" | null;
 type Menu = "share" | "audio" | "hear" | "devices" | "stream" | "resolution" | "fps" | "bitrate" | "screens" | null;
+type StageView = "screen" | "remote" | "self";
+type TileCorner = "tl" | "tr" | "bl" | "br";
 type FriendTab = "online" | "all" | "requests";
 
 const RESOLUTIONS = [
@@ -114,6 +116,12 @@ export function App() {
   const [dialog, setDialog] = useState<Dialog>(null);
   const [menu, setMenu] = useState<Menu>(null);
   const [devicePane, setDevicePane] = useState<"input" | "output" | null>(null);
+  const [popAt, setPopAt] = useState<{ x: number; y: number } | null>(null);
+  const [slots, setSlots] = useState<{ main: StageView; a: StageView; b: StageView }>({ main: "screen", a: "remote", b: "self" });
+  const [tileAt, setTileAt] = useState<{ x: number; y: number } | null>(null);
+  const [tileDragging, setTileDragging] = useState(false);
+  const [tileCorner, setTileCorner] = useState<TileCorner>("br");
+  const [paneShift, setPaneShift] = useState(0);
   const [friendTab, setFriendTab] = useState<FriendTab>("all");
   const [query, setQuery] = useState("");
   const [active, setActive] = useState<string | null>(null);
@@ -127,7 +135,14 @@ export function App() {
   const pendingShare = useRef(false);
   const heard = useRef({ voice: 100, screen: 100 });
   const shareRef = useRef<() => Promise<void>>(async () => {});
+  const panelRef = useRef<HTMLDivElement>(null);
+  const micMenuRef = useRef<HTMLDivElement>(null);
+  const tileDrag = useRef<{ dx: number; dy: number; sx: number; sy: number } | null>(null);
+  const tileCornerRef = useRef<TileCorner>("br");
+  const tileAtRef = useRef<{ x: number; y: number } | null>(null);
   roomRef.current = room;
+  tileCornerRef.current = tileCorner;
+  tileAtRef.current = tileAt;
 
   const saved = (next?: Partial<Profile>): Profile => ({
     name,
@@ -385,34 +400,97 @@ export function App() {
   }, [fullscreen]);
 
   useEffect(() => {
+    setSlots({ main: "screen", a: "remote", b: "self" });
+  }, [sharing]);
+
+  useEffect(() => {
     if (phase !== "call") return;
-    const node = document.getElementById("stage");
-    if (!node) return;
+    const onResize = () => {
+      const panel = panelRef.current;
+      const stack = panel?.querySelector(".tile-stack") as HTMLElement | null;
+      const origin = stack?.offsetParent;
+      if (!panel || !stack || !(origin instanceof HTMLElement) || !tileAtRef.current || tileDrag.current) return;
+      const box = origin.getBoundingClientRect();
+      const corner = tileCornerRef.current;
+      setTileAt({
+        x: corner.endsWith("l") ? 12 : box.width - stack.offsetWidth - 12,
+        y: corner.startsWith("t") ? 12 : box.height - stack.offsetHeight - 12
+      });
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [phase]);
+
+  useLayoutEffect(() => {
+    if (menu !== "devices" || !devicePane || !micMenuRef.current) return;
+    const row = micMenuRef.current.querySelector(`[data-pane="${devicePane}"]`);
+    if (!row) return;
+    const menuBox = micMenuRef.current.getBoundingClientRect();
+    const rowBox = row.getBoundingClientRect();
+    setPaneShift(rowBox.top - menuBox.top);
+  }, [menu, devicePane, inputs, outputs]);
+
+  useEffect(() => {
+    if (phase !== "call") return;
     const post = () => {
-      const rect = node.getBoundingClientRect();
+      const stage = document.getElementById("stage");
+      if (!stage) return;
+      const stageRect = stage.getBoundingClientRect();
       const bare = fullscreen && !chrome;
-      const right = bare ? 0 : Math.min(204, rect.width * 0.22);
-      const bottom = bare ? 0 : Math.min(64, rect.height * 0.11);
-      void invoke("stage_rect", {
-        body: {
-          x: rect.x,
-          y: rect.y,
-          width: Math.max(2, rect.width - right),
-          height: Math.max(2, rect.height - bottom),
-          visible: true
+      const screenTile = document.getElementById("screen-tile");
+      const shrunk = Boolean(sharing && screenTile && slots.main !== "screen");
+      let x = stageRect.x;
+      let y = stageRect.y;
+      let width = stageRect.width;
+      let height = stageRect.height;
+      if (shrunk && screenTile) {
+        const tile = screenTile.getBoundingClientRect();
+        x = tile.x;
+        y = tile.y;
+        width = tile.width;
+        height = tile.height;
+      } else if (!bare) {
+        const stack = document.querySelector(".tile-stack")?.getBoundingClientRect();
+        const dock = 56;
+        if (stack && stack.width > 8) {
+          const onRight = stack.left + stack.width / 2 > stageRect.left + stageRect.width / 2;
+          const onBottom = stack.top + stack.height / 2 > stageRect.top + stageRect.height / 2;
+          if (onRight) width -= stageRect.right - stack.left + 8;
+          else {
+            const shift = stack.right - stageRect.left + 8;
+            x += shift;
+            width -= shift;
+          }
+          if (onBottom) height -= Math.max(dock, stageRect.bottom - stack.top + 8);
+          else {
+            const shift = stack.bottom - stageRect.top + 8;
+            y += shift;
+            height -= shift + dock;
+          }
+        } else {
+          width -= Math.min(204, stageRect.width * 0.22);
+          height -= dock;
         }
+      }
+      void invoke("stage_rect", {
+        body: { x, y, width: Math.max(2, width), height: Math.max(2, height), visible: true }
       }).catch(() => {});
     };
     post();
     const observer = new ResizeObserver(post);
-    observer.observe(node);
+    const stage = document.getElementById("stage");
+    if (stage) observer.observe(stage);
+    const screenTile = document.getElementById("screen-tile");
+    if (screenTile) observer.observe(screenTile);
+    const stack = document.querySelector(".tile-stack");
+    if (stack) observer.observe(stack);
     window.addEventListener("resize", post);
     return () => {
       observer.disconnect();
       window.removeEventListener("resize", post);
       void invoke("stage_rect", { body: { x: 0, y: 0, width: 0, height: 0, visible: false } }).catch(() => {});
     };
-  }, [phase, fullscreen, chrome, sharing]);
+  }, [phase, fullscreen, chrome, sharing, slots, tileAt]);
 
   useEffect(() => {
     if (phase !== "call") return;
@@ -605,6 +683,33 @@ export function App() {
     const shareOpen = menu === "share" || menu === "screens" || menu === "stream" || menu === "resolution" || menu === "fps" || menu === "bitrate";
     const inputName = inputs.find((item) => item.id === inputId)?.name || "System default";
     const outputName = outputs.find((item) => item.id === outputId)?.name || "System default";
+    const placePop = (clientX: number, clientY: number) => {
+      const panel = panelRef.current?.getBoundingClientRect();
+      if (!panel) return;
+      const popW = 196;
+      const popH = 44;
+      setPopAt({
+        x: Math.max(8, Math.min(clientX - panel.left, panel.width - popW - 8)),
+        y: Math.max(8, Math.min(clientY - panel.top, panel.height - popH - 8))
+      });
+    };
+    const mainPerson = slots.main === "self" ? (you?.name || name || "You") : (featured?.name || you?.name || name || "You");
+    const renderTile = (view: StageView, slot: "a" | "b") => {
+      if (view === "remote" && !featured) return null;
+      const person = view === "self" ? (you?.name || name || "You") : (featured?.name || "Guest");
+      const speaking = view === "self" ? Boolean(you?.speaking && !muted) : talking;
+      return (
+        <div
+          key={slot}
+          className={`face-tile${view === "self" ? " you-tile" : ""}${speaking ? " speaking" : ""}${view === "screen" ? " screen-tile" : ""}`}
+          data-tile={slot}
+          id={view === "screen" ? "screen-tile" : undefined}
+        >
+          {view === "screen" ? <MonitorIcon size={20} /> : <Avatar name={person} large />}
+          <span>{view === "screen" ? "Screen" : person}</span>
+        </div>
+      );
+    };
     return (
       <div className={`app mock${fullscreen ? " fullscreen" : ""}${fullscreen && chrome ? " chrome" : ""}`}>
         <header className="topbar">
@@ -629,52 +734,24 @@ export function App() {
           <div className="workspace call">
             <div
               className="call-panel"
+              ref={panelRef}
               onContextMenu={(event) => {
                 event.preventDefault();
+                placePop(event.clientX, event.clientY);
+                setDevicePane(null);
                 setMenu(sharing ? "hear" : "audio");
               }}
             >
               <div className="stage" id="stage" />
               <div className="call-chrome">
-                {!sharing ? (
+                {!sharing || slots.main !== "screen" ? (
                   <div className="center-face">
-                    <Avatar name={featured?.name || you?.name || name || "You"} large />
+                    <Avatar name={sharing ? mainPerson : (featured?.name || you?.name || name || "You")} large />
                   </div>
                 ) : null}
-                {volumeOpen ? (
-                  <div className={`voice-pop${sharing ? " side" : ""}`} role="dialog" aria-label={menu === "hear" ? "Screen audio" : "Voice"}>
-                    <p>Right Click Anywhere</p>
+                {volumeOpen && popAt ? (
+                  <div className="voice-pop" role="dialog" aria-label={menu === "hear" ? "Screen audio" : "Voice"} style={{ left: popAt.x, top: popAt.y }} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); }}>
                     <VolumeRow label={menu === "hear" ? "Audio" : "Voice"} value={menu === "hear" ? screen : voice} onChange={menu === "hear" ? changeScreen : changeVoice} />
-                  </div>
-                ) : null}
-                {menu === "devices" ? (
-                  <div className="mic-menus" onContextMenu={(event) => event.stopPropagation()}>
-                    <div className="mock-menu" role="dialog" aria-label="Microphone settings">
-                      <button className="stack" type="button" onClick={() => setDevicePane(devicePane === "input" ? null : "input")}>
-                        <span>Input Device<small>{inputName}</small></span>
-                        <span className="chev"><ChevronRightIcon size={18} /></span>
-                      </button>
-                      <button className="stack" type="button" onClick={() => setDevicePane(devicePane === "output" ? null : "output")}>
-                        <span>Output Device<small>{outputName}</small></span>
-                        <span className="chev"><ChevronRightIcon size={18} /></span>
-                      </button>
-                      <button type="button" onClick={() => pickNoise(!noise)}>
-                        <span>Noise Suppression</span>
-                        <i className={`check${noise ? " on" : ""}`}>{noise ? "✓" : ""}</i>
-                      </button>
-                    </div>
-                    {devicePane ? (
-                      <div className="mock-menu" role="dialog" aria-label={devicePane === "input" ? "Input Device" : "Output Device"}>
-                        <button type="button" className={(devicePane === "input" ? inputId : outputId) === "" ? "picked" : ""} onClick={() => devicePane === "input" ? pickInput("") : pickOutput("")}>
-                          <span>System default</span><i className="radio" />
-                        </button>
-                        {(devicePane === "input" ? inputs : outputs).map((device) => (
-                          <button key={device.id} type="button" className={(devicePane === "input" ? inputId : outputId) === device.id ? "picked" : ""} onClick={() => devicePane === "input" ? pickInput(device.id) : pickOutput(device.id)}>
-                            <span>{device.name}</span><i className="radio" />
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
                   </div>
                 ) : null}
                 {shareOpen ? (
@@ -731,25 +808,83 @@ export function App() {
                     ) : null}
                   </div>
                 ) : null}
-                <div className="tile-stack" onContextMenu={(event) => event.stopPropagation()}>
-                  {sharing && featured ? (
-                    <div className={`face-tile${talking ? " speaking" : ""}`}>
-                      <Avatar name={featured.name} large />
-                      <span>{featured.name}</span>
+                <div
+                  className={`tile-stack${tileAt ? " placed" : ""}${tileDragging ? " dragging" : ""}`}
+                  style={tileAt ? { left: tileAt.x, top: tileAt.y } : undefined}
+                  onContextMenu={(event) => event.stopPropagation()}
+                  onPointerDown={(event) => {
+                    if (event.button !== 0) return;
+                    const origin = event.currentTarget.offsetParent;
+                    if (!(origin instanceof HTMLElement)) return;
+                    const originBox = origin.getBoundingClientRect();
+                    const box = event.currentTarget.getBoundingClientRect();
+                    tileDrag.current = {
+                      dx: event.clientX - box.left,
+                      dy: event.clientY - box.top,
+                      sx: event.clientX,
+                      sy: event.clientY
+                    };
+                    try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* pointer capture is unavailable for this event */ }
+                    setTileDragging(true);
+                    setTileAt({ x: box.left - originBox.left, y: box.top - originBox.top });
+                  }}
+                  onPointerMove={(event) => {
+                    const drag = tileDrag.current;
+                    const origin = event.currentTarget.offsetParent;
+                    if (!drag || !(origin instanceof HTMLElement)) return;
+                    const originBox = origin.getBoundingClientRect();
+                    const maxX = originBox.width - event.currentTarget.offsetWidth - 4;
+                    const maxY = originBox.height - event.currentTarget.offsetHeight - 4;
+                    setTileAt({
+                      x: Math.min(maxX, Math.max(4, event.clientX - originBox.left - drag.dx)),
+                      y: Math.min(maxY, Math.max(4, event.clientY - originBox.top - drag.dy))
+                    });
+                  }}
+                  onPointerUp={(event) => {
+                    const drag = tileDrag.current;
+                    const origin = event.currentTarget.offsetParent;
+                    tileDrag.current = null;
+                    if (!drag || !(origin instanceof HTMLElement)) {
+                      setTileDragging(false);
+                      return;
+                    }
+                    const originBox = origin.getBoundingClientRect();
+                    const node = event.currentTarget;
+                    const x = event.clientX - originBox.left - drag.dx;
+                    const y = event.clientY - originBox.top - drag.dy;
+                    const corner: TileCorner = `${y + node.offsetHeight / 2 < originBox.height / 2 ? "t" : "b"}${x + node.offsetWidth / 2 < originBox.width / 2 ? "l" : "r"}`;
+                    const target = {
+                      x: corner.endsWith("l") ? 12 : originBox.width - node.offsetWidth - 12,
+                      y: corner.startsWith("t") ? 12 : originBox.height - node.offsetHeight - 12
+                    };
+                    setTileCorner(corner);
+                    setTileDragging(false);
+                    requestAnimationFrame(() => setTileAt(target));
+                    const moved = Math.hypot(event.clientX - drag.sx, event.clientY - drag.sy);
+                    if (moved < 6 && sharing) {
+                      const hit = (event.target as Element).closest<HTMLElement>("[data-tile]");
+                      const slot = hit?.dataset.tile;
+                      if (slot === "a" || slot === "b") {
+                        setSlots((current) => ({ ...current, main: current[slot], [slot]: current.main }));
+                      }
+                    }
+                  }}
+                >
+                  {sharing ? renderTile(slots.a, "a") : null}
+                  {sharing ? renderTile(slots.b, "b") : (
+                    <div className={`face-tile you-tile${you?.speaking && !muted ? " speaking" : ""}`}>
+                      <Avatar name={you?.name || name || "You"} large />
+                      <span>{you?.name || name || "You"}</span>
                     </div>
-                  ) : null}
-                  <div className={`face-tile you-tile${you?.speaking && !muted ? " speaking" : ""}`}>
-                    <Avatar name={you?.name || name || "You"} large />
-                    <span>{you?.name || name || "You"}</span>
-                  </div>
+                  )}
                 </div>
                 <div className="name-pill">
-                  {sharing ? <MonitorIcon size={16} /> : <span className="muted-mic"><MicOffIcon size={16} /></span>}
-                  <strong>{sharing ? (you?.name || name || "You") : (featured?.name || "Just you")}</strong>
+                  {sharing && slots.main === "screen" ? <MonitorIcon size={16} /> : <span className="muted-mic"><MicOffIcon size={16} /></span>}
+                  <strong>{sharing ? (slots.main === "screen" ? (you?.name || name || "You") : mainPerson) : (featured?.name || "Just you")}</strong>
                 </div>
                 <div className="call-dock" onContextMenu={(event) => event.stopPropagation()}>
                 <div className="controls">
-                  <div className={`tool${muted ? " muted" : ""}`}>
+                  <div className={`tool${muted ? " muted" : ""}${menu === "devices" ? " open" : ""}`}>
                     <button
                       type="button"
                       aria-pressed={muted}
@@ -770,6 +905,36 @@ export function App() {
                     <button className={`caret${menu === "devices" ? " open" : ""}`} type="button" aria-label="Microphone settings" onClick={() => { setDevicePane(null); setMenu(menu === "devices" ? null : "devices"); }}>
                       <ChevronIcon size={16} />
                     </button>
+                    {menu === "devices" ? (
+                      <div className="pop-anchor" onContextMenu={(event) => event.stopPropagation()}>
+                        <div className="mock-menu" role="dialog" aria-label="Microphone settings" ref={micMenuRef}>
+                          <button className="stack" type="button" data-pane="input" onClick={() => setDevicePane(devicePane === "input" ? null : "input")}>
+                            <span>Input Device<small>{inputName}</small></span>
+                            <span className="chev"><ChevronRightIcon size={18} /></span>
+                          </button>
+                          <button className="stack" type="button" data-pane="output" onClick={() => setDevicePane(devicePane === "output" ? null : "output")}>
+                            <span>Output Device<small>{outputName}</small></span>
+                            <span className="chev"><ChevronRightIcon size={18} /></span>
+                          </button>
+                          <button type="button" onClick={() => pickNoise(!noise)}>
+                            <span>Noise Suppression</span>
+                            <i className={`check${noise ? " on" : ""}`}>{noise ? "✓" : ""}</i>
+                          </button>
+                        </div>
+                        {devicePane ? (
+                          <div className="mock-menu pane" role="dialog" aria-label={devicePane === "input" ? "Input Device" : "Output Device"} style={{ marginTop: paneShift }}>
+                            <button type="button" className={(devicePane === "input" ? inputId : outputId) === "" ? "picked" : ""} onClick={() => devicePane === "input" ? pickInput("") : pickOutput("")}>
+                              <span>System default</span><i className="radio" />
+                            </button>
+                            {(devicePane === "input" ? inputs : outputs).map((device) => (
+                              <button key={device.id} type="button" className={(devicePane === "input" ? inputId : outputId) === device.id ? "picked" : ""} onClick={() => devicePane === "input" ? pickInput(device.id) : pickOutput(device.id)}>
+                                <span>{device.name}</span><i className="radio" />
+                              </button>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
                   <div className="tool">
                     <button type="button" aria-label="Camera"><VideoIcon size={18} /></button>
@@ -779,7 +944,12 @@ export function App() {
                     <button type="button" aria-pressed={deaf} aria-label={deaf ? "Hear the room" : "Silence the room"} onClick={toggleDeaf}>
                       <HeadphonesIcon size={18} />
                     </button>
-                    <button className={`caret${volumeOpen ? " open" : ""}`} type="button" aria-label="Volume" onClick={() => setMenu(volumeOpen ? null : sharing ? "hear" : "audio")}>
+                    <button className={`caret${volumeOpen ? " open" : ""}`} type="button" aria-label="Volume" onClick={(event) => {
+                      if (volumeOpen) { setMenu(null); return; }
+                      const box = event.currentTarget.getBoundingClientRect();
+                      placePop(box.left, box.top - 48);
+                      setMenu(sharing ? "hear" : "audio");
+                    }}>
                       <ChevronIcon size={16} />
                     </button>
                   </div>
