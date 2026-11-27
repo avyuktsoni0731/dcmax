@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "MyCord Shell",
+  "productName": "Yatai",
   "version": "0.1.0",
   "identifier": "com.mycord.shell",
   "build": {
@@ -17,7 +17,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "MyCord Shell",
+        "title": "Yatai",
         "width": 1080,
         "height": 720,
         "minWidth": 720,

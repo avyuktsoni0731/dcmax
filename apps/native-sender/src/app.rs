@@ -1924,7 +1924,7 @@ async fn connect(settings: &CallSettings, stage: Arc<Stage>) -> Result<(Joined, 
     } else {
         crate::audio::session_log("microphone did not start: init_recording failed");
         Some(
-            "The microphone did not start. Allow the microphone for MyCord Shell, then join again. You can still share and hear the room."
+            "The microphone did not start. Allow the microphone for Yatai, then join again. You can still share and hear the room."
                 .to_string(),
         )
     };

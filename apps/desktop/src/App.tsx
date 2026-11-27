@@ -2,31 +2,23 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import discordMark from "./discord-mark.png";
 import ramenUrl from "./ramen.svg";
-import { ago, faceColor, initials, loadDesk, saveDesk, type Desk, type Friend, type Mail } from "./desk";
+import { faceColor, initials, loadDesk, saveDesk, type Desk, type Mail } from "./desk";
 import {
-  AddIcon,
-  ArrowIcon,
   ChatBubbleIcon,
   ChevronIcon,
   ChevronRightIcon,
-  FriendsIcon,
   FullscreenExitIcon,
   FullscreenIcon,
   HeadphonesIcon,
   HeadphonesOffIcon,
-  HomeIcon,
-  MessagesIcon,
   MicIcon,
   MicOffIcon,
   MonitorIcon,
   PersonAddIcon,
   PersonSearchIcon,
   PhoneIcon,
-  PhoneInTalkIcon,
   RamenMark,
-  RecentsIcon,
   SendIcon,
   SettingsIcon,
   ShareIcon,
@@ -48,13 +40,9 @@ type Note =
 
 type Person = { name: string; local: boolean; speaking: boolean; muted?: boolean };
 
-type Page = "home" | "friends" | "messages" | "recents" | "settings";
-type Dialog = "create" | "join" | "friend" | null;
 type Menu = "share" | "audio" | "hear" | "devices" | "stream" | "resolution" | "fps" | "bitrate" | "screens" | null;
 type StageView = "screen" | "remote" | "self";
 type TileCorner = "tl" | "tr" | "bl" | "br";
-type FriendTab = "online" | "all" | "requests";
-
 const RESOLUTIONS = [
   { width: 1280, height: 720, label: "1280 × 720" },
   { width: 1920, height: 1080, label: "1920 × 1080" },
@@ -62,6 +50,14 @@ const RESOLUTIONS = [
 ];
 
 const BITRATES = [8000, 12000, 20000, 40000, 80000, 100000];
+
+function pairRoom(mine: string, theirs: string) {
+  const names = [mine, theirs]
+    .map((item) => item.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, ""))
+    .filter(Boolean)
+    .sort();
+  return names.length ? `yatai-${names.join("-")}`.slice(0, 64) : "";
+}
 
 type ScreenChoice = { id: number; label: string; width: number; height: number };
 
@@ -82,21 +78,12 @@ type Profile = {
 
 type Gear = { id: string; name: string };
 
-const NAV: { id: Page; label: string; icon: typeof HomeIcon }[] = [
-  { id: "home", label: "Home", icon: HomeIcon },
-  { id: "friends", label: "Friends", icon: FriendsIcon },
-  { id: "messages", label: "Messages", icon: MessagesIcon },
-  { id: "recents", label: "Recents", icon: RecentsIcon },
-  { id: "settings", label: "Settings", icon: SettingsIcon }
-];
-
 export function App() {
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [name, setName] = useState("");
   const [room, setRoom] = useState("");
   const [invite, setInvite] = useState("");
   const [phase, setPhase] = useState<"home" | "joining" | "call">("home");
-  const [page, setPage] = useState<Page>("home");
   const [status, setStatus] = useState("");
   const [sharing, setSharing] = useState(false);
   const [watching, setWatching] = useState(false);
@@ -120,7 +107,6 @@ export function App() {
   const [people, setPeople] = useState<Person[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [desk, setDesk] = useState<Desk>(loadDesk);
-  const [dialog, setDialog] = useState<Dialog>(null);
   const [menu, setMenu] = useState<Menu>(null);
   const [devicePane, setDevicePane] = useState<"input" | "output" | null>(null);
   const [popAt, setPopAt] = useState<{ x: number; y: number } | null>(null);
@@ -129,12 +115,10 @@ export function App() {
   const [tileDragging, setTileDragging] = useState(false);
   const [tileCorner, setTileCorner] = useState<TileCorner>("br");
   const [paneShift, setPaneShift] = useState(0);
-  const [friendTab, setFriendTab] = useState<FriendTab>("all");
   const [query, setQuery] = useState("");
   const [active, setActive] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [friendName, setFriendName] = useState("");
-  const [friendRoom, setFriendRoom] = useState("");
+  const [prefsOpen, setPrefsOpen] = useState(false);
   const [session, setSession] = useState(() => {
     const preview = import.meta.env.DEV ? new URLSearchParams(window.location.search).get("preview") : null;
     if (preview === "login" || preview === "register") return false;
@@ -156,6 +140,7 @@ export function App() {
   const [authBusy, setAuthBusy] = useState(false);
   const [friendOpen, setFriendOpen] = useState(false);
   const [friendQuery, setFriendQuery] = useState("");
+  const [foundPeople, setFoundPeople] = useState<string[]>([]);
   const sharingRef = useRef(false);
   const remotesRef = useRef<Set<string> | null>(null);
   const noticeTimer = useRef(0);
@@ -284,7 +269,6 @@ export function App() {
     }
     setSession(true);
     if (preview === "inbox" || preview === "add" || preview === "search") {
-      setPage("messages");
       setActive("");
       if (preview === "add" || preview === "search") setFriendOpen(true);
       if (preview === "search") setFriendQuery("asna");
@@ -316,10 +300,7 @@ export function App() {
       setWatching(preview === "watch");
       setStatus("In the room");
     } else if (preview === "inbox") {
-      setPage("messages");
       setActive("");
-    } else if (preview === "messages" || preview === "friends" || preview === "recents" || preview === "settings") {
-      setPage(preview);
     }
   }, []);
 
@@ -382,7 +363,7 @@ export function App() {
         setFullscreen(false);
         setNotice(null);
         setMenu(null);
-        setStatus("You left the room.");
+        setStatus("");
         setBusy(false);
         playLeft();
         void invoke("set_fullscreen", { body: { on: false } });
@@ -420,17 +401,10 @@ export function App() {
           ));
         }
         if (remotes.length > 0) {
-          commit((current) => {
-            let friends = current.friends;
-            for (const person of remotes) {
-              friends = [{ name: person.name, room: roomRef.current, at: Date.now() }, ...friends.filter((friend) => friend.name !== person.name)];
-            }
-            return {
-              ...current,
-              friends: friends.slice(0, 40),
-              recents: current.recents.map((item, index) => (index === 0 ? { ...item, people: note.people.length } : item))
-            };
-          });
+          commit((current) => ({
+            ...current,
+            recents: current.recents.map((item, index) => (index === 0 ? { ...item, people: note.people.length } : item))
+          }));
         }
       }
     });
@@ -517,8 +491,9 @@ export function App() {
       width = tile.width;
       height = tile.height;
       radius = 12;
-    } else if (!fullscreen || chrome) {
+    } else {
       const cut = (node: Element) => {
+        if (fullscreen && Number(getComputedStyle(node).opacity) <= 0.02) return;
         const box = node.getBoundingClientRect();
         if (box.width < 2 || box.height < 2) return;
         const left = Math.round(box.x - x);
@@ -556,6 +531,17 @@ export function App() {
   useLayoutEffect(() => {
     if (phase !== "call") return;
     postStageRef.current();
+    if (!fullscreen) return;
+    let frame = 0;
+    const start = performance.now();
+    const tick = (now: number) => {
+      postStageRef.current();
+      if (now - start < 300) {
+        frame = requestAnimationFrame(tick);
+      }
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
   }, [phase, fullscreen, chrome, sharing, watching, slots, tileCorner, tileAt, menu]);
 
   useEffect(() => {
@@ -593,11 +579,10 @@ export function App() {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
-        setPage("messages");
         document.getElementById("thread-search")?.focus();
       }
       if (event.key === "Escape") {
-        setDialog(null);
+        setPrefsOpen(false);
         setMenu(null);
         setDevicePane(null);
         setFullscreen((current) => {
@@ -675,21 +660,22 @@ export function App() {
     const nextName = (accountName || name).trim();
     const target = nextRoom.trim();
     if (!nextName || !target) {
-      setDialog("join");
-      setStatus("Add your name and a room.");
+      setStatus("Choose a friend to call.");
       return;
     }
     primeAudio();
     pendingShare.current = share;
     setName(nextName);
     setRoom(target);
-    setDialog(null);
+    setPrefsOpen(false);
     setPhase("joining");
     setStatus("Joining the room.");
     persist({ name: nextName, room: target });
     const saved = localStorage.getItem("mycord.session");
     void run(() => invoke("join", { body: { name: nextName, room: target, invite: invite.trim() ? invite.trim() : null, session: saved && saved !== "1" ? saved : null } }), false);
   }
+  // Call buttons stay inactive until calling is turned on.
+  void joinRoom;
 
   function rememberAccount(account: { username: string; session: string }) {
     localStorage.setItem("mycord.session", account.session);
@@ -735,15 +721,70 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!session) return;
+    const ping = () => {
+      const saved = localStorage.getItem("mycord.session");
+      if (!saved || saved === "1") return;
+      void invoke("account", { body: { action: "here", session: saved } }).catch(() => { });
+    };
+    ping();
+    const timer = window.setInterval(ping, 20000);
+    return () => window.clearInterval(timer);
+  }, [session]);
+
+  useEffect(() => {
+    if (!friendOpen) {
+      setFoundPeople([]);
+      return;
+    }
+    const query = friendQuery.trim().replace(/^@/, "");
+    if (query.length < 2) {
+      setFoundPeople([]);
+      return;
+    }
+    const saved = localStorage.getItem("mycord.session");
+    if (!saved || saved === "1") return;
+    let cancel = false;
+    const timer = window.setTimeout(() => {
+      void invoke<string[]>("people", { body: { session: saved, query } })
+        .then((names) => {
+          if (!cancel) setFoundPeople(names);
+        })
+        .catch(() => {
+          if (!cancel) setFoundPeople([]);
+        });
+    }, 180);
+    return () => {
+      cancel = true;
+      window.clearTimeout(timer);
+    };
+  }, [friendOpen, friendQuery]);
+
+  function logOut() {
+    const saved = localStorage.getItem("mycord.session");
+    localStorage.removeItem("mycord.session");
+    localStorage.removeItem("mycord.user");
+    setAuthPass("");
+    setAuthNote("");
+    setPrefsOpen(false);
+    setSession(false);
+    if (phase === "call" || phase === "joining") void invoke("leave").catch(() => { });
+    if (saved && saved !== "1") void invoke("account", { body: { action: "logout", session: saved } }).catch(() => { });
+  }
+
   function addFoundFriend(foundName: string) {
     const nextName = foundName.replace(/^@/, "").trim();
     if (!nextName) return;
-    const target = room.trim() || "lobby";
+    const mine = (localStorage.getItem("mycord.user") || name).trim();
+    const target = pairRoom(mine, nextName);
     commit((current) => ({
       ...current,
-      friends: [{ name: nextName, room: target, at: Date.now() }, ...current.friends.filter((friend) => friend.name.toLowerCase() !== nextName.toLowerCase())].slice(0, 40)
+      friends: [{ name: nextName, room: target, at: Date.now(), added: true }, ...current.friends.filter((friend) => friend.name.toLowerCase() !== nextName.toLowerCase())].slice(0, 40)
     }));
     setFriendQuery("");
+    setFriendOpen(false);
+    openFriend({ name: nextName, room: target });
   }
 
   function openFriend(friend: { name: string; room: string }) {
@@ -752,20 +793,6 @@ export function App() {
       if (current.threads.some((item) => item.name === friend.name)) return current;
       return { ...current, threads: [{ name: friend.name, room: friend.room, notes: [] }, ...current.threads] };
     });
-  }
-
-  function addFriend() {
-    const nextName = friendName.trim();
-    const target = friendRoom.trim();
-    if (!nextName || !target) return;
-    commit((current) => ({
-      ...current,
-      friends: [{ name: nextName, room: target, at: Date.now() }, ...current.friends.filter((friend) => friend.name !== nextName)].slice(0, 40)
-    }));
-    setFriendName("");
-    setFriendRoom("");
-    setDialog(null);
-    setActive(nextName);
   }
 
   function sendNote(who: string, roomName: string) {
@@ -822,7 +849,19 @@ export function App() {
   }
 
   const online = new Set(people.filter((person) => !person.local).map((person) => person.name));
-  const visibleFriends = desk.friends.filter((friend) => friendTab !== "online" || online.has(friend.name));
+  const rail = (
+    <Rail
+      prefsOpen={prefsOpen}
+      onPrefs={() => setPrefsOpen((open) => !open)}
+      onTheme={() => {
+        const next = theme === "dark" ? "light" : "dark";
+        setTheme(next);
+        persist({ dark: next === "dark" });
+      }}
+      onLogOut={logOut}
+      dark={theme === "dark"}
+    />
+  );
 
   if (phase === "call") {
     const others = people.filter((person) => !person.local);
@@ -872,7 +911,7 @@ export function App() {
     return (
       <div className={`app mock${fullscreen ? " fullscreen" : ""}${fullscreen && chrome ? " chrome" : ""}`}>
           <header className="topbar" data-tauri-drag-region>
-            <span className="topbar-title"><PhoneInTalkIcon size={16} /> Call</span>
+            <span className="topbar-title"><img className="name-mark" src={ramenUrl} alt="" /> Yatai</span>
             {notice || status ? <span className={`call-live${status && /microphone|could not|did not/i.test(status) ? " warn" : ""}`}>{notice ?? status}</span> : null}
             <button
               className="icon-quiet"
@@ -889,7 +928,7 @@ export function App() {
             </button>
           </header>
           <div className="shell call-shell">
-            <Rail mock page="messages" onPage={() => { }} />
+            {rail}
             <div className="workspace call">
               <div
                 className="call-panel"
@@ -1246,97 +1285,27 @@ export function App() {
     );
   }
 
-  const threadNames = conversationList(desk, query);
-  const selectedName = threadNames.some((item) => item.name === active) ? active : null;
-  const selected = threadNames.find((item) => item.name === selectedName) ?? null;
-  const thread = desk.threads.find((item) => item.name === selectedName);
+  const needle = query.trim().toLowerCase().replace(/^@/, "");
+  const added = desk.friends.filter((friend) => friend.added);
+  const friendRows = added.filter((friend) => !needle || friend.name.toLowerCase().includes(needle) || handleOf(friend.name).includes(needle));
+  const direct = desk.threads.filter((item) => {
+    const known = added.some((friend) => friend.name.toLowerCase() === item.name.toLowerCase());
+    return known && (!needle || item.name.toLowerCase().includes(needle) || handleOf(item.name).includes(needle));
+  });
+  const selectedName = direct.some((item) => item.name === active) ? active : null;
+  const selected = direct.find((item) => item.name === selectedName) ?? null;
+  const thread = selected ? desk.threads.find((item) => item.name.toLowerCase() === selected.name.toLowerCase()) : null;
+  const already = new Set(added.map((friend) => friend.name.toLowerCase()));
+  const suggestions = foundPeople.filter((person) => !already.has(person.toLowerCase()));
 
   return (
-    <div className={`app${page === "messages" ? " mock" : ""}`}>
-      {page === "messages" ? (
+    <div className="app mock">
           <header className="topbar" data-tauri-drag-region>
-            <span className="topbar-title"><ChatBubbleIcon size={16} /> Chat</span>
+            <span className="topbar-title"><img className="name-mark" src={ramenUrl} alt="" /> Yatai</span>
           </header>
-      ) : (
-        <header className="topbar home-topbar" data-tauri-drag-region>
-          <span className="topbar-title">MyCord</span>
-        </header>
-      )}
           <div className="shell">
-            <Rail mock={page === "messages"} page={page} onPage={setPage} />
+            {rail}
             <main className="workspace">
-              {page === "home" ? (
-                <div className="home">
-                  <div className="home-main">
-                    <section className="hero">
-                      <h1>Connect, watch, and build together.</h1>
-                      <p>A simple space to call and share your screen with the people you care about.</p>
-                      <div className="hero-actions">
-                        <button className="cream" type="button" onClick={() => setDialog("create")}><AddIcon size={18} /> Create a Room</button>
-                        <button className="outline" type="button" onClick={() => setDialog("join")}>Join a Room</button>
-                      </div>
-                      {status ? <p className="notice">{phase === "joining" ? "Joining the room." : status}</p> : null}
-                    </section>
-                    <section>
-                      <div className="section-head">
-                        <h2>Recent Rooms</h2>
-                        <button className="text-btn" type="button" onClick={() => setPage("recents")}>View all</button>
-                      </div>
-                      <div className="room-list">
-                        {desk.recents.length === 0 ? <p className="empty">Rooms you open will stay here.</p> : null}
-                        {desk.recents.slice(0, 3).map((item) => (
-                          <button className="room" type="button" key={item.room} onClick={() => joinRoom(item.room)}>
-                            <span className="room-mark"><MonitorIcon size={18} /></span>
-                            <span className="person-line">
-                              <strong>{item.room}</strong>
-                              <span>{item.people} {item.people === 1 ? "person" : "people"} · {ago(item.at)}</span>
-                            </span>
-                            <ArrowIcon size={18} />
-                          </button>
-                        ))}
-                      </div>
-                    </section>
-                  </div>
-                  <div className="side-col">
-                    <section className="panel">
-                      <div className="panel-head">
-                        <h2>Friends</h2>
-                        <button className="text-btn" type="button" onClick={() => setDialog("friend")}>Add Friend</button>
-                      </div>
-                      <FriendTabs tab={friendTab} setTab={setFriendTab} online={online.size} />
-                      <FriendRows friends={visibleFriends} tab={friendTab} online={online} onCall={(friend) => joinRoom(friend.room)} onShare={(friend) => joinRoom(friend.room, true)} />
-                    </section>
-                    <section className="panel">
-                      <div className="panel-head"><h2>Activity</h2></div>
-                      <div className="activity-list">
-                        {desk.friends.length === 0 ? <p className="empty">When someone joins a room with you, they show up here.</p> : null}
-                        {desk.friends.slice(0, 4).map((friend) => (
-                          <div className="activity" key={friend.name}>
-                            <Avatar name={friend.name} online={online.has(friend.name)} />
-                            <span className="activity-copy">
-                              <strong>{friend.name}</strong>
-                              <span>{online.has(friend.name) ? "In a room with you" : `Last room ${friend.room} · ${ago(friend.at)}`}</span>
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    </section>
-                  </div>
-                </div>
-              ) : null}
-              {page === "friends" ? (
-                <div className="page">
-                  <div className="page-head">
-                    <h1>Friends</h1>
-                    <button className="outline" type="button" onClick={() => setDialog("friend")}><AddIcon size={18} /> Add Friend</button>
-                  </div>
-                  <FriendTabs tab={friendTab} setTab={setFriendTab} online={online.size} />
-                  <div className="friend-list">
-                    <FriendRows friends={visibleFriends} tab={friendTab} online={online} onCall={(friend) => joinRoom(friend.room)} onShare={(friend) => joinRoom(friend.room, true)} />
-                  </div>
-                </div>
-              ) : null}
-              {page === "messages" ? (
                 <div className="messages">
                   <div className="chat-board">
                     <section className="dm-col">
@@ -1347,14 +1316,8 @@ export function App() {
                       <hr className="dm-rule" />
                       <div className="thread-scroll">
                         <p className="dm-label">Direct Messages</p>
-                        {desk.threads.filter((item) => {
-                          const needle = query.trim().toLowerCase();
-                          return !needle || item.name.toLowerCase().includes(needle);
-                        }).length === 0 ? <p className="empty">No conversations yet.</p> : null}
-                        {desk.threads.filter((item) => {
-                          const needle = query.trim().toLowerCase();
-                          return !needle || item.name.toLowerCase().includes(needle);
-                        }).map((item) => {
+                        {needle && direct.length === 0 ? <p className="empty">No matches.</p> : null}
+                        {direct.map((item) => {
                           const count = item.notes.length;
                           const badge = item.name === selectedName || count === 0 ? "" : count > 9 ? "9+" : String(count);
                           return (
@@ -1369,10 +1332,8 @@ export function App() {
                         })}
                         <hr className="dm-rule" />
                         <p className="dm-label">Friends</p>
-                        {desk.friends.filter((friend) => {
-                          const needle = query.trim().toLowerCase();
-                          return !needle || friend.name.toLowerCase().includes(needle) || handleOf(friend.name).includes(needle);
-                        }).map((friend) => (
+                        {needle && friendRows.length === 0 ? <p className="empty">No matches.</p> : null}
+                        {friendRows.map((friend) => (
                           <button className="thread-row" type="button" key={friend.name} onClick={() => openFriend(friend)}>
                             <Avatar name={friend.name} />
                             <span className="thread-copy"><strong>{friend.name}</strong></span>
@@ -1393,7 +1354,7 @@ export function App() {
                               <strong>{selected.name}</strong>
                             </span>
                             <span className="thread-tools">
-                              <button type="button" aria-label={`Call ${selected.name}`} onClick={() => joinRoom(selected.room)}><PhoneIcon size={18} /></button>
+                              <button type="button" aria-label="Call"><PhoneIcon size={18} /></button>
                             </span>
                           </header>
                           <div className="transcript">
@@ -1425,8 +1386,7 @@ export function App() {
                           </div>
                         </>
                       ) : (
-                        <>
-                          <hr className="pane-rule" />
+                        <div className="home-empty">
                           <button className="add-friend" type="button" onClick={() => setFriendOpen((open) => !open)}>
                             <PersonAddIcon size={18} /> Add Friend
                           </button>
@@ -1434,148 +1394,59 @@ export function App() {
                             <div className="friend-pop" role="dialog" aria-label="Search for a friend">
                               <label className="search">
                                 <PersonSearchIcon size={18} />
-                                <input placeholder="Search for a friend" value={friendQuery} onChange={(event) => setFriendQuery(event.target.value)} />
+                                <input placeholder="Find someone online" value={friendQuery} onChange={(event) => setFriendQuery(event.target.value)} />
                               </label>
-                              {friendQuery.trim() ? friendHits(desk.friends, friendQuery).map((hit) => (
-                                <div className="friend-hit" key={hit.name}>
-                                  <Avatar name={hit.name} />
+                              {suggestions.map((hit) => (
+                                <div className="friend-hit" key={hit}>
+                                  <Avatar name={hit} />
                                   <span>
-                                    <strong>{hit.name}</strong>
-                                    <small>{handleOf(hit.name)}</small>
+                                    <strong>{hit}</strong>
+                                    <small>{handleOf(hit)}</small>
                                   </span>
-                                  <button type="button" aria-label={`Add ${hit.name}`} onClick={() => addFoundFriend(hit.name)}><PersonAddIcon size={18} /></button>
+                                  <button type="button" aria-label={`Add ${hit}`} onClick={() => addFoundFriend(hit)}><PersonAddIcon size={18} /></button>
                                 </div>
-                              )) : null}
+                              ))}
+                              {friendQuery.trim().replace(/^@/, "").length >= 2 && suggestions.length === 0 ? <p className="empty">No one online matches that.</p> : null}
                             </div>
                           ) : null}
                           <div className="chat-empty">
                             <img src={ramenUrl} alt="" />
                             <p>Ramen may have originated from China. Scholars believe that “shina shoba” (“Chinese style” noodle soup) was imported to Japan between the 17th and 20th centuries.</p>
                           </div>
-                        </>
+                        </div>
                       )}
                     </section>
                   </div>
                 </div>
-              ) : null}
-              {page === "recents" ? (
-                <div className="page">
-                  <div className="page-head"><h1>Recent rooms</h1></div>
-                  <div className="room-list">
-                    {desk.recents.length === 0 ? <p className="empty">Rooms you open will stay here.</p> : null}
-                    {desk.recents.map((item) => (
-                      <button className="room" type="button" key={item.room} onClick={() => joinRoom(item.room)}>
-                        <span className="room-mark"><MonitorIcon size={18} /></span>
-                        <span className="person-line">
-                          <strong>{item.room}</strong>
-                          <span>{item.people} {item.people === 1 ? "person" : "people"} · {ago(item.at)}</span>
-                        </span>
-                        <ArrowIcon size={18} />
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
-              {page === "settings" ? (
-                <div className="page">
-                  <div className="page-head"><h1>Settings</h1></div>
-                  <div className="settings">
-                    <label>
-                      Display name
-                      <input value={name} autoComplete="name" onChange={(event) => { setName(event.target.value); persist({ name: event.target.value }); }} />
-                    </label>
-                    <label>
-                      Invite
-                      <input value={invite} autoComplete="off" onChange={(event) => { setInvite(event.target.value); persist({ invite: event.target.value }); }} />
-                    </label>
-                    <button className="outline" type="button" onClick={() => { const next = theme === "dark" ? "light" : "dark"; setTheme(next); persist({ dark: next === "dark" }); }}>
-                      {theme === "dark" ? "Switch to light" : "Switch to dark"}
-                    </button>
-                    <button className="outline" type="button" onClick={() => {
-                      const saved = localStorage.getItem("mycord.session");
-                      localStorage.removeItem("mycord.session");
-                      localStorage.removeItem("mycord.user");
-                      setAuthPass("");
-                      setAuthNote("");
-                      setSession(false);
-                      if (saved && saved !== "1") void invoke("account", { body: { action: "logout", session: saved } }).catch(() => { });
-                    }}>
-                      Log out
-                    </button>
-                    <DeviceSelect label="Microphone" value={inputId} devices={inputs} onChange={pickInput} />
-                    <DeviceSelect label="Speakers" value={outputId} devices={outputs} onChange={pickOutput} />
-                    <NoiseSwitch on={noise} onChange={pickNoise} />
-                  </div>
-                </div>
-              ) : null}
             </main>
           </div>
-          {dialog === "create" || dialog === "join" ? (
-            <div className="picker" role="dialog" aria-modal="true" aria-label={dialog === "create" ? "Create a room" : "Join a room"}>
-              <form className="picker-card" onSubmit={(event) => { event.preventDefault(); joinRoom(room); }}>
-                <h2>{dialog === "create" ? "Create a room" : "Join a room"}</h2>
-                <label>Display name<input value={name} autoComplete="name" onChange={(event) => setName(event.target.value)} /></label>
-                <label>Room<input value={room} autoComplete="off" onChange={(event) => setRoom(event.target.value)} /></label>
-                <label>Invite<input value={invite} autoComplete="off" placeholder="Optional" onChange={(event) => setInvite(event.target.value)} /></label>
-                <div className="dialog-actions">
-                  <button className="outline" type="button" onClick={() => setDialog(null)}>Cancel</button>
-                  <button className="cream" type="submit" disabled={busy || phase === "joining"}>{phase === "joining" ? "Joining" : dialog === "create" ? "Create" : "Join"}</button>
-                </div>
-              </form>
-            </div>
-          ) : null}
-          {dialog === "friend" ? (
-            <div className="picker" role="dialog" aria-modal="true" aria-label="Add a friend">
-              <form className="picker-card" onSubmit={(event) => { event.preventDefault(); addFriend(); }}>
-                <h2>Add a friend</h2>
-                <label>Name<input value={friendName} onChange={(event) => setFriendName(event.target.value)} /></label>
-                <label>Room you share<input value={friendRoom} onChange={(event) => setFriendRoom(event.target.value)} /></label>
-                <div className="dialog-actions">
-                  <button className="outline" type="button" onClick={() => setDialog(null)}>Cancel</button>
-                  <button className="cream" type="submit">Save</button>
-                </div>
-              </form>
-            </div>
-          ) : null}
         </div>
       );
 }
 
-      function Rail({page, onPage, mock = false}: {page: Page | null; onPage: (page: Page) => void; mock?: boolean }) {
-  if (mock) {
-    return (
-      <aside className="sidebar">
-        <button className="brand-mark" type="button" aria-label="Home" onClick={() => onPage("home")}>
-          <img src={discordMark} alt="" />
-        </button>
-        <button className={`nav-btn${page === "messages" ? " active" : ""}`} type="button" aria-label="Messages" onClick={() => onPage("messages")}>
-          <ChatBubbleIcon size={20} />
-        </button>
-        <button className="nav-btn plain" type="button" aria-label="Call">
-          <PhoneIcon size={20} />
-        </button>
-        <button className={`nav-btn plain rail-end${page === "settings" ? " active" : ""}`} type="button" aria-label="Settings" onClick={() => onPage("settings")}>
-          <SettingsIcon size={20} />
-        </button>
-      </aside>
-      );
-  }
-  const main = NAV.filter((item) => item.id !== "settings");
-      return (
-      <aside className="sidebar">
-        <button className="brand-mark" type="button" aria-label="Home" onClick={() => onPage("home")}>M</button>
-        <nav className="nav-list" aria-label="Sections">
-          {main.map((item) => (
-            <button key={item.id} className={`nav-btn${page === item.id ? " active" : ""}`} type="button" aria-label={item.label} onClick={() => onPage(item.id)}>
-              <item.icon size={22} />
-            </button>
-          ))}
-        </nav>
-        <button className={`nav-btn rail-end${page === "settings" ? " active" : ""}`} type="button" aria-label="Settings" onClick={() => onPage("settings")}>
-          <SettingsIcon size={22} />
-        </button>
-      </aside>
-      );
+function Rail({ prefsOpen, onPrefs, onTheme, onLogOut, dark }: { prefsOpen: boolean; onPrefs: () => void; onTheme: () => void; onLogOut: () => void; dark: boolean }) {
+  return (
+    <aside className="sidebar">
+      <div className="brand-mark" aria-label="Yatai">
+        <img src={ramenUrl} alt="" />
+      </div>
+      <button className="nav-btn active" type="button" aria-label="Messages">
+        <ChatBubbleIcon size={20} />
+      </button>
+      <button className="nav-btn plain" type="button" aria-label="Call">
+        <PhoneIcon size={20} />
+      </button>
+      <button className={`nav-btn plain rail-end${prefsOpen ? " active" : ""}`} type="button" aria-label="Settings" onClick={onPrefs}>
+        <SettingsIcon size={20} />
+      </button>
+      {prefsOpen ? (
+        <div className="mock-menu rail-pop" role="dialog" aria-label="Settings">
+          <button type="button" onClick={onTheme}>{dark ? "Light theme" : "Dark theme"}</button>
+          <button type="button" onClick={onLogOut}>Log out</button>
+        </div>
+      ) : null}
+    </aside>
+  );
 }
 
       function VolumeRow({label, value, onChange}: {label: string; value: number; onChange: (value: number) => void }) {
@@ -1605,15 +1476,6 @@ export function App() {
   return `@${name.toLowerCase().replace(/[^a-z0-9]+/g, "")}`;
 }
 
-      function friendHits(friends: {name: string; room: string }[], query: string) {
-  const needle = query.trim().toLowerCase().replace(/^@/, "");
-      if (!needle) return [];
-  const matches = friends.filter((friend) => friend.name.toLowerCase().includes(needle) || handleOf(friend.name).includes(needle));
-  if (matches.length > 0) return matches.slice(0, 4);
-      const typed = query.trim().replace(/^@/, "");
-      return typed ? [{name: typed, room: "" }] : [];
-}
-
       function clock(at: number) {
   return new Date(at).toLocaleTimeString([], {hour: "numeric", minute: "2-digit" }).replace(" AM", " am").replace(" PM", " pm");
 }
@@ -1635,51 +1497,6 @@ export function App() {
       return groups;
 }
 
-      function NoiseSwitch({on, onChange}: {on: boolean; onChange: (on: boolean) => void }) {
-  return (
-      <button className={`switch${on ? " on" : ""}`} type="button" role="switch" aria-checked={on} onClick={() => onChange(!on)}>
-        <span>Noise suppression</span>
-        <i />
-      </button>
-      );
-}
-
-      function DeviceSelect({label, value, devices, onChange}: {label: string; value: string; devices: Gear[]; onChange: (id: string) => void }) {
-  const known = devices.some((device) => device.id === value);
-      return (
-      <label>
-        {label}
-        <select aria-label={label} value={known ? value : ""} onChange={(event) => onChange(event.target.value)}>
-          <option value="">System default</option>
-          {devices.map((device) => (
-            <option key={device.id} value={device.id}>{device.name}</option>
-          ))}
-        </select>
-      </label>
-      );
-}
-
-      function conversationList(desk: Desk, query: string) {
-  const needle = query.trim().toLowerCase();
-      const map = new Map<string, {name: string; room: string; preview: string; at: number }>();
-      for (const friend of desk.friends) {
-        map.set(friend.name, { name: friend.name, room: friend.room, preview: "", at: friend.at });
-  }
-      for (const thread of desk.threads) {
-    const last = thread.notes[thread.notes.length - 1];
-      const current = map.get(thread.name);
-      map.set(thread.name, {
-        name: thread.name,
-      room: thread.room || current?.room || "",
-      preview: last?.text ?? "",
-      at: last?.at ?? current?.at ?? 0
-    });
-  }
-      return [...map.values()]
-    .filter((item) => item.name.toLowerCase().includes(needle) || item.preview.toLowerCase().includes(needle))
-    .sort((a, b) => b.at - a.at);
-}
-
       function Avatar({name, online = false, large = false, small = false}: {name: string; online?: boolean; large?: boolean; small?: boolean }) {
   return (
       <span className={`avatar${large ? " lg" : ""}${small ? " sm" : ""}`} style={{ background: faceColor(name) }}>
@@ -1689,28 +1506,3 @@ export function App() {
       );
 }
 
-      function FriendTabs({tab, setTab, online}: {tab: FriendTab; setTab: (tab: FriendTab) => void; online: number }) {
-  return (
-      <div className="tabs" role="tablist">
-        <button type="button" className={tab === "online" ? "on" : ""} onClick={() => setTab("online")}>Online {online}</button>
-        <button type="button" className={tab === "all" ? "on" : ""} onClick={() => setTab("all")}>All</button>
-        <button type="button" className={tab === "requests" ? "on" : ""} onClick={() => setTab("requests")}>Requests</button>
-      </div>
-      );
-}
-
-      function FriendRows({friends, tab, online, onCall, onShare}: {friends: Friend[]; tab: FriendTab; online: Set<string>; onCall: (friend: Friend) => void; onShare: (friend: Friend) => void }) {
-  if (tab === "requests") return <p className="empty">No requests. Add someone you already share a room with.</p>;
-        if (friends.length === 0) return <p className="empty">{tab === "online" ? "No one from your list is in a room with you." : "Add someone, then call the room you both use."}</p>;
-  return friends.map((friend) => (
-        <div className="friend" key={friend.name}>
-          <Avatar name={friend.name} online={online.has(friend.name)} />
-          <span className="friend-copy">
-            <strong>{friend.name}</strong>
-            <span>{online.has(friend.name) ? "In the room" : `${friend.room} · ${ago(friend.at)}`}</span>
-          </span>
-          <button className="mini-action" type="button" aria-label={`Share with ${friend.name}`} onClick={() => onShare(friend)}><MonitorIcon size={18} /></button>
-          <button className="mini-action" type="button" aria-label={`Call ${friend.name}`} onClick={() => onCall(friend)}><PhoneIcon size={18} /></button>
-        </div>
-        ));
-}

@@ -264,6 +264,7 @@ pub fn account_blocking(body: &serde_json::Value) -> Result<AccountSession> {
         Some("login") => "login",
         Some("session") => "session",
         Some("logout") => "logout",
+        Some("here") => "here",
         _ => anyhow::bail!("unknown account action"),
     };
     let api_base_url = std::env::var("API_BASE_URL")
@@ -294,4 +295,35 @@ pub fn account_blocking(body: &serde_json::Value) -> Result<AccountSession> {
         anyhow::bail!(message);
     }
     serde_json::from_str(&text).context("account response parse failed")
+}
+
+/// Usernames of people who are signed in right now and match the start of `query`.
+pub fn people_blocking(session: &str, query: &str) -> Result<Vec<String>> {
+    let api_base_url = std::env::var("API_BASE_URL")
+        .unwrap_or_else(|_| "https://dcmax-token.soniavyukt.workers.dev".to_string());
+    let url = format!("{}/people", api_base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .context("account client")?;
+    let response = authed_blocking(client.post(url), Some(session))
+        .json(&serde_json::json!({ "query": query, "session": session }))
+        .send()
+        .context("Could not reach the account service.")?;
+    let status = response.status();
+    let text = response.text().context("account response")?;
+    if !status.is_success() {
+        anyhow::bail!("The account service did not accept that.");
+    }
+    let value: serde_json::Value = serde_json::from_str(&text).context("account response parse failed")?;
+    Ok(value
+        .get("people")
+        .and_then(|item| item.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
 }

@@ -40,6 +40,12 @@ export default {
     if (request.method === "POST" && url.pathname === "/logout") {
       return cors(await logout(request, env));
     }
+    if (request.method === "POST" && url.pathname === "/here") {
+      return cors(await here(request, env));
+    }
+    if (request.method === "POST" && url.pathname === "/people") {
+      return cors(await people(request, env));
+    }
     return cors(new Response("not found", { status: 404 }));
   },
 };
@@ -103,11 +109,51 @@ async function session(request, env) {
   if (body.error) return body.error;
   const user = await userForRequest(request, database, body);
   if (!user) return Response.json({ error: "Sign in again." }, { status: 401 });
+  await markSeen(database, user.username);
   return Response.json({
     username: user.username,
     email: user.email,
     session: bearer(request) || String(body.value.session ?? ""),
   });
+}
+
+async function here(request, env) {
+  const database = await accounts(env);
+  if (database.error) return database.error;
+  const body = await readJson(request);
+  if (body.error) return body.error;
+  const user = await userForRequest(request, database, body);
+  if (!user) return Response.json({ error: "Sign in again." }, { status: 401 });
+  await markSeen(database, user.username);
+  return Response.json({ username: user.username, email: "", session: "" });
+}
+
+async function people(request, env) {
+  const database = await accounts(env);
+  if (database.error) return database.error;
+  const body = await readJson(request);
+  if (body.error) return body.error;
+  const user = await userForRequest(request, database, body);
+  if (!user) return Response.json({ error: "Sign in again." }, { status: 401 });
+  await markSeen(database, user.username);
+  const query = String(body.value.query ?? "").trim().replace(/^@/, "").slice(0, 32);
+  if (query.length < 2) return Response.json({ people: [] });
+  const pattern = `^${query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`;
+  const since = new Date(Date.now() - 90_000);
+  const found = await database.users
+    .find(
+      { username: { $regex: pattern, $options: "i" }, lastSeen: { $gt: since } },
+      { projection: { username: 1, _id: 0 }, limit: 8 },
+    )
+    .toArray();
+  const names = found
+    .map((item) => item.username)
+    .filter((name) => name && name.toLowerCase() !== user.username.toLowerCase());
+  return Response.json({ people: names });
+}
+
+async function markSeen(database, username) {
+  await database.users.updateOne({ username }, { $set: { lastSeen: new Date() } });
 }
 
 async function logout(request, env) {

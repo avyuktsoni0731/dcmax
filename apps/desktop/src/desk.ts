@@ -1,6 +1,6 @@
 export type RecentRoom = { room: string; people: number; at: number };
 
-export type Friend = { name: string; room: string; at: number };
+export type Friend = { name: string; room: string; at: number; added?: boolean };
 
 export type Mail = { id: string; author: string; text: string; at: number };
 
@@ -22,7 +22,7 @@ export function loadDesk(): Desk {
     const parsed = JSON.parse(raw) as Partial<Desk>;
     return {
       recents: Array.isArray(parsed.recents) ? parsed.recents : [],
-      friends: Array.isArray(parsed.friends) ? parsed.friends : [],
+      friends: Array.isArray(parsed.friends) ? parsed.friends.flatMap(readFriend) : [],
       threads: Array.isArray(parsed.threads) ? parsed.threads : []
     };
   } catch {
@@ -32,6 +32,17 @@ export function loadDesk(): Desk {
 
 export function saveDesk(desk: Desk) {
   localStorage.setItem(KEY, JSON.stringify(desk));
+}
+
+function readFriend(value: Partial<Friend> | null): Friend[] {
+  if (!value || typeof value.name !== "string" || !value.name.trim()) return [];
+  const friend: Friend = {
+    name: value.name,
+    room: typeof value.room === "string" ? value.room : "",
+    at: typeof value.at === "number" ? value.at : 0
+  };
+  if (value.added === true) friend.added = true;
+  return [friend];
 }
 
 export function ago(at: number) {

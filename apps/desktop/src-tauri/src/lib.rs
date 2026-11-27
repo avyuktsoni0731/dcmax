@@ -332,6 +332,17 @@ fn account(body: AccountBody) -> Result<native_sender::AccountSession, String> {
     native_sender::account_blocking(&payload).map_err(|err| err.to_string())
 }
 
+#[derive(Deserialize)]
+struct PeopleBody {
+    session: String,
+    query: String,
+}
+
+#[tauri::command]
+fn people(body: PeopleBody) -> Result<Vec<String>, String> {
+    native_sender::people_blocking(&body.session, &body.query).map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 fn stage_rect(state: State<DesktopState>, body: RectBody) -> Result<(), String> {
     let mut rect = state.rect.lock().map_err(|_| "the stage is unavailable".to_string())?;
@@ -744,6 +755,7 @@ pub fn run() {
             profile,
             remember,
             account,
+            people,
             stage_rect,
             screens
         ])
@@ -760,7 +772,7 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("MyCord failed to start")
+        .expect("Yatai failed to start")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 if let Some(state) = app.try_state::<DesktopState>() {
