@@ -1028,6 +1028,21 @@ input[type="range"] {
 }
 .app.mock .thread-row:hover { background: rgba(255, 255, 255, 0.04); }
 .app.mock .thread-row strong { font-size: 14px; font-weight: 700; }
+.app.mock .thread-copy span {
+  color: rgba(255, 255, 255, 0.55);
+  font-family: "Work Sans", sans-serif;
+  font-size: 12px;
+}
+.app.mock .thread-start {
+  margin: auto;
+  max-width: 280px;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.72);
+  font-family: "Plus Jakarta Sans", sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+.app.mock .composer .hint { color: #ffb4b4; padding: 0 4px 8px; }
 .app.mock .thread-row.active,
 .app.mock .thread-row.active:hover { background: rgba(0, 0, 0, 0.3); }
 .thread-row .avatar, .dm-you .avatar, .thread-top .avatar { width: 40px; height: 40px; font-size: 13px; }

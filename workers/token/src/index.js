@@ -49,6 +49,9 @@ export default {
     if (request.method === "POST" && url.pathname === "/circle") {
       return cors(await circle(request, env));
     }
+    if (request.method === "POST" && url.pathname === "/chat") {
+      return cors(await chat(request, env));
+    }
     return cors(new Response("not found", { status: 404 }));
   },
 };
@@ -235,6 +238,147 @@ async function circle(request, env) {
   }
 }
 
+function pairKey(a, b) {
+  return [a.toLowerCase(), b.toLowerCase()].sort().join("|");
+}
+
+function noteOf(row) {
+  const at = row.at instanceof Date ? row.at.getTime() : Number(row.at) || 0;
+  return { id: row.id, author: row.from, to: row.to, text: row.text, at };
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function inboxOf(database, me) {
+  const friends = await database.friendships
+    .find({ user: me }, { projection: { friend: 1, _id: 0 } })
+    .limit(40)
+    .toArray();
+  const rows = [];
+  for (const friend of friends) {
+    const peer = friend.friend;
+    if (!peer) continue;
+    const pair = pairKey(me, peer);
+    const last = await database.messages.find({ pair }).sort({ at: -1 }).limit(1).next();
+    if (!last) continue;
+    const read = await database.reads.findOne({ user: me, peer }, { projection: { at: 1, _id: 0 } });
+    const since = read?.at instanceof Date ? read.at : new Date(0);
+    const unread = await database.messages.countDocuments({ pair, from: peer, at: { $gt: since } });
+    rows.push({ name: peer, text: last.text, at: noteOf(last).at, unread, from: last.from });
+  }
+  return rows;
+}
+
+async function messagesAfter(database, pair, after) {
+  if (!after) {
+    const rows = await database.messages.find({ pair }).sort({ at: -1 }).limit(80).toArray();
+    return rows.reverse();
+  }
+  return database.messages.find({ pair, at: { $gt: new Date(after) } }).sort({ at: 1 }).limit(80).toArray();
+}
+
+async function incomingAfter(database, me, after) {
+  if (!after) {
+    const rows = await database.messages.find({ to: me }).sort({ at: -1 }).limit(1).toArray();
+    return rows;
+  }
+  return database.messages.find({ to: me, at: { $gt: new Date(after) } }).sort({ at: 1 }).limit(40).toArray();
+}
+
+async function chat(request, env) {
+  const database = await accounts(env);
+  if (database.error) return database.error;
+  try {
+    const body = await readJson(request);
+    if (body.error) return body.error;
+    const user = await userForRequest(request, database, body);
+    if (!user) return Response.json({ error: "Sign in again." }, { status: 401 });
+    await markSeen(database, user.username);
+    const me = user.username;
+    const action = String(body.value.action ?? "");
+    if (action === "send") {
+      const other = await namedUser(database, body.value.username);
+      if (!other) return Response.json({ error: "No one uses that username." }, { status: 404 });
+      if (other.username.toLowerCase() === me.toLowerCase()) {
+        return Response.json({ error: "You can't message yourself." }, { status: 400 });
+      }
+      const friend = await database.friendships.findOne(
+        { user: me, friend: other.username },
+        { collation: NAME, projection: { _id: 1 } },
+      );
+      if (!friend) return Response.json({ error: "Add each other before chatting." }, { status: 403 });
+      const text = String(body.value.text ?? "").trim();
+      if (!text || text.length > 2000) {
+        return Response.json({ error: "That message needs between 1 and 2000 characters." }, { status: 400 });
+      }
+      const given = String(body.value.id ?? "");
+      const id = /^[A-Za-z0-9_-]{8,64}$/.test(given) ? given : newSecret();
+      const pair = pairKey(me, other.username);
+      let row = await database.messages.findOne({ id });
+      if (!row) {
+        row = { id, pair, from: me, to: other.username, text, at: new Date() };
+        try {
+          await database.messages.insertOne(row);
+        } catch (err) {
+          if (!err || err.code !== 11000) return Response.json({ error: "The message could not be saved." }, { status: 500 });
+          row = await database.messages.findOne({ id });
+        }
+      }
+      return Response.json({ messages: row ? [noteOf(row)] : [], inbox: await inboxOf(database, me), full: false });
+    }
+    if (action === "sync") {
+      const wanted = String(body.value.username ?? "").trim();
+      let other = null;
+      if (wanted) {
+        other = await namedUser(database, wanted);
+        if (other && other.username.toLowerCase() === me.toLowerCase()) other = null;
+        if (other) {
+          const friend = await database.friendships.findOne(
+            { user: me, friend: other.username },
+            { collation: NAME, projection: { _id: 1 } },
+          );
+          if (!friend) other = null;
+        }
+      }
+      const after = Number(body.value.after) || 0;
+      const hold = body.value.wait === true;
+      const full = Boolean(other) && !after;
+      let rows = [];
+      const deadline = Date.now() + (hold ? 5000 : 0);
+      const pair = other ? pairKey(me, other.username) : "";
+      do {
+        rows = pair
+          ? await messagesAfter(database, pair, after)
+          : await incomingAfter(database, me, after);
+        if (rows.length || Date.now() >= deadline) break;
+        await wait(320);
+      } while (Date.now() < deadline);
+      if (other && body.value.read === true) {
+        const newest = rows.length ? rows[rows.length - 1].at : new Date();
+        try {
+          await database.reads.updateOne(
+            { user: me, peer: other.username },
+            { $set: { at: newest } },
+            { upsert: true },
+          );
+        } catch (err) {
+          if (!err || err.code !== 11000) throw err;
+        }
+      }
+      return Response.json({
+        messages: rows.map(noteOf),
+        inbox: await inboxOf(database, me),
+        full,
+      });
+    }
+    return Response.json({ error: "Unknown chat action." }, { status: 400 });
+  } finally {
+    await release(database);
+  }
+}
+
 async function namedUser(database, username) {
   const name = String(username ?? "").trim().replace(/^@/, "");
   if (!/^[A-Za-z0-9_-]{2,32}$/.test(name)) return null;
@@ -324,7 +468,7 @@ async function accounts(env) {
   const client = new MongoClient(env.MONGODB_URI, {
     serverSelectionTimeoutMS: 5000,
     connectTimeoutMS: 5000,
-    socketTimeoutMS: 8000,
+    socketTimeoutMS: 20000,
     maxPoolSize: 1,
     family: 4,
   });
@@ -349,6 +493,10 @@ async function accounts(env) {
           { user: 1, friend: 1 },
           { unique: true, collation: NAME },
         ),
+        database.collection("messages").createIndex({ pair: 1, at: 1 }),
+        database.collection("messages").createIndex({ to: 1, at: 1 }),
+        database.collection("messages").createIndex({ id: 1 }, { unique: true }),
+        database.collection("reads").createIndex({ user: 1, peer: 1 }, { unique: true }),
       ]);
       globalThis.__mycordReady = true;
     }
@@ -357,6 +505,8 @@ async function accounts(env) {
       sessions: database.collection("sessions"),
       requests: database.collection("requests"),
       friendships: database.collection("friendships"),
+      messages: database.collection("messages"),
+      reads: database.collection("reads"),
       close: () => client.close(),
     };
   } catch {

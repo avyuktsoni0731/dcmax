@@ -57,6 +57,28 @@ const BITRATES = [8000, 12000, 20000, 40000, 80000, 100000];
 
 type Ask = { name: string; direction: "in" | "out" };
 type Circle = { friends: string[]; incoming: string[]; outgoing: string[] };
+type ChatNote = { id: string; author: string; to: string; text: string; at: number };
+type ChatRow = { name: string; text: string; at: number; unread: number; from: string };
+type ChatSync = { messages: ChatNote[]; inbox: ChatRow[]; full: boolean };
+
+function openEmojiPanel() {
+  const field = document.getElementById("composer-field");
+  if (field instanceof HTMLInputElement) field.focus();
+  window.setTimeout(() => {
+    void invoke("emoji_panel").catch(() => {});
+  }, 40);
+}
+
+function blendNotes(existing: Mail[], incoming: Mail[], replace: boolean) {
+  if (!replace) {
+    const map = new Map(existing.map((mail) => [mail.id, mail]));
+    for (const mail of incoming) map.set(mail.id, mail);
+    return [...map.values()].sort((a, b) => a.at - b.at).slice(-200);
+  }
+  const ids = new Set(incoming.map((mail) => mail.id));
+  const pending = existing.filter((mail) => !ids.has(mail.id) && Date.now() - mail.at < 20000);
+  return [...incoming, ...pending].sort((a, b) => a.at - b.at).slice(-200);
+}
 
 function pairRoom(mine: string, theirs: string) {
   const names = [mine, theirs]
@@ -155,6 +177,8 @@ export function App() {
   const [friendQuery, setFriendQuery] = useState("");
   const [foundPeople, setFoundPeople] = useState<string[]>([]);
   const [friendNote, setFriendNote] = useState("");
+  const [chatNote, setChatNote] = useState("");
+  const [inbox, setInbox] = useState<ChatRow[]>([]);
   const [looking, setLooking] = useState(false);
   const sharingRef = useRef(false);
   const remotesRef = useRef<Set<string> | null>(null);
@@ -162,6 +186,8 @@ export function App() {
   const roomRef = useRef(room);
   const pendingShare = useRef(false);
   const heard = useRef({ voice: 100, screen: 100 });
+  const transcriptRef = useRef<HTMLDivElement>(null);
+  const stickTranscript = useRef(true);
   const shareRef = useRef<() => Promise<void>>(async () => { });
   const panelRef = useRef<HTMLDivElement>(null);
   const micMenuRef = useRef<HTMLDivElement>(null);
@@ -771,6 +797,48 @@ export function App() {
   }, [session]);
 
   useEffect(() => {
+    if (!session) return;
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has("preview")) return;
+    let cancel = false;
+    const watch = active;
+    let after = 0;
+    const run = (hold: boolean) => {
+      if (cancel) return;
+      const saved = localStorage.getItem("mycord.session");
+      if (!saved || saved === "1") return;
+      const mine = (localStorage.getItem("mycord.user") || name).trim();
+      void invoke<ChatSync>("chat", {
+        body: { session: saved, action: "sync", username: watch ?? "", text: "", id: "", after, read: Boolean(watch), wait: hold }
+      })
+        .then((sync) => {
+          if (cancel) return;
+          applyChat(sync, watch, mine);
+          const previous = after;
+          after = sync.messages.reduce((latest, mail) => Math.max(latest, mail.at), after);
+          if (hold && after === previous) {
+            window.setTimeout(() => run(true), 1000);
+            return;
+          }
+          run(true);
+        })
+        .catch(() => {
+          if (!cancel) window.setTimeout(() => run(true), 1500);
+        });
+    };
+    run(false);
+    return () => {
+      cancel = true;
+    };
+  }, [session, active]);
+
+  const transcriptMark = `${active ?? ""}:${phase}:${desk.threads.find((item) => item.name.toLowerCase() === (active ?? "").toLowerCase())?.notes.length ?? 0}`;
+  useLayoutEffect(() => {
+    const node = transcriptRef.current;
+    if (!node || !stickTranscript.current) return;
+    node.scrollTop = node.scrollHeight;
+  }, [transcriptMark]);
+
+  useEffect(() => {
     const typed = (friendOpen ? friendQuery : query).trim().replace(/^@/, "");
     if (typed.length < 2) {
       setFoundPeople([]);
@@ -898,26 +966,94 @@ export function App() {
     void postCircle(direction === "in" ? "reject" : "cancel", askName).catch((err: unknown) => setFriendNote(accountError(err)));
   }
 
+  function focusThread(who: string) {
+    setActive(who);
+    setChatNote("");
+    stickTranscript.current = true;
+    setInbox((current) => current.map((row) => (row.name.toLowerCase() === who.toLowerCase() ? { ...row, unread: 0 } : row)));
+  }
+
   function openFriend(friend: { name: string; room: string }) {
-    setActive(friend.name);
+    focusThread(friend.name);
     commit((current) => {
-      if (current.threads.some((item) => item.name === friend.name)) return current;
+      if (current.threads.some((item) => item.name.toLowerCase() === friend.name.toLowerCase())) return current;
       return { ...current, threads: [{ name: friend.name, room: friend.room, notes: [] }, ...current.threads] };
     });
   }
 
+  function applyChat(sync: ChatSync, watch: string | null, mine: string) {
+    setInbox(sync.inbox.map((row) => (
+      watch && row.name.toLowerCase() === watch.toLowerCase() ? { ...row, unread: 0 } : row
+    )));
+    if (!sync.messages.length && !sync.full) return;
+    commit((current) => {
+      const buckets = new Map<string, { name: string; notes: Mail[] }>();
+      for (const mail of sync.messages) {
+        const peer = mail.author.toLowerCase() === mine.toLowerCase() ? mail.to : mail.author;
+        const key = peer.toLowerCase();
+        const bucket = buckets.get(key) ?? { name: peer, notes: [] };
+        bucket.notes.push({ id: mail.id, author: mail.author, text: mail.text, at: mail.at });
+        buckets.set(key, bucket);
+      }
+      let threads = current.threads;
+      if (sync.full && watch) {
+        const key = watch.toLowerCase();
+        const bucket = buckets.get(key);
+        buckets.delete(key);
+        threads = placeThread(threads, bucket?.name || watch, bucket?.notes ?? [], true, mine);
+      }
+      for (const bucket of buckets.values()) threads = placeThread(threads, bucket.name, bucket.notes, false, mine);
+      return { ...current, threads };
+    });
+  }
+
+  function placeThread(threads: Desk["threads"], peer: string, incoming: Mail[], replace: boolean, mine: string) {
+    const key = peer.toLowerCase();
+    const index = threads.findIndex((item) => item.name.toLowerCase() === key);
+    const existing = index >= 0 ? threads[index] : null;
+    const notes = blendNotes(existing?.notes ?? [], incoming, replace);
+    const next = { name: existing?.name || peer, room: existing?.room || pairRoom(mine, peer), notes };
+    if (index < 0) return [next, ...threads].slice(0, 40);
+    return threads.map((item, at) => (at === index ? next : item));
+  }
+
   function sendNote(who: string, roomName: string) {
     const text = draft.trim();
-    if (!text) return;
-    const mail = { id: `${Date.now()}`, author: name.trim() || "You", text, at: Date.now() };
+    if (!text || text.length > 2000) return;
+    const mine = name.trim() || "You";
+    const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    const mail = { id, author: mine, text, at: Date.now() };
     commit((current) => {
-      const existing = current.threads.find((thread) => thread.name === who);
+      const existing = current.threads.find((thread) => thread.name.toLowerCase() === who.toLowerCase());
       const threads = existing
-        ? current.threads.map((thread) => (thread.name === who ? { ...thread, room: roomName || thread.room, notes: [...thread.notes, mail] } : thread))
+        ? current.threads.map((thread) => (thread.name.toLowerCase() === who.toLowerCase() ? { ...thread, room: roomName || thread.room, notes: [...thread.notes, mail] } : thread))
         : [{ name: who, room: roomName, notes: [mail] }, ...current.threads];
       return { ...current, threads };
     });
     setDraft("");
+    setChatNote("");
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has("preview")) return;
+    const saved = localStorage.getItem("mycord.session");
+    if (!saved || saved === "1") {
+      setChatNote("Sign in again.");
+      return;
+    }
+    void invoke<ChatSync>("chat", {
+      body: { session: saved, action: "send", username: who, text, id, after: 0, read: true, wait: false }
+    })
+      .then((sync) => applyChat(sync, who, mine))
+      .catch((err: unknown) => {
+        commit((current) => ({
+          ...current,
+          threads: current.threads.map((thread) => (
+            thread.name.toLowerCase() === who.toLowerCase()
+              ? { ...thread, notes: thread.notes.filter((item) => item.id !== id) }
+              : thread
+          ))
+        }));
+        setDraft((current) => (current.trim() ? current : text));
+        setChatNote(accountError(err));
+      });
   }
 
   function tune(next: Partial<{ resolution: number; fps: number; bitrate: number }>) {
@@ -1399,12 +1535,25 @@ export function App() {
   const needle = query.trim().toLowerCase().replace(/^@/, "");
   const added = desk.friends.filter((friend) => friend.added);
   const friendRows = added.filter((friend) => !needle || friend.name.toLowerCase().includes(needle) || handleOf(friend.name).includes(needle));
-  const direct = desk.threads.filter((item) => {
-    const known = added.some((friend) => friend.name.toLowerCase() === item.name.toLowerCase());
-    return known && (!needle || item.name.toLowerCase().includes(needle) || handleOf(item.name).includes(needle));
-  });
-  const selectedName = direct.some((item) => item.name === active) ? active : null;
-  const selected = direct.find((item) => item.name === selectedName) ?? null;
+  const direct = added
+    .map((friend) => {
+      const saved = desk.threads.find((item) => item.name.toLowerCase() === friend.name.toLowerCase());
+      const row = inbox.find((item) => item.name.toLowerCase() === friend.name.toLowerCase());
+      const last = saved?.notes[saved.notes.length - 1];
+      const author = last?.author || row?.from || "";
+      const text = last?.text || row?.text || "";
+      return {
+        name: friend.name,
+        room: friend.room || saved?.room || "",
+        text,
+        at: Math.max(last?.at ?? 0, row?.at ?? 0),
+        unread: friend.name === active ? 0 : row?.unread ?? 0,
+        mine: author.toLowerCase() === name.trim().toLowerCase()
+      };
+    })
+    .filter((item) => (item.text || item.unread > 0 || item.name === active) && (!needle || item.name.toLowerCase().includes(needle) || handleOf(item.name).includes(needle)))
+    .sort((a, b) => b.at - a.at);
+  const selected = added.find((friend) => friend.name === active) ?? null;
   const thread = selected ? desk.threads.find((item) => item.name.toLowerCase() === selected.name.toLowerCase()) : null;
   const already = new Set(added.map((friend) => friend.name.toLowerCase()));
   const waiting = new Set(asks.map((ask) => ask.name.toLowerCase()));
@@ -1432,13 +1581,14 @@ export function App() {
                         <p className="dm-label">Direct Messages</p>
                         {needle && direct.length === 0 ? <p className="empty">No matches.</p> : null}
                         {direct.map((item) => {
-                          const count = item.notes.length;
-                          const badge = item.name === selectedName || count === 0 ? "" : count > 9 ? "9+" : String(count);
+                          const badge = item.unread > 0 ? (item.unread > 9 ? "9+" : String(item.unread)) : "";
+                          const preview = item.text ? (item.mine ? `You: ${item.text}` : item.text) : "Start a conversation";
                           return (
-                            <button className={`thread-row${item.name === selectedName ? " active" : ""}`} type="button" key={item.name} onClick={() => setActive(item.name)}>
+                            <button className={`thread-row${item.name === selected?.name ? " active" : ""}`} type="button" key={item.name} onClick={() => focusThread(item.name)}>
                               <Avatar name={item.name} />
                               <span className="thread-copy">
                                 <strong>{item.name}</strong>
+                                <span>{preview}</span>
                               </span>
                               {badge ? <span className="badge">{badge}</span> : null}
                             </button>
@@ -1478,8 +1628,11 @@ export function App() {
                               <button type="button" aria-label="Call"><PhoneIcon size={18} /></button>
                             </span>
                           </header>
-                          <div className="transcript">
-                            {noteDays(thread?.notes ?? []).map((group) => (
+                          <div className="transcript" ref={transcriptRef} onScroll={(event) => {
+                            const node = event.currentTarget;
+                            stickTranscript.current = node.scrollHeight - node.scrollTop - node.clientHeight < 160;
+                          }}>
+                            {(thread?.notes.length ?? 0) === 0 ? <p className="thread-start">This is the start of your conversation with {selected.name}.</p> : noteDays(thread?.notes ?? []).map((group) => (
                               <div key={group.day}>
                                 <div className="day"><span /><em>{group.day}</em><span /></div>
                                 {group.notes.map((mail) => {
@@ -1499,10 +1652,11 @@ export function App() {
                             ))}
                           </div>
                           <div className="composer">
+                            {chatNote ? <p className="hint">{chatNote}</p> : null}
                             <form onSubmit={(event) => { event.preventDefault(); sendNote(selected.name, selected.room); }}>
-                              <input aria-label={`Message ${selected.name}`} placeholder={`Message to ${selected.name}`} value={draft} spellCheck={false} autoCorrect="off" autoCapitalize="off" onChange={(event) => setDraft(event.target.value)} />
-                              <button className="emoji" type="button" aria-label="Add an emoji" onClick={() => setDraft((current) => `${current}✨`)}><SmileIcon size={18} /></button>
-                              <button className="send" type="submit" aria-label="Save note"><SendIcon size={18} /></button>
+                              <input id="composer-field" aria-label={`Message ${selected.name}`} placeholder={`Message to ${selected.name}`} value={draft} spellCheck={false} autoCorrect="off" autoCapitalize="off" onChange={(event) => setDraft(event.target.value)} />
+                              <button className="emoji" type="button" aria-label="Add an emoji" onMouseDown={(event) => event.preventDefault()} onClick={openEmojiPanel}><SmileIcon size={18} /></button>
+                              <button className="send" type="submit" aria-label="Send message"><SendIcon size={18} /></button>
                             </form>
                           </div>
                         </>

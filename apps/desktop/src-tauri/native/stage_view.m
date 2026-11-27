@@ -104,3 +104,10 @@ void dcmax_stage_holes(void *ns_view, const double *xywh, int count, double radi
         CGPathRelease(path);
     }
 }
+
+// The system Emoji & Symbols panel. Chosen characters insert into the focused field.
+void dcmax_emoji_panel(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSApplication sharedApplication] orderFrontCharacterPalette:nil];
+    });
+}

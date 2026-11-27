@@ -522,3 +522,19 @@ extern "C" int dcmax_stage_draw_nv12(void* window, const uint8_t* y, const uint8
     (void)y_bytes;
     return 0;
 }
+
+// Win+. is the system emoji panel. It types into whichever field is focused.
+extern "C" void dcmax_emoji_panel(void) {
+    INPUT chord[4] = {};
+    chord[0].type = INPUT_KEYBOARD;
+    chord[0].ki.wVk = VK_LWIN;
+    chord[1].type = INPUT_KEYBOARD;
+    chord[1].ki.wVk = VK_OEM_PERIOD;
+    chord[2].type = INPUT_KEYBOARD;
+    chord[2].ki.wVk = VK_OEM_PERIOD;
+    chord[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    chord[3].type = INPUT_KEYBOARD;
+    chord[3].ki.wVk = VK_LWIN;
+    chord[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, chord, sizeof(INPUT));
+}

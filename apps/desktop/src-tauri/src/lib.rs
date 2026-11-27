@@ -373,6 +373,43 @@ async fn circle(body: CircleBody) -> Result<native_sender::Circle, String> {
     .map_err(|err| err.to_string())?
 }
 
+#[derive(Deserialize)]
+struct ChatBody {
+    session: String,
+    action: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    after: i64,
+    #[serde(default)]
+    read: bool,
+    #[serde(default)]
+    wait: bool,
+}
+
+#[tauri::command]
+async fn chat(body: ChatBody) -> Result<native_sender::ChatSync, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        native_sender::chat_blocking(
+            &body.session,
+            &body.action,
+            &body.username,
+            &body.text,
+            &body.id,
+            body.after,
+            body.read,
+            body.wait,
+        )
+        .map_err(|err| err.to_string())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
 #[tauri::command]
 fn stage_rect(state: State<DesktopState>, body: RectBody) -> Result<(), String> {
     let mut rect = state.rect.lock().map_err(|_| "the stage is unavailable".to_string())?;
@@ -408,6 +445,17 @@ struct ScreenInfo {
     label: String,
     width: u32,
     height: u32,
+}
+
+#[tauri::command]
+fn emoji_panel() {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        extern "C" {
+            fn dcmax_emoji_panel();
+        }
+        unsafe { dcmax_emoji_panel() }
+    }
 }
 
 #[tauri::command]
@@ -800,8 +848,10 @@ pub fn run() {
             account,
             people,
             circle,
+            chat,
             stage_rect,
-            screens
+            screens,
+            emoji_panel
         ])
         .setup(|app| {
             let engine = native_sender::Engine::start().map_err(|err| err.to_string())?;

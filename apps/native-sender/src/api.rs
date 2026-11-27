@@ -365,3 +365,72 @@ pub fn circle_blocking(session: &str, action: &str, username: &str) -> Result<Ci
     }
     serde_json::from_str(&text).context("account response parse failed")
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatNote {
+    pub id: String,
+    pub author: String,
+    pub to: String,
+    pub text: String,
+    pub at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatRow {
+    pub name: String,
+    pub text: String,
+    pub at: i64,
+    pub unread: i64,
+    pub from: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatSync {
+    pub messages: Vec<ChatNote>,
+    pub inbox: Vec<ChatRow>,
+    pub full: bool,
+}
+
+/// Send one message, or wait briefly for new ones in a thread.
+pub fn chat_blocking(
+    session: &str,
+    action: &str,
+    username: &str,
+    text: &str,
+    id: &str,
+    after: i64,
+    read: bool,
+    wait: bool,
+) -> Result<ChatSync> {
+    let api_base_url = std::env::var("API_BASE_URL")
+        .unwrap_or_else(|_| "https://dcmax-token.soniavyukt.workers.dev".to_string());
+    let url = format!("{}/chat", api_base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .context("account client")?;
+    let response = authed_blocking(client.post(url), Some(session))
+        .json(&serde_json::json!({
+            "action": action,
+            "username": username,
+            "text": text,
+            "id": id,
+            "after": after,
+            "read": read,
+            "wait": wait,
+            "session": session,
+        }))
+        .send()
+        .context("Could not reach the account service.")?;
+    let status = response.status();
+    let body = response.text().context("account response")?;
+    if !status.is_success() {
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("error").and_then(|item| item.as_str()).map(str::to_string))
+            .filter(|item| !item.trim().is_empty())
+            .unwrap_or_else(|| "The account service did not accept that.".to_string());
+        anyhow::bail!(message);
+    }
+    serde_json::from_str(&body).context("account response parse failed")
+}
