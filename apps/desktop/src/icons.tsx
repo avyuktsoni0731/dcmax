@@ -27,8 +27,7 @@ export function MicIcon(props: IconProps) {
 export function MicOffIcon(props: IconProps) {
   return (
     <Glyph {...props}>
-      <Fill d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 2.76-2.24 5-5 5s-5-2.24-5-5H5.3c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
-      <path fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" d="M5 5.2 19 19" />
+      <Fill d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3 3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z" />
     </Glyph>
   );
 }
@@ -178,6 +177,70 @@ export function HeadphonesIcon(props: IconProps) {
 }
 
 export function ArrowIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+    </Glyph>
+  );
+}
+
+export function ChatBubbleIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z" />
+    </Glyph>
+  );
+}
+
+export function ForumIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M21 6h-2v9H6v2c0 .55.45 1 1 1h11l4 4V7c0-.55-.45-1-1-1zm-4 6V3c0-.55-.45-1-1-1H3c-.55 0-1 .45-1 1v14l4-4h10c.55 0 1-.45 1-1z" />
+    </Glyph>
+  );
+}
+
+export function PhoneInTalkIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M20 15.5c-1.25 0-2.45-.2-3.57-.57-.35-.11-.74-.03-1.02.24l-2.2 2.2c-2.83-1.44-5.15-3.75-6.59-6.59l2.2-2.21c.28-.26.36-.65.25-1C8.7 6.45 8.5 5.25 8.5 4c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1 0 9.39 7.61 17 17 17 .55 0 1-.45 1-1v-3.5c0-.55-.45-1-1-1zM19 12h2c0-4.97-4.03-9-9-9v2c3.87 0 7 3.13 7 7zm-4 0h2c0-2.76-2.24-5-5-5v2c1.66 0 3 1.34 3 3z" />
+    </Glyph>
+  );
+}
+
+export function PersonSearchIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M10 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h9.35c-.22-.63-.35-1.3-.35-2 0-2.21 1.79-4 4-4 .22 0 .43.02.64.05C14.07 13.34 12.11 14 10 14zm11.5 1.5c-1.93 0-3.5 1.57-3.5 3.5s1.57 3.5 3.5 3.5 3.5-1.57 3.5-3.5-1.57-3.5-3.5-3.5zm5.5 6.49-.01.01L22 21.5c-.28.28-.72.28-1 0l-1.4-1.4c-.6.47-1.34.74-2.1.74-2.21 0-4-1.79-4-4s1.79-4 4-4 4 1.79 4 4c0 .76-.27 1.5-.74 2.1l1.4 1.4c.28.28.28.72 0 1z" />
+    </Glyph>
+  );
+}
+
+export function EmojiPeopleIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M12 6c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2v1.5l-1.59-1.59a.996.996 0 1 0-1.41 1.41L10.17 14H8.5c-.83 0-1.5.67-1.5 1.5S7.67 17 8.5 17H11v5h2v-5h2.5c.83 0 1.5-.67 1.5-1.5s-.67-1.5-1.5-1.5h-1.67l3.17-3.18a.996.996 0 1 0-1.41-1.41L14 11.5V10c0-1.1-.9-2-2-2z" />
+    </Glyph>
+  );
+}
+
+export function VideoIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M15 8v8H5V8h10m1-2H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4V7c0-.55-.45-1-1-1z" />
+    </Glyph>
+  );
+}
+
+export function SmileIcon(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <Fill d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z" />
+    </Glyph>
+  );
+}
+
+export function ChevronRightIcon(props: IconProps) {
   return (
     <Glyph {...props}>
       <Fill d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />

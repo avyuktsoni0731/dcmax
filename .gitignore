@@ -9,3 +9,6 @@ coverage
 npm-debug.log*
 pnpm-lock.yaml
 yarn.lock
+
+# extra
+.figma-shots/
