@@ -192,6 +192,9 @@ export function App() {
   const transcriptRef = useRef<HTMLDivElement>(null);
   const stickTranscript = useRef(true);
   const dialPeer = useRef<string | null>(null);
+  const phaseRef = useRef(phase);
+  const closeChatRef = useRef<() => void>(() => {});
+  phaseRef.current = phase;
   const shareRef = useRef<() => Promise<void>>(async () => { });
   const panelRef = useRef<HTMLDivElement>(null);
   const micMenuRef = useRef<HTMLDivElement>(null);
@@ -633,7 +636,6 @@ export function App() {
         document.getElementById("thread-search")?.focus();
       }
       if (event.key === "Escape") {
-        setPrefsOpen(false);
         setMenu(null);
         setDevicePane(null);
         setFullscreen((current) => {
@@ -642,6 +644,7 @@ export function App() {
           }
           return false;
         });
+        if (phaseRef.current !== "call") closeChatRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -1048,6 +1051,17 @@ export function App() {
     void postCircle(direction === "in" ? "reject" : "cancel", askName).catch((err: unknown) => setFriendNote(accountError(err)));
   }
 
+  function closeChat() {
+    setActive(null);
+    setChatNote("");
+    setPrefsOpen(false);
+    setFriendOpen(false);
+    setPendingOpen(false);
+    setMenu(null);
+    setDevicePane(null);
+  }
+  closeChatRef.current = closeChat;
+
   function focusThread(who: string) {
     setActive(who);
     setChatNote("");
@@ -1178,10 +1192,10 @@ export function App() {
   }
 
   const online = new Set(people.filter((person) => !person.local).map((person) => person.name));
-  const ringing = lines[0] ?? null;
   const rail = (
     <Rail
       prefsOpen={prefsOpen}
+      onHome={closeChat}
       onPrefs={() => setPrefsOpen((open) => !open)}
       onTheme={() => {
         const next = theme === "dark" ? "light" : "dark";
@@ -1190,16 +1204,6 @@ export function App() {
       }}
       onLogOut={logOut}
       dark={theme === "dark"}
-      live={Boolean(ringing)}
-      onCall={() => {
-        if (ringing) {
-          callFriend(ringing.name, ringing.room);
-          return;
-        }
-        if (!active) return;
-        const friend = desk.friends.find((item) => item.added && item.name === active);
-        if (friend) callFriend(friend.name, friend.room);
-      }}
     />
   );
 
@@ -1834,16 +1838,16 @@ export function App() {
       );
 }
 
-function Rail({ prefsOpen, onPrefs, onTheme, onLogOut, dark, live, onCall }: { prefsOpen: boolean; onPrefs: () => void; onTheme: () => void; onLogOut: () => void; dark: boolean; live: boolean; onCall: () => void }) {
+function Rail({ prefsOpen, onHome, onPrefs, onTheme, onLogOut, dark }: { prefsOpen: boolean; onHome: () => void; onPrefs: () => void; onTheme: () => void; onLogOut: () => void; dark: boolean }) {
   return (
     <aside className="sidebar">
-      <div className="brand-mark" aria-label="Home">
+      <button className="brand-mark" type="button" aria-label="Home" onClick={onHome}>
         <RamenIcon size={30} />
-      </div>
+      </button>
       <button className="nav-btn active" type="button" aria-label="Messages">
         <ChatBubbleIcon size={20} />
       </button>
-      <button className={`nav-btn plain${live ? " live" : ""}`} type="button" aria-label={live ? "Join call" : "Call"} onClick={onCall}>
+      <button className="nav-btn plain" type="button" aria-label="Call" disabled>
         <PhoneIcon size={20} />
       </button>
       <button className={`nav-btn plain rail-end${prefsOpen ? " active" : ""}`} type="button" aria-label="Settings" onClick={onPrefs}>

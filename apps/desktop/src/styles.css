@@ -1261,10 +1261,9 @@ input[type="range"] {
 .thread-top strong { font-size: 15px; font-weight: 700; }
 .thread-tools { margin-left: auto; }
 .thread-tools button { color: #ffffff; }
-.app.mock .nav-btn.live,
 .app.mock .thread-tools button.live { color: #3dce6e; }
-.app.mock .nav-btn.live:hover,
 .app.mock .thread-tools button.live:hover { color: #3dce6e; background: rgba(61, 206, 110, 0.16); }
+.app.mock .nav-btn:disabled { opacity: 1; }
 .app.mock .transcript { padding: 22px var(--inset) 8px; gap: 14px; }
 .app.mock .bubble { align-items: flex-end; gap: 8px; max-width: min(300px, 68%); }
 .app.mock .bubble > div {
